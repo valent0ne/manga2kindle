@@ -7,6 +7,7 @@ name = "manga2kindle"
 version = "0.1.0"
 description = "Cross-platform headless CLI to convert CBZ/CBR manga into PDOC-tagged KFX with Guided View panels"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "opencv-python-headless>=4.8.0",
