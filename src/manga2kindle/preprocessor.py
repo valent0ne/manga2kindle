@@ -420,27 +420,21 @@ class ImagePreprocessor:
         source_path: Path,
         cover_size: tuple[int, int],
     ) -> None:
-        """Fit and letterbox the cover image to cover_size without cropping artwork."""
+        """Stretch the cover image to exact cover_size edge-to-edge without borders."""
         if cover_page.processed_path is None:
             return
         target_w, target_h = cover_size
         with Image.open(source_path) as raw:
             rgb = _flatten_image(raw, "RGB")
 
-        scale = min(target_w / rgb.width, target_h / rgb.height)
-        new_w = min(target_w, max(1, round(rgb.width * scale)))
-        new_h = min(target_h, max(1, round(rgb.height * scale)))
-        resized = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-        canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
-        canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
+        resized = rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
         out_path = cover_page.processed_path
         if out_path.suffix.lower() in {".jpg", ".jpeg"}:
-            canvas.save(out_path, format="JPEG", quality=95)
+            resized.save(out_path, format="JPEG", quality=95)
         else:
-            canvas.save(out_path, format="PNG", optimize=True)
-        canvas.close()
+            resized.save(out_path, format="PNG", optimize=True)
+        resized.close()
 
         cover_page.width, cover_page.height = _measure_image(out_path)
         cover_page.is_spread = False

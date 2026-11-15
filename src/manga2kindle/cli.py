@@ -180,7 +180,7 @@ def convert(
         str,
         typer.Option(
             "--cover-size",
-            help="Target cover WIDTHxHEIGHT (fit & letterboxed without cropping).",
+            help="Target cover WIDTHxHEIGHT (stretched to fill without borders).",
         ),
     ] = f"{DEFAULT_COVER_SIZE[0]}x{DEFAULT_COVER_SIZE[1]}",
 ) -> None:
