@@ -102,16 +102,28 @@ class KccBackend:
 
         staging_dir = _reset_dir(work_dir / "kcc_in")
         out_dir = _reset_dir(work_dir / "kcc_out")
+        kcc_tmp_dir = _reset_dir(work_dir / "kcc_tmp")
         processed_dir = _reset_dir(work_dir / "processed")
 
         self._stage_pages(pages, staging_dir)
         cmd = self._build_command(kcc_bin, staging_dir, out_dir, config)
+        # Isolate KCC's global checkPre('KCC-') cleanup per subprocess across batch workers.
+        kcc_tmp_str = str(kcc_tmp_dir)
+        env = {
+            **os.environ,
+            "TMPDIR": kcc_tmp_str,
+            "TEMP": kcc_tmp_str,
+            "TMP": kcc_tmp_str,
+        }
 
         try:
             proc = subprocess.run(
                 cmd,
+                env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:

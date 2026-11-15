@@ -249,9 +249,11 @@ def test_kcc_backend_stages_pages_builds_command_and_unpacks_cbz(
     discovery.find_kcc.return_value = fake_kcc
 
     captured_cmds: list[list[str]] = []
+    captured_envs: list[dict[str, str]] = []
 
     def fake_run(cmd, **kwargs):
         captured_cmds.append(cmd)
+        captured_envs.append(kwargs.get("env", {}))
         out_dir = Path(cmd[cmd.index("-o") + 1])
         staging_dir = Path(cmd[-1])
         # Verify staging_dir only contains the two staged images (no junk!)
@@ -281,6 +283,10 @@ def test_kcc_backend_stages_pages_builds_command_and_unpacks_cbz(
 
     discovery.find_kcc.assert_called_once_with(override=fake_kcc)
     assert len(captured_cmds) == 1
+    expected_tmp = str(work_dir / "kcc_tmp")
+    assert captured_envs[0]["TMPDIR"] == expected_tmp
+    assert captured_envs[0]["TEMP"] == expected_tmp
+    assert captured_envs[0]["TMP"] == expected_tmp
     cmd = captured_cmds[0]
     assert cmd == [
         str(fake_kcc),
@@ -328,9 +334,11 @@ def test_kcc_backend_ltr_spread_modes_and_custom_profile(
     discovery.find_kcc.return_value = fake_kcc
 
     captured_cmds: list[list[str]] = []
+    captured_envs: list[dict[str, str]] = []
 
     def fake_run(cmd, **kwargs):
         captured_cmds.append(cmd)
+        captured_envs.append(kwargs.get("env", {}))
         out_dir = Path(cmd[cmd.index("-o") + 1])
         with zipfile.ZipFile(out_dir / "out.cbz", "w") as zf:
             zf.writestr("0001.jpg", _make_jpg_bytes(1400, 1800))
