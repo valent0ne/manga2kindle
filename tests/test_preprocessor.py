@@ -432,8 +432,8 @@ def test_kcc_backend_raises_without_silent_fallback_when_missing_or_fails(
         ImagePreprocessor(discovery=ok_discovery).process(pages, tmp_path / "w3", config)
 
 
-def test_image_preprocessor_normalizes_cover_to_1600x2560_letterbox(tmp_path: Path) -> None:
-    """Cover page is fit & letterboxed to config.cover_size (1600x2560) preserving artwork."""
+def test_image_preprocessor_stretches_cover_to_1600x2560(tmp_path: Path) -> None:
+    """Cover page is stretched edge-to-edge to config.cover_size (1600x2560) with no borders."""
     cover_img = Image.new("RGB", (1131, 1696), color=(20, 90, 180))
     cover_src = _save_image(cover_img, tmp_path / "extracted" / "0000_cover.png")
     page_img = Image.new("L", (800, 1200), color=180)
@@ -452,11 +452,10 @@ def test_image_preprocessor_normalizes_cover_to_1600x2560_letterbox(tmp_path: Pa
     assert (result[1].width, result[1].height) == (1264, 1680)
     assert result[1].is_cover is False
 
-    # 1131x1696 scaled to width 1600 -> height = round(1696 * 1600 / 1131) = 2399;
-    # top/bottom letterbox margin = (2560 - 2399) // 2 = 80px.
+    # Stretched edge-to-edge: all edges/corners match cover color with zero white borders.
     with Image.open(result[0].processed_path) as out_cover:
         assert out_cover.size == (1600, 2560)
         assert out_cover.mode == "RGB"
-        assert out_cover.getpixel((800, 10)) == (255, 255, 255)
-        assert out_cover.getpixel((800, 2550)) == (255, 255, 255)
+        assert out_cover.getpixel((10, 10)) == (20, 90, 180)
+        assert out_cover.getpixel((1590, 2550)) == (20, 90, 180)
         assert out_cover.getpixel((800, 1280)) == (20, 90, 180)

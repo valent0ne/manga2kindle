@@ -135,7 +135,7 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 | `-o, --output` | `<input.parent>/<name>.kfx` (single) / `<input>` (batch) | Output `.kfx` file or output directory |
 | `-p, --profile` | `KPW5` | Device preset: `KPW5` (1264x1680), `KS` (1860x2480), `OASIS`, or `CUSTOM` |
 | `--custom-size` | `None` | Custom `WIDTHxHEIGHT` (requires `-p CUSTOM`) |
-| `--cover-size` | `1600x2560` | Cover `WIDTHxHEIGHT` (fit & letterboxed without cropping) |
+| `--cover-size` | `1600x2560` | Cover `WIDTHxHEIGHT` (stretched to fill without borders) |
 | `-d, --direction` | `rtl` | Reading direction (`rtl` or `ltr`) |
 | `-s, --spread-mode` | `split` | Double-page spread handling (`split`, `rotate`, or `keep`) |
 | `-z, --zoom-factor` | `1.5` | Guided View magnification factor (`>= 1.0`) |
