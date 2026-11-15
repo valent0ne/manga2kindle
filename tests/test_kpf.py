@@ -250,9 +250,10 @@ class TestKpfBuilderIntegration:
             assert "content_hash" in kcb_json
             assert len(kcb_json["content_hash"]) == 32  # valid MD5 hex
             assert "metadata" in kcb_json
-            assert kcb_json["metadata"]["tool_name"] == "manga2kindle"
-            assert "tool_version" in kcb_json["metadata"]
+            assert kcb_json["metadata"].get("format") == "yj"
             # Must NOT contain unknown keys that warn in KFX Output
+            assert "tool_name" not in kcb_json["metadata"]
+            assert "tool_version" not in kcb_json["metadata"]
             assert "book_reading_direction" not in kcb_json["metadata"]
             assert "book_virtual_panelmovement" not in kcb_json["metadata"]
 
@@ -314,6 +315,7 @@ class TestKpfBuilderIntegration:
             for fid, pval in path_frags.items():
                 assert isinstance(pval, bytes)
                 assert pval.startswith(b"res/")
+                assert pval == f"res/{fid}".encode("utf-8")
 
             # Check fragment_properties
             cur.execute("SELECT id, key, value FROM fragment_properties")
@@ -321,6 +323,17 @@ class TestKpfBuilderIntegration:
             prop_keys = {(row[0], row[1], row[2]) for row in props}
             assert ("book_metadata", "element_type", "book_metadata") in prop_keys
             assert ("document_data", "element_type", "document_data") in prop_keys
+
+            # Verify external_resource $165 location stores rsrc* (NOT res/rsrc*)
+            ext_frags = {
+                fid: frags[fid][1]
+                for fid, k, v in prop_keys
+                if k == "element_type" and v == "external_resource"
+            }
+            assert len(ext_frags) == 2
+            for ext_blob in ext_frags.values():
+                assert b"rsrc" in ext_blob
+                assert b"res/rsrc" not in ext_blob
 
             # Check Guided View panel containers exist
             cur.execute("SELECT payload_value FROM fragments WHERE id LIKE 'p%'")

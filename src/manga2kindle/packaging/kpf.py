@@ -581,7 +581,7 @@ class KpfBuilder:
             ext_res_ion = IonAnnotation([SYM_EXTERNAL_RESOURCE], IonStruct([
                 (SYM_LOCAL_SOURCE_FILE_NAME, pd["img_path"].name),
                 (SYM_FORMAT, IonSymbol(pd["fmt_sym"])),
-                (SYM_LOCATION, rsrc_rel_path),
+                (SYM_LOCATION, rsrc_id),
                 (SYM_AUXILIARY_DATA, IonEidRef(d_id)),
                 (SYM_IMAGE_WIDTH, IonFloat64(float(w))),
                 (SYM_RESOURCE_ID, IonEidRef(e_id)),
@@ -738,8 +738,7 @@ class KpfBuilder:
             kcb_obj = {
                 "content_hash": content_hash_hex,
                 "metadata": {
-                    "tool_name": "manga2kindle",
-                    "tool_version": "1.0.0",
+                    "format": "yj",
                 },
             }
             kcb_raw = json.dumps(kcb_obj, indent=2).encode("utf-8")
