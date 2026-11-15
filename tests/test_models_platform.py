@@ -174,9 +174,16 @@ def test_platform_discovery_run_doctor(tmp_path, monkeypatch):
     monkeypatch.setattr(disc, "find_previewer4", lambda override=None: kp4)
     monkeypatch.setattr(disc, "find_unrar", lambda: unrar)
 
+    recorded_cmds: list[list[str]] = []
+
     def fake_run(cmd, **kwargs):
+        recorded_cmds.append(cmd)
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
         if "KFX Output" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="KFX Output 2.19.0", stderr="")
+        if "--help" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="comic2ebook v13.0.1 - ...", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="1.0.0", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -185,10 +192,23 @@ def test_platform_discovery_run_doctor(tmp_path, monkeypatch):
     by_name = {s.name: s for s in statuses}
     assert all(isinstance(s, ToolStatus) for s in statuses)
     assert by_name["kcc-c2e"].found is True
+    assert by_name["kcc-c2e"].version == "comic2ebook v13.0.1 - ..."
+    assert any(cmd[0] == str(kcc) and cmd[1] == "--help" for cmd in recorded_cmds)
     assert by_name["calibre-debug"].found is True
     assert by_name["KFX Output"].found is True
     assert by_name["Kindle Previewer 4"].found is True
     assert by_name["unrar/unar/7z"].found is True
+
+
+def test_platform_discovery_find_unrar_includes_7zz(tmp_path, monkeypatch):
+    fake_7zz = tmp_path / "7zz"
+    fake_7zz.write_text("stub")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: str(fake_7zz) if name == "7zz" else None,
+    )
+    disc = PlatformDiscovery(system="darwin")
+    assert disc.find_unrar() == fake_7zz
 
 
 def test_platform_discovery_run_doctor_missing_tools(monkeypatch):

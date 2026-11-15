@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -27,8 +28,14 @@ class KfxCompiler:
         self.calibre_debug_path = Path(calibre_debug_path)
 
     def _run_calibre(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+        }
         return subprocess.run(
             [str(self.calibre_debug_path), *args],
+            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -39,9 +46,13 @@ class KfxCompiler:
     def compile(self, kpf_path: Path, output_kfx: Path) -> Path:
         """Compile a .kpf package into a PDOC-tagged .kfx file using calibre-debug."""
         output_kfx.parent.mkdir(parents=True, exist_ok=True)
+        # Prevent stale pre-existing outputs from masking silent KFX Output exit-0 failures.
+        output_kfx.unlink(missing_ok=True)
+        resolved_kpf = kpf_path.resolve()
+        resolved_kfx = output_kfx.resolve()
         try:
             proc = self._run_calibre(
-                ["-r", "KFX Output", "--", "-d", str(kpf_path), str(output_kfx)]
+                ["-r", "KFX Output", "--", "-d", str(resolved_kpf), str(resolved_kfx)]
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise KfxCompilationError(
@@ -73,7 +84,7 @@ class KfxCompiler:
             return False
 
         try:
-            proc = self._run_calibre(["-c", _VERIFY_PDOC_SCRIPT, str(kfx_path)])
+            proc = self._run_calibre(["-c", _VERIFY_PDOC_SCRIPT, str(kfx_path.resolve())])
         except (OSError, subprocess.SubprocessError):
             return False
 

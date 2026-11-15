@@ -121,10 +121,12 @@ class TestIonBinaryWriter:
         assert (encoded[0] >> 4) == 0x0D
 
     def test_encode_annotation(self) -> None:
-        """Annotation (type 14) wrapping an inner Ion value."""
+        """Annotation (type 14) wrapping an inner Ion value; empty list raises ValueError."""
         annot = IonAnnotation([259], IonStruct([]))
         encoded = IonBinaryWriter.encode(annot, include_bvm=False)
         assert (encoded[0] >> 4) == 0x0E
+        with pytest.raises(ValueError, match="at least one"):
+            IonBinaryWriter.encode_annotation([], IonStruct([]))
 
     def test_ion_symbol_table(self) -> None:
         """$ion_symbol_table must import YJ_symbols v10 with max_id=842."""
@@ -425,8 +427,19 @@ class TestKpfBuilderIntegration:
             cur = conn.cursor()
             cur.execute("SELECT payload_value FROM fragments WHERE id='document_data'")
             doc_data = cur.fetchone()[0]
-            # Symbol 376 is 0x0178 -> big-endian 2 bytes: 0x01, 0x78 -> type 7, len 2: 0x72 0x01 0x78
+            # Symbol 376 (0x0178) and binding 442 (0x01BA) in document_data
             assert b"\x72\x01\x78" in doc_data
+            assert b"\x72\x01\xba" in doc_data
+            # Guided View source panels ($684 / SYM_PAN_ZOOM_VIEWER) must emit $442 (0x72 0x01 0xba), NOT $441 (0x72 0x01 0xb9)
+            cur.execute("SELECT payload_value FROM fragments WHERE id LIKE 'p%'")
+            gv_nodes = [row[0] for row in cur.fetchall()]
+            pan_zoom_field = IonBinaryWriter.encode_varuint(SYM_PAN_ZOOM_VIEWER)
+            rtl_sym = IonBinaryWriter.encode_symbol(SYM_RIGHT_TO_LEFT_BINDING)
+            ltr_sym = IonBinaryWriter.encode_symbol(442)
+            assert len(gv_nodes) == 4
+            for node in gv_nodes:
+                assert (pan_zoom_field + ltr_sym) in node
+                assert (pan_zoom_field + rtl_sym) not in node
         finally:
             conn.close()
 

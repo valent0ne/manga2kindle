@@ -266,3 +266,45 @@ def test_panel_sorter_four_koma_vertical_stack() -> None:
 
     assert [b.y for b in sorted_panels] == [20, 62, 104, 146]
     assert [b.ordinal for b in sorted_panels] == [1, 2, 3, 4]
+
+
+def test_panel_sorter_overlapping_staggered_row_and_spread_halves() -> None:
+    """Overlapping staggered panels stay in the same row; spreads sort right half before left half in RTL."""
+    # Staggered vertical top edges (y=50 vs y=120 -> delta 70 > 50) yet high overlap -> single row RTL
+    staggered_right = PanelBox(x=520, y=50, w=300, h=300)
+    staggered_left = PanelBox(x=80, y=120, w=300, h=220)
+    row_sorted = PanelSorter(direction=ReadingDirection.RTL, row_tolerance_px=50).sort(
+        [staggered_left, staggered_right]
+    )
+    assert [(b.x, b.ordinal) for b in row_sorted] == [(520, 1), (80, 2)]
+
+    # Spread 2000x1000: top-left (x=100,y=50), bottom-right (x=1200,y=500), top-right (x=1200,y=50)
+    spread_panels = [
+        PanelBox(x=100, y=50, w=700, h=400),
+        PanelBox(x=1200, y=500, w=700, h=400),
+        PanelBox(x=1200, y=50, w=700, h=400),
+    ]
+    rtl_spread = PanelSorter(direction=ReadingDirection.RTL).sort(
+        spread_panels, page_width=2000, is_spread=True
+    )
+    assert [(b.x, b.y, b.ordinal) for b in rtl_spread] == [
+        (1200, 50, 1),
+        (1200, 500, 2),
+        (100, 50, 3),
+    ]
+    ltr_spread = PanelSorter(direction=ReadingDirection.LTR).sort(
+        spread_panels, page_width=2000, is_spread=True
+    )
+    assert [(b.x, b.y, b.ordinal) for b in ltr_spread] == [
+        (100, 50, 1),
+        (1200, 50, 2),
+        (1200, 500, 3),
+    ]
+
+
+def test_panel_detector_pad_and_clamp_edge_safety_margin() -> None:
+    """_pad_and_clamp clamps x1/y1 so even extreme right/bottom contours stay inside bleed margin."""
+    detector = PanelDetector(padding=0.02)
+    box = detector._pad_and_clamp((999, 1199, 1, 1), page_w=1000, page_h=1200)
+    assert box.x + box.w <= 998
+    assert box.y + box.h <= 1198

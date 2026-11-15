@@ -60,6 +60,11 @@ def _resolve_profile(profile: str, custom_size: str | None) -> DeviceProfile:
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
 
+    if custom_size is not None:
+        raise typer.BadParameter(
+            "--custom-size can only be used together with --profile CUSTOM."
+        )
+
     if "x" in normalized.lower() and normalized.lower().split("x", 1)[0].isdigit():
         try:
             dims = _parse_custom_dimensions(normalized)
@@ -152,10 +157,6 @@ def convert(
         Path | None,
         typer.Option("--calibre-path", help="Explicit path to calibre-debug executable."),
     ] = None,
-    previewer_path: Annotated[
-        Path | None,
-        typer.Option("--previewer-path", help="Explicit path to KindlePreviewer4CLI."),
-    ] = None,
     title: Annotated[
         str | None,
         typer.Option("--title", help="Book title metadata override (defaults to archive/folder name)."),
@@ -171,6 +172,8 @@ def convert(
 
     try:
         is_batch = pipeline.is_batch_input(input_path)
+        if is_batch and title is not None:
+            raise ValueError("--title cannot be used with a batch archive directory.")
         if output is None:
             resolved_output = (
                 input_path
@@ -196,7 +199,6 @@ def convert(
             workers=workers,
             kcc_path=kcc_path,
             calibre_path=calibre_path,
-            previewer_path=previewer_path,
         )
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -285,7 +287,11 @@ def preview_panels(
 ) -> None:
     """Render debug overlays showing detected panels and reading-order arrows."""
     device_profile = _resolve_profile(profile, custom_size)
-    target_dir = output_dir or (input_path.parent / f"{input_path.stem}_preview")
+    default_name = ConversionPipeline.resolve_input_name(input_path)
+    target_dir = output_dir or (input_path.resolve().parent / f"{default_name}_preview")
+    if target_dir.exists() and not target_dir.is_dir():
+        console.print(f"[red]Error:[/red] Output path exists and is not a directory: {target_dir}")
+        raise typer.Exit(code=1)
     pipeline = ConversionPipeline()
 
     try:

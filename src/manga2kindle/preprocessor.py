@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import zipfile
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from manga2kindle.extractor import natural_sort_key
+from manga2kindle.extractor import ArchiveExtractor, natural_sort_key, sanitize_stem
 from manga2kindle.models import (
     ConversionConfig,
     PageAsset,
@@ -19,11 +20,6 @@ from manga2kindle.models import (
 )
 from manga2kindle.platform import PlatformDiscovery
 
-_IMAGE_EXTENSIONS = frozenset(
-    {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-)
-_IGNORED_FILENAMES = frozenset({"thumbs.db", "comicinfo.xml"})
-_IGNORED_DIRS = frozenset({"__macosx"})
 _SPREAD_CLI_ARGS: dict[SpreadMode, list[str]] = {
     SpreadMode.SPLIT: ["-r", "0"],
     SpreadMode.ROTATE: ["-r", "1"],
@@ -66,20 +62,11 @@ def _stage_file(src: Path, dst: Path) -> None:
 
 
 def _is_valid_archive_image(raw_name: str) -> bool:
-    if "\x00" in raw_name:
+    try:
+        parts = ArchiveExtractor.validate_member_parts(raw_name)
+    except ValueError:
         return False
-    normalized = raw_name.replace("\\", "/")
-    if normalized.startswith("/"):
-        return False
-    parts = [part for part in normalized.split("/") if part not in ("", ".")]
-    if not parts or ".." in parts:
-        return False
-    if any(part.lower() in _IGNORED_DIRS or part.startswith(".") for part in parts):
-        return False
-    filename = parts[-1]
-    if filename.lower() in _IGNORED_FILENAMES:
-        return False
-    return Path(filename).suffix.lower() in _IMAGE_EXTENSIONS
+    return not ArchiveExtractor.is_ignored_parts(parts)
 
 
 class KccBackend:
@@ -115,6 +102,8 @@ class KccBackend:
             "TMPDIR": kcc_tmp_str,
             "TEMP": kcc_tmp_str,
             "TMP": kcc_tmp_str,
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
         }
 
         try:
@@ -207,7 +196,12 @@ class KccBackend:
                 members = [
                     info
                     for info in zf.infolist()
-                    if not info.is_dir() and _is_valid_archive_image(info.filename)
+                    if not info.is_dir()
+                    and not (
+                        isinstance(getattr(info, "external_attr", 0), int)
+                        and stat.S_ISLNK(info.external_attr >> 16)
+                    )
+                    and _is_valid_archive_image(info.filename)
                 ]
             members.sort(key=lambda info: natural_sort_key(info.filename))
             if members:
@@ -223,8 +217,10 @@ class KccBackend:
         for cbz_path, members in cbz_members:
             with zipfile.ZipFile(cbz_path, "r") as zf:
                 for info in members:
-                    leaf_name = Path(info.filename.replace("\\", "/")).name
-                    out_path = processed_dir / f"{idx:0{pad}d}_{leaf_name}"
+                    raw_leaf = Path(info.filename.replace("\\", "/")).name
+                    leaf_path = Path(raw_leaf)
+                    safe_leaf_stem = sanitize_stem(leaf_path.stem, fallback="page")
+                    out_path = processed_dir / f"{idx:0{pad}d}_{safe_leaf_stem}{leaf_path.suffix.lower()}"
                     with zf.open(info) as src, out_path.open("wb") as dst:
                         shutil.copyfileobj(src, dst)
                     extracted.append(out_path)
@@ -259,8 +255,10 @@ class PillowFallbackBackend:
         """Auto-crop, handle spreads, apply gamma 1.6, quantize to 16-level grayscale, and pad."""
         processed_dir = _reset_dir(work_dir / "processed")
         target_size = (config.profile.width, config.profile.height)
+        pad = max(4, len(str(len(pages) * 2)))
+        output_pages: list[PageAsset] = []
+        out_idx = 0
 
-        rendered: list[tuple[PageAsset, Image.Image, bool]] = []
         for page in pages:
             if not page.source_path.is_file():
                 raise ImagePreprocessingError(
@@ -268,29 +266,31 @@ class PillowFallbackBackend:
                 )
             with Image.open(page.source_path) as raw:
                 gray = self._to_grayscale(raw)
+                pre_crop_spread = page.is_spread or (gray.width > gray.height)
                 cropped = self._autocrop_white(gray)
-                variants, keep_spread = self._handle_spread(cropped, config)
-                for variant in variants:
-                    final_img = self._render_eink_page(variant, target_size)
-                    rendered.append((page, final_img, keep_spread))
-
-        pad = max(4, len(str(len(rendered))))
-        output_pages: list[PageAsset] = []
-        for idx, (src_page, final_img, is_spread) in enumerate(rendered):
-            out_path = processed_dir / f"{idx:0{pad}d}.png"
-            final_img.save(out_path, format="PNG", optimize=True)
-            width, height = _measure_image(out_path)
-            output_pages.append(
-                PageAsset(
-                    index=idx,
-                    source_path=src_page.source_path,
-                    processed_path=out_path,
-                    width=width,
-                    height=height,
-                    is_cover=(idx == 0),
-                    is_spread=is_spread,
+                variants, keep_spread = self._handle_spread(
+                    cropped, pre_crop_spread, config
                 )
-            )
+                for variant in variants:
+                    final_img = self._render_eink_page(
+                        variant, target_size, keep_spread=keep_spread
+                    )
+                    out_path = processed_dir / f"{out_idx:0{pad}d}.png"
+                    final_img.save(out_path, format="PNG", optimize=True)
+                    final_img.close()
+                    width, height = _measure_image(out_path)
+                    output_pages.append(
+                        PageAsset(
+                            index=out_idx,
+                            source_path=page.source_path,
+                            processed_path=out_path,
+                            width=width,
+                            height=height,
+                            is_cover=(out_idx == 0),
+                            is_spread=keep_spread,
+                        )
+                    )
+                    out_idx += 1
         return output_pages
 
     @staticmethod
@@ -324,9 +324,9 @@ class PillowFallbackBackend:
 
     @staticmethod
     def _handle_spread(
-        img: Image.Image, config: ConversionConfig
+        img: Image.Image, is_spread: bool, config: ConversionConfig
     ) -> tuple[list[Image.Image], bool]:
-        if img.width <= img.height:
+        if not is_spread:
             return [img], False
 
         if config.spread_mode == SpreadMode.SPLIT:
@@ -343,16 +343,25 @@ class PillowFallbackBackend:
         return [img], True
 
     def _render_eink_page(
-        self, img: Image.Image, target_size: tuple[int, int]
+        self,
+        img: Image.Image,
+        target_size: tuple[int, int],
+        *,
+        keep_spread: bool = False,
     ) -> Image.Image:
         target_w, target_h = target_size
-        scale = min(target_w / img.width, target_h / img.height)
-        new_w = min(target_w, max(1, round(img.width * scale)))
-        new_h = min(target_h, max(1, round(img.height * scale)))
+        box_w = target_w * 2 if keep_spread else target_w
+        box_h = target_h
+        scale = min(box_w / img.width, box_h / img.height)
+        new_w = min(box_w, max(1, round(img.width * scale)))
+        new_h = min(box_h, max(1, round(img.height * scale)))
 
         resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        canvas = Image.new("L", (target_w, target_h), 255)
-        canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
+        if keep_spread:
+            canvas = resized
+        else:
+            canvas = Image.new("L", (target_w, target_h), 255)
+            canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
 
         gamma_adjusted = canvas.point(self._gamma_lut)
         quantized = gamma_adjusted.convert("RGB").quantize(

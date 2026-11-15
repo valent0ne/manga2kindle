@@ -99,8 +99,6 @@ SYM_PAN_ZOOM_VIEWER: int = 684
 
 # Local symbol IDs
 SYM_LOCAL_SOURCE_FILE_NAME: int = 852
-SYM_LOCAL_ORIGINAL_RESOURCE: int = 853
-SYM_LOCAL_PRESERVED_ORIGINAL: int = 854
 
 
 @dataclass(frozen=True)
@@ -256,6 +254,8 @@ class IonBinaryWriter:
     @classmethod
     def encode_annotation(cls, annotation_sids: list[int], value: Any) -> bytes:
         """Wrap an Ion value with one or more symbol ID annotations (type 14)."""
+        if not annotation_sids:
+            raise ValueError("Ion annotation requires at least one symbol ID")
         val_bytes = cls.encode(value, include_bvm=False)
         annot_bytes = b"".join(cls.encode_varuint(sid) for sid in annotation_sids)
         annot_len = cls.encode_varuint(len(annot_bytes))

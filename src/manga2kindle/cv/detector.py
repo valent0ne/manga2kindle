@@ -135,6 +135,11 @@ class PanelDetector:
         x2 = min(page_w - margin_x, x + w + pad_x)
         y2 = min(page_h - margin_y, y + h + pad_y)
 
+        if margin_x > 0:
+            x1 = min(x1, page_w - margin_x - 1)
+        if margin_y > 0:
+            y1 = min(y1, page_h - margin_y - 1)
+
         return PanelBox(
             x=x1,
             y=y1,

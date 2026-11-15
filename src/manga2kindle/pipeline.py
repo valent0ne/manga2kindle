@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -62,12 +63,20 @@ class ConversionPipeline:
     @staticmethod
     def _contains_images(directory: Path) -> bool:
         for path in directory.rglob("*"):
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
             parts = list(path.relative_to(directory).parts)
-            if not ArchiveExtractor._is_ignored_parts(parts):
+            if not ArchiveExtractor.is_ignored_parts(parts):
                 return True
         return False
+
+    @staticmethod
+    def resolve_input_name(input_path: Path) -> str:
+        """Return a clean human-readable base name for an archive file or directory."""
+        resolved = input_path.resolve()
+        if input_path.is_dir() or resolved.is_dir():
+            return resolved.name or "manga"
+        return resolved.stem or resolved.name or "manga"
 
     def is_batch_input(self, input_path: Path) -> bool:
         """Return True if input_path is a directory of CBZ/CBR archives, False for single input."""
@@ -83,14 +92,23 @@ class ConversionPipeline:
             f"Directory contains no .cbz/.cbr archives or image files: {input_path}"
         )
 
-    @staticmethod
-    def resolve_single_output(input_path: Path, output_path: Path | None) -> Path:
+    @classmethod
+    def resolve_single_output(cls, input_path: Path, output_path: Path | None) -> Path:
         """Resolve exact output .kfx path for a single archive or image folder."""
+        base_name = cls.resolve_input_name(input_path)
         if output_path is None:
-            return input_path.parent / f"{input_path.stem}.kfx"
+            return input_path.resolve().parent / f"{base_name}.kfx"
         if output_path.suffix.lower() == ".kfx":
+            if output_path.exists() and output_path.is_dir():
+                raise ValueError(
+                    f"Output .kfx path points to an existing directory: {output_path}"
+                )
             return output_path
-        return output_path / f"{input_path.stem}.kfx"
+        if output_path.exists() and not output_path.is_dir():
+            raise ValueError(
+                f"Output path exists and is not a directory: {output_path}"
+            )
+        return output_path / f"{base_name}.kfx"
 
     @staticmethod
     def resolve_batch_output_dir(input_path: Path, output_path: Path | None) -> Path:
@@ -100,6 +118,10 @@ class ConversionPipeline:
         if output_path.suffix.lower() == ".kfx":
             raise ValueError(
                 f"Batch output path must be a directory, got file path: {output_path}"
+            )
+        if output_path.exists() and not output_path.is_dir():
+            raise ValueError(
+                f"Batch output path exists and is not a directory: {output_path}"
             )
         return output_path
 
@@ -117,7 +139,11 @@ class ConversionPipeline:
 
         def _process_page(page: PageAsset) -> PageAsset:
             img_path = page.processed_path or page.source_path
-            panels = sorter.sort(detector.detect(img_path))
+            panels = sorter.sort(
+                detector.detect(img_path),
+                page_width=page.width,
+                is_spread=page.is_spread,
+            )
             return page.model_copy(update={"panels": panels})
 
         if workers > 1 and len(pages) > 1:
@@ -140,8 +166,9 @@ class ConversionPipeline:
                 "or pass --calibre-path."
             )
 
+        input_name = self.resolve_input_name(config.input_path)
         output_kfx = self.resolve_single_output(config.input_path, config.output_path)
-        book_title = (title or "").strip() or config.input_path.stem
+        book_title = (title or "").strip() or input_name
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_"))
 
         try:
@@ -155,7 +182,7 @@ class ConversionPipeline:
                 workers=config.workers,
             )
 
-            kpf_path = work_dir / f"{config.input_path.stem}.kpf"
+            kpf_path = work_dir / f"{input_name}.kpf"
             self.builder.build(
                 pages=annotated,
                 title=book_title,
@@ -165,12 +192,21 @@ class ConversionPipeline:
             )
 
             compiler = KfxCompiler(calibre_path)
-            compiled = compiler.compile(kpf_path, output_kfx)
+            staged_kfx = work_dir / f"{input_name}.kfx"
+            compiled = compiler.compile(kpf_path, staged_kfx)
             if not compiler.verify_pdoc(compiled):
                 raise KfxCompilationError(
                     f"Compiled KFX failed PDOC verification: {compiled}"
                 )
-            return compiled
+
+            output_kfx.parent.mkdir(parents=True, exist_ok=True)
+            tmp_dest = output_kfx.with_name(f".{output_kfx.stem}.tmp_{os.getpid()}.kfx")
+            try:
+                shutil.copy2(compiled, tmp_dest)
+                os.replace(tmp_dest, output_kfx)
+            finally:
+                tmp_dest.unlink(missing_ok=True)
+            return output_kfx
         finally:
             if not config.keep_temp:
                 shutil.rmtree(work_dir, ignore_errors=True)
@@ -189,17 +225,40 @@ class ConversionPipeline:
             raise ValueError(f"No .cbz or .cbr archives found in {config.input_path}")
 
         out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
+        seen_names: dict[str, Path] = {}
+        targets: list[tuple[Path, Path]] = []
+        for archive_path in archives:
+            out_kfx = out_dir / f"{archive_path.stem}.kfx"
+            key = out_kfx.name.lower()
+            if key in seen_names:
+                raise ValueError(
+                    f"Batch output filename collision for '{out_kfx.name}': "
+                    f"'{seen_names[key].name}' and '{archive_path.name}'"
+                )
+            seen_names[key] = archive_path
+            targets.append((archive_path, out_kfx))
+
+        calibre_path = self.discovery.find_calibre(override=config.calibre_path)
+        if calibre_path is None:
+            raise KfxCompilationError(
+                "calibre-debug not found. Install Calibre with the KFX Output plugin "
+                "or pass --calibre-path."
+            )
+
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
-        batch_workers = min(config.workers, len(archives))
+        batch_workers = min(config.workers, len(targets))
         per_book_workers = max(1, config.workers // batch_workers)
 
-        def _convert_one(archive_path: Path) -> tuple[Path, Path | None, Exception | None]:
+        def _convert_one(
+            archive_path: Path, target_kfx: Path
+        ) -> tuple[Path, Path | None, Exception | None]:
             book_config = config.model_copy(
                 update={
                     "input_path": archive_path,
-                    "output_path": out_dir / f"{archive_path.stem}.kfx",
+                    "output_path": target_kfx,
+                    "calibre_path": calibre_path,
                     "workers": per_book_workers,
                 }
             )
@@ -216,9 +275,11 @@ class ConversionPipeline:
 
         if batch_workers > 1:
             with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                outcomes = list(executor.map(_convert_one, archives))
+                outcomes = list(
+                    executor.map(lambda item: _convert_one(item[0], item[1]), targets)
+                )
         else:
-            outcomes = [_convert_one(archive) for archive in archives]
+            outcomes = [_convert_one(arch, tgt) for arch, tgt in targets]
 
         succeeded: list[Path] = []
         errors: list[tuple[Path, Exception]] = []

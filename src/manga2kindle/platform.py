@@ -58,6 +58,8 @@ class PlatformDiscovery:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 check=False,
             )
@@ -135,9 +137,9 @@ class PlatformDiscovery:
     def find_unrar(self) -> Path | None:
         """Locate an archive extractor capable of handling CBR (RAR) archives."""
         names = (
-            ["unrar.exe", "unrar", "unar", "7z.exe", "7z"]
+            ["unrar.exe", "unrar", "unar", "7z.exe", "7z", "7zz.exe", "7zz", "7za.exe", "7za"]
             if self._is_windows
-            else ["unrar", "unar", "7z"]
+            else ["unrar", "unar", "7zz", "7z", "7za"]
         )
         which_hit = self._which(names)
         if which_hit is not None:
@@ -149,10 +151,14 @@ class PlatformDiscovery:
             for root in roots:
                 candidates.append(root / "WinRAR" / "UnRAR.exe")
                 candidates.append(root / "7-Zip" / "7z.exe")
+                candidates.append(root / "7-Zip" / "7zz.exe")
+                candidates.append(root / "7-Zip" / "7za.exe")
             candidates.extend(
                 [
                     Path(r"C:\Program Files\WinRAR\UnRAR.exe"),
                     Path(r"C:\Program Files\7-Zip\7z.exe"),
+                    Path(r"C:\Program Files\7-Zip\7zz.exe"),
+                    Path(r"C:\Program Files\7-Zip\7za.exe"),
                 ]
             )
             return self._first_existing(candidates)
@@ -186,7 +192,7 @@ class PlatformDiscovery:
         unrar_path = self.find_unrar()
 
         statuses = [
-            self._check_tool("kcc-c2e", kcc_path, ["--version"]),
+            self._check_tool("kcc-c2e", kcc_path, ["--help"]),
             self._check_tool("calibre-debug", calibre_path, ["--version"]),
         ]
 

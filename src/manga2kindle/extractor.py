@@ -6,6 +6,7 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from typing import Protocol
@@ -16,14 +17,17 @@ from PIL import Image
 from manga2kindle.models import PageAsset
 from manga2kindle.platform import PlatformDiscovery
 
-_IMAGE_EXTENSIONS = frozenset(
+IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 )
+_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
 _IGNORED_FILENAMES = frozenset({"thumbs.db", "comicinfo.xml"})
 _IGNORED_DIRS = frozenset({"__macosx"})
 _NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 _SAFE_STEM_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_MAX_STAGED_STEM_LEN = 64
+_RAR_CONFIG_LOCK = threading.Lock()
 
 
 class _ArchiveMember(Protocol):
@@ -45,6 +49,12 @@ def natural_sort_key(path: str | Path) -> list[int | str]:
         int(part) if part.isdigit() else part
         for part in _NATURAL_SPLIT_RE.split(normalized)
     ]
+
+
+def sanitize_stem(raw_stem: str, fallback: str = "page") -> str:
+    """Sanitize a filename stem and bound its length for cross-platform path safety."""
+    cleaned = _SAFE_STEM_RE.sub("_", raw_stem).strip("_")[:_MAX_STAGED_STEM_LEN].strip("_")
+    return cleaned or fallback
 
 
 class ArchiveExtractor:
@@ -85,20 +95,28 @@ class ArchiveExtractor:
         raise ValueError(f"Unsupported input format '{input_path.suffix}' for {input_path}")
 
     def _configure_rar_tool(self) -> None:
-        unrar_path = self.discovery.find_unrar()
-        if unrar_path is None:
-            return
-        stem = unrar_path.stem.lower()
-        if stem == "unar":
-            rarfile.UNAR_TOOL = str(unrar_path)
-        elif stem in {"7z", "7za", "7zz"}:
-            rarfile.SEVENZIP_TOOL = str(unrar_path)
-        else:
-            rarfile.UNRAR_TOOL = str(unrar_path)
-        rarfile.CURRENT_SETUP = None
+        with _RAR_CONFIG_LOCK:
+            unrar_path = self.discovery.find_unrar()
+            if unrar_path is not None:
+                stem = unrar_path.stem.lower()
+                if stem == "unar":
+                    attr = "UNAR_TOOL"
+                elif stem in {"7z", "7za", "7zz"}:
+                    attr = "SEVENZIP_TOOL"
+                else:
+                    attr = "UNRAR_TOOL"
+                target = str(unrar_path)
+                if getattr(rarfile, attr, None) != target:
+                    setattr(rarfile, attr, target)
+                    rarfile.CURRENT_SETUP = None
+            if rarfile.CURRENT_SETUP is None:
+                try:
+                    rarfile.tool_setup()
+                except rarfile.RarCannotExec:
+                    pass
 
     @staticmethod
-    def _validate_member_parts(raw_name: str) -> list[str]:
+    def validate_member_parts(raw_name: str) -> list[str]:
         """Validate an archive member path against traversal and return clean parts."""
         if "\x00" in raw_name:
             raise ValueError(f"Unsafe archive member path (null byte): {raw_name}")
@@ -113,7 +131,7 @@ class ArchiveExtractor:
         return [part for part in segments if part not in ("", ".")]
 
     @staticmethod
-    def _is_ignored_parts(parts: list[str]) -> bool:
+    def is_ignored_parts(parts: list[str]) -> bool:
         """Return True for metadata, dotfiles, OS junk, or non-image paths."""
         if not parts:
             return True
@@ -122,16 +140,20 @@ class ArchiveExtractor:
         filename = parts[-1]
         if filename.lower() in _IGNORED_FILENAMES:
             return True
-        return Path(filename).suffix.lower() not in _IMAGE_EXTENSIONS
+        return Path(filename).suffix.lower() not in IMAGE_EXTENSIONS
 
     def _collect_from_directory(self, root_dir: Path) -> list[tuple[str, Path]]:
+        root_resolved = root_dir.resolve()
         candidates: list[tuple[str, Path]] = []
         for path in root_dir.rglob("*"):
-            if not path.is_file():
+            if path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root_resolved) or not resolved.is_file():
                 continue
             rel = path.relative_to(root_dir)
             parts = list(rel.parts)
-            if self._is_ignored_parts(parts):
+            if self.is_ignored_parts(parts):
                 continue
             candidates.append((rel.as_posix(), path))
         return candidates
@@ -143,13 +165,16 @@ class ArchiveExtractor:
         candidates: list[tuple[str, Path]] = []
 
         for info in archive.infolist():
-            parts = self._validate_member_parts(info.filename)
+            parts = self.validate_member_parts(info.filename)
             if info.is_dir():
+                continue
+            is_symlink_fn = getattr(info, "is_symlink", None)
+            if callable(is_symlink_fn) and is_symlink_fn() is True:
                 continue
             ext_attr = getattr(info, "external_attr", 0)
             if isinstance(ext_attr, int) and stat.S_ISLNK(ext_attr >> 16):
                 continue
-            if self._is_ignored_parts(parts):
+            if self.is_ignored_parts(parts):
                 continue
 
             dest = (raw_root / Path(*parts)).resolve()
@@ -198,7 +223,7 @@ class ArchiveExtractor:
 
         for index, (rel_name, src_path) in enumerate(ordered):
             width, height = self._verify_and_measure(src_path, rel_name)
-            safe_stem = _SAFE_STEM_RE.sub("_", src_path.stem).strip("_") or "page"
+            safe_stem = sanitize_stem(src_path.stem, fallback="page")
             staged_name = f"{index:0{pad}d}_{safe_stem}{src_path.suffix.lower()}"
             staged_path = extracted_dir / staged_name
             shutil.copy2(src_path, staged_path)

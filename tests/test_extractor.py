@@ -278,3 +278,48 @@ def test_extract_error_cases(tmp_path: Path):
         zf.writestr("ComicInfo.xml", b"<ComicInfo/>")
     with pytest.raises(ValueError, match="No valid image"):
         extractor.extract(empty_cbz, tmp_path / "work_empty")
+
+
+def test_extract_cbr_skips_rarinfo_symlinks_and_bounds_staged_stem(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cbr_path = tmp_path / "symlinks.cbr"
+    cbr_path.write_bytes(b"Rar!stub")
+    discovery = MagicMock(spec=PlatformDiscovery)
+    discovery.find_unrar.return_value = None
+
+    long_stem = "very_long_page_name_" * 8
+    real_info = MagicMock()
+    real_info.filename = f"{long_stem}.png"
+    real_info.is_dir.return_value = False
+    real_info.is_symlink.return_value = False
+    real_info.external_attr = 0
+
+    sym_info = MagicMock()
+    sym_info.filename = "evil_link.png"
+    sym_info.is_dir.return_value = False
+    sym_info.is_symlink.return_value = True
+    sym_info.external_attr = 0
+
+    fake_rf = MagicMock()
+    fake_rf.__enter__.return_value = fake_rf
+    fake_rf.__exit__.return_value = False
+    fake_rf.infolist.return_value = [sym_info, real_info]
+    fake_rf.open.side_effect = lambda info: io.BytesIO(_make_png_bytes(100, 150))
+
+    monkeypatch.setattr(rarfile, "RarFile", MagicMock(return_value=fake_rf))
+    pages = ArchiveExtractor(discovery=discovery).extract(cbr_path, tmp_path / "work_sym")
+    assert len(pages) == 1
+    assert len(pages[0].source_path.stem) <= 75
+
+
+def test_extract_folder_skips_symlinks(tmp_path: Path) -> None:
+    src_dir = tmp_path / "dir_with_symlink"
+    src_dir.mkdir()
+    outside = tmp_path / "outside.png"
+    _write_png(outside, 200, 300)
+    _write_png(src_dir / "01.png", 100, 150)
+    (src_dir / "02_link.png").symlink_to(outside)
+
+    pages = ArchiveExtractor().extract(src_dir, tmp_path / "work_dir_sym")
+    assert [(p.width, p.height) for p in pages] == [(100, 150)]

@@ -558,6 +558,11 @@ class KpfBuilder:
         frag_props.append((i_leaf, "child", e_id))
 
         # Guided View Panel Containers
+        binding_sym = (
+            SYM_RIGHT_TO_LEFT_BINDING
+            if config.direction == ReadingDirection.RTL
+            else SYM_LEFT_TO_RIGHT_BINDING
+        )
         for p_info in panels:
             p_box: PanelBox = p_info["panel"]
             ordinal: int = p_info["ordinal"]
@@ -579,7 +584,7 @@ class KpfBuilder:
                 (SYM_TOP, _dim_pct(p_box.y, h)),
                 (SYM_WIDTH, _dim_pct(p_box.w, w)),
                 (SYM_HEIGHT, _dim_pct(p_box.h, h)),
-                (SYM_PAN_ZOOM_VIEWER, IonSymbol(SYM_RIGHT_TO_LEFT_BINDING)),
+                (SYM_PAN_ZOOM_VIEWER, IonSymbol(binding_sym)),
                 (SYM_ORDINAL, ordinal),
                 (SYM_ACTIONS, IonList([activate_act])),
             ]))

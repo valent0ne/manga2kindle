@@ -76,7 +76,31 @@ class TestKfxCompilerUnit:
         ]
         assert captured["kwargs"]["capture_output"] is True
         assert captured["kwargs"]["text"] is True
+        assert captured["kwargs"]["encoding"] == "utf-8"
         assert captured["kwargs"]["check"] is False
+        assert captured["kwargs"]["env"]["PYTHONIOENCODING"] == "utf-8"
+        assert captured["kwargs"]["env"]["PYTHONUTF8"] == "1"
+
+    def test_compile_rejects_stale_output_when_calibre_writes_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calibre_debug = tmp_path / "calibre-debug"
+        kpf_path = tmp_path / "book.kpf"
+        kpf_path.write_bytes(b"kpf")
+        output_kfx = tmp_path / "stale.kfx"
+        output_kfx.write_bytes(b"OLD_STALE_KFX")
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr=""),
+        )
+
+        compiler = KfxCompiler(calibre_debug)
+        with pytest.raises(KfxCompilationError, match="missing"):
+            compiler.compile(kpf_path, output_kfx)
 
     def test_compile_raises_on_nonzero_exit(
         self,

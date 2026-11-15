@@ -22,8 +22,6 @@ from manga2kindle.platform import PlatformDiscovery
 from manga2kindle.preprocessor import (
     ImagePreprocessingError,
     ImagePreprocessor,
-    KccBackend,
-    PillowFallbackBackend,
 )
 
 
@@ -209,20 +207,42 @@ def test_pillow_fallback_spread_rotate_and_keep(tmp_path: Path) -> None:
         # Bottom-left of content holds gray (170 -> ~136 after gamma)
         assert rot_img.getpixel((320, 1400)) > 100
 
-    # KEEP: 2000x1000 -> scaled to 1264x632 centered vertically on 1264x1680
+    # KEEP: 2000x1000 -> fitted cleanly within landscape (2*1264, 1680) -> (2528, 1264)
     keep_cfg = _make_config(tmp_path, spread_mode=SpreadMode.KEEP, no_kcc=True)
     kept = ImagePreprocessor().process(pages, tmp_path / "work_keep", keep_cfg)
     assert len(kept) == 1
     assert kept[0].is_spread is True
-    assert (kept[0].width, kept[0].height) == (1264, 1680)
+    assert kept[0].width > kept[0].height
+    assert (kept[0].width, kept[0].height) == (2528, 1264)
     with Image.open(kept[0].processed_path) as keep_img:
-        assert keep_img.size == (1264, 1680)
-        # Top and bottom white padding outside 632px height ((1680-632)/2 = 524)
-        assert keep_img.getpixel((632, 100)) == 255
-        assert keep_img.getpixel((632, 1580)) == 255
-        # Horizontal edges within content band (y=840) reach full width
-        assert keep_img.getpixel((10, 840)) > 100
-        assert keep_img.getpixel((1250, 600)) == 0
+        assert keep_img.size == (2528, 1264)
+        # Left side holds darkened gray (~136), top-right quadrant holds black marker (0)
+        assert keep_img.getpixel((200, 600)) > 100
+        assert keep_img.getpixel((2200, 200)) == 0
+
+
+def test_pillow_fallback_portrait_wide_banner_not_erroneously_split(tmp_path: Path) -> None:
+    """Portrait pages with wide artwork surrounded by white space must not split in SPLIT mode."""
+    portrait = Image.new("L", (1000, 1600), color=255)
+    draw = ImageDraw.Draw(portrait)
+    draw.rectangle([50, 600, 950, 1000], fill=40)
+    src = _save_image(portrait, tmp_path / "extracted" / "0000_portrait.png")
+
+    pages = [
+        PageAsset(
+            index=0,
+            source_path=src,
+            width=1000,
+            height=1600,
+            is_cover=True,
+            is_spread=False,
+        )
+    ]
+    cfg = _make_config(tmp_path, spread_mode=SpreadMode.SPLIT, no_kcc=True)
+    result = ImagePreprocessor().process(pages, tmp_path / "work_banner", cfg)
+    assert len(result) == 1
+    assert (result[0].width, result[0].height) == (1264, 1680)
+    assert result[0].is_spread is False
 
 
 def test_kcc_backend_stages_pages_builds_command_and_unpacks_cbz(
@@ -287,6 +307,8 @@ def test_kcc_backend_stages_pages_builds_command_and_unpacks_cbz(
     assert captured_envs[0]["TMPDIR"] == expected_tmp
     assert captured_envs[0]["TEMP"] == expected_tmp
     assert captured_envs[0]["TMP"] == expected_tmp
+    assert captured_envs[0]["PYTHONIOENCODING"] == "utf-8"
+    assert captured_envs[0]["PYTHONUTF8"] == "1"
     cmd = captured_cmds[0]
     assert cmd == [
         str(fake_kcc),

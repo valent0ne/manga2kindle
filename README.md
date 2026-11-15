@@ -89,11 +89,13 @@ Generate numbered PNG overlays with green panel boxes, `[1]`/`[2]` ordinals, and
 ```bash
 uv run manga2kindle preview-panels \
   -i "Chapter 01.cbz" \
-  -o ./preview \
+  --output-dir ./preview \
   -p KPW5 \
   -d rtl \
   -s split
 ```
+
+(`preview-panels` defaults `-o, --output-dir` to `<input.parent>/<name>_preview`.)
 
 ### 3. Convert to PDOC KFX (`convert`)
 
@@ -125,14 +127,14 @@ uv run manga2kindle convert -i ./Chapters -o ./KFX_Output -w 4
 uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 ```
 
-### Key Flags
+### Key Flags (`convert`)
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `-i, --input` | *(required)* | Input `.cbz`/`.cbr`, image directory, or batch archive directory |
-| `-o, --output` | `<input.parent>/<stem>.kfx` | Output `.kfx` file or output directory |
+| `-o, --output` | `<input.parent>/<name>.kfx` (single) / `<input>` (batch) | Output `.kfx` file or output directory |
 | `-p, --profile` | `KPW5` | Device preset: `KPW5` (1264x1680), `KS` (1860x2480), `OASIS`, or `CUSTOM` |
-| `--custom-size` | `None` | Custom `WIDTHxHEIGHT` when `-p CUSTOM` is set |
+| `--custom-size` | `None` | Custom `WIDTHxHEIGHT` (requires `-p CUSTOM`) |
 | `-d, --direction` | `rtl` | Reading direction (`rtl` or `ltr`) |
 | `-s, --spread-mode` | `split` | Double-page spread handling (`split`, `rotate`, or `keep`) |
 | `-z, --zoom-factor` | `1.5` | Guided View magnification factor (`>= 1.0`) |
@@ -141,8 +143,8 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 | `--no-kcc` | `false` | Use pure-Pillow E-Ink preprocessing instead of `kcc-c2e` |
 | `--keep-temp` | `false` | Keep temporary staging and intermediate `.kpf` directories |
 | `-w, --workers` | CPU count | Parallel worker threads |
-| `--title` / `--author` | archive stem / `None` | Override KFX book title and author metadata |
-| `--kcc-path` / `--calibre-path` / `--previewer-path` | auto-discovered | Explicit executable path overrides |
+| `--title` / `--author` | archive/folder name / `None` | Override KFX book title (single book) and author metadata |
+| `--kcc-path` / `--calibre-path` | auto-discovered | Explicit executable path overrides (`doctor` also accepts `--previewer-path`) |
 
 ## Kindle USB Sideloading (`PDOC`)
 

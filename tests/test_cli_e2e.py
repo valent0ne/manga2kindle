@@ -309,6 +309,9 @@ class TestConvertCliMocked:
             names = set(zf.namelist())
             assert "book.kdf" in names
             assert "book.kcb" in names
+            raw_kdf = zf.read("book.kdf")
+            assert b"Sample Manga Vol 1" in raw_kdf
+            assert b"Sample Author" in raw_kdf
 
         assert created_temps
         for temp_dir in created_temps:
@@ -492,6 +495,90 @@ class TestConvertCliMocked:
         single_out = pipeline.run(single_cfg)
         assert single_out == [tmp_path / "single_out" / "single_folder.kfx"]
         assert single_out[0].is_file()
+
+        batch_dir = tmp_path / "batch_via_run"
+        batch_dir.mkdir()
+        _make_cbz(batch_dir / "v01.cbz", num_pages=1)
+        _make_cbz(batch_dir / "v02.cbz", num_pages=1)
+        batch_cfg = ConversionConfig(
+            input_path=batch_dir,
+            output_path=tmp_path / "batch_out",
+            profile=DeviceProfile.from_name("KPW5"),
+            no_kcc=True,
+        )
+        batch_out = pipeline.run(batch_cfg)
+        assert sorted(p.name for p in batch_out) == ["v01.kfx", "v02.kfx"]
+        assert all(p.is_file() for p in batch_out)
+
+    def test_convert_dotted_directory_name_preserves_full_folder_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dotted_dir = tmp_path / "Manga Vol. 1"
+        dotted_dir.mkdir()
+        _make_panel_page(dotted_dir / "001.png")
+        self._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+
+        result = runner.invoke(app, ["convert", "-i", str(dotted_dir), "--no-kcc"])
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "Manga Vol. 1.kfx").is_file()
+
+    def test_convert_rejects_batch_stem_collision(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        batch_dir = tmp_path / "colliding_batch"
+        batch_dir.mkdir()
+        _make_cbz(batch_dir / "chapter_01.cbz", num_pages=1)
+        (batch_dir / "chapter_01.cbr").write_bytes(b"Rar!stub")
+        self._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+
+        result = runner.invoke(app, ["convert", "-i", str(batch_dir), "--no-kcc"])
+        assert result.exit_code != 0
+        assert "collision" in result.output.lower()
+
+    def test_cli_validation_and_version_errors(self, tmp_path: Path) -> None:
+        ver_res = runner.invoke(app, ["--version"])
+        assert ver_res.exit_code == 0
+        assert "manga2kindle" in ver_res.output
+
+        cbz_path = _make_cbz(tmp_path / "single.cbz", num_pages=1)
+
+        bad_custom = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "-p", "KPW5", "--custom-size", "1000x1400"],
+        )
+        assert bad_custom.exit_code != 0
+
+        bad_dims = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "-p", "CUSTOM", "--custom-size", "not-a-size"],
+        )
+        assert bad_dims.exit_code != 0
+
+        bad_zoom = runner.invoke(app, ["convert", "-i", str(cbz_path), "-z", "0.5"])
+        assert bad_zoom.exit_code != 0
+
+        bad_workers = runner.invoke(app, ["convert", "-i", str(cbz_path), "-w", "0"])
+        assert bad_workers.exit_code != 0
+
+        batch_dir = tmp_path / "batch_val"
+        batch_dir.mkdir()
+        _make_cbz(batch_dir / "c1.cbz", num_pages=1)
+        bad_batch_out = runner.invoke(
+            app, ["convert", "-i", str(batch_dir), "-o", str(tmp_path / "file.kfx")]
+        )
+        assert bad_batch_out.exit_code != 0
+
+        existing_file = tmp_path / "already_a_file"
+        existing_file.write_text("occupied")
+        bad_existing = runner.invoke(
+            app, ["convert", "-i", str(batch_dir), "-o", str(existing_file)]
+        )
+        assert bad_existing.exit_code != 0
+
+        bad_batch_title = runner.invoke(
+            app, ["convert", "-i", str(batch_dir), "--title", "Series"]
+        )
+        assert bad_batch_title.exit_code != 0
 
 
 class TestConvertCliIntegration:
