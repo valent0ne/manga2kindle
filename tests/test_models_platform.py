@@ -1,0 +1,229 @@
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+from pydantic import ValidationError
+
+from manga2kindle.models import (
+    ConversionConfig,
+    DeviceProfile,
+    PageAsset,
+    PanelBox,
+    ReadingDirection,
+    SpreadMode,
+    ZoomRect,
+)
+from manga2kindle.platform import PlatformDiscovery, ToolStatus
+
+
+def test_device_profile_presets():
+    kpw5 = DeviceProfile.from_name("KPW5")
+    assert (kpw5.width, kpw5.height, kpw5.kcc_code) == (1264, 1680, "KPW5")
+    ks = DeviceProfile.from_name("KS")
+    assert (ks.width, ks.height, ks.kcc_code) == (1860, 2480, "KS")
+    oasis = DeviceProfile.from_name("OASIS")
+    assert (oasis.width, oasis.height, oasis.kcc_code) == (1264, 1680, "KO")
+    custom = DeviceProfile.from_name("CUSTOM", custom_size=(1400, 1900))
+    assert (custom.width, custom.height, custom.kcc_code) == (1400, 1900, "OTHER")
+    with pytest.raises(ValueError):
+        DeviceProfile.from_name("CUSTOM")
+    with pytest.raises(ValueError):
+        DeviceProfile.from_name("UNKNOWN")
+
+
+def test_conversion_config_defaults_and_validators(tmp_path):
+    profile = DeviceProfile.from_name("KPW5")
+    cfg = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=profile,
+    )
+    assert cfg.direction == ReadingDirection.RTL
+    assert cfg.spread_mode == SpreadMode.SPLIT
+    assert cfg.zoom_factor == 1.5
+    assert cfg.padding == 0.02
+    assert cfg.min_panel_area == 0.03
+    assert cfg.no_kcc is False
+    assert cfg.keep_temp is False
+    assert cfg.workers >= 1
+
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            zoom_factor=0.9,
+        )
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            padding=-0.01,
+        )
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            padding=0.30,
+        )
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            min_panel_area=0.005,
+        )
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            min_panel_area=0.60,
+        )
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            workers=0,
+        )
+
+
+def test_panel_and_page_models(tmp_path):
+    panel = PanelBox(x=10, y=20, w=300, h=400, ordinal=1)
+    zoom = ZoomRect(x=0, y=0, w=450, h=600)
+    page = PageAsset(
+        index=0,
+        source_path=tmp_path / "0000.png",
+        width=1264,
+        height=1680,
+        is_cover=True,
+        panels=[panel],
+    )
+    assert panel.ordinal == 1
+    assert zoom.w == 450
+    assert page.is_cover is True
+    assert len(page.panels) == 1
+
+
+def test_platform_discovery_windows_candidates(tmp_path, monkeypatch):
+    fake_calibre = tmp_path / "Calibre2" / "calibre-debug.exe"
+    fake_calibre.parent.mkdir(parents=True)
+    fake_calibre.write_text("stub")
+    disc = PlatformDiscovery(system="win32")
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "x86"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    assert disc.find_calibre() == fake_calibre
+
+
+def test_platform_discovery_override_takes_precedence(tmp_path):
+    custom = tmp_path / "custom-kcc"
+    custom.write_text("stub")
+    disc = PlatformDiscovery(system="darwin")
+    assert disc.find_kcc(override=custom) == custom
+
+
+def test_platform_discovery_kcc_and_previewer_windows(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "venv"
+    bin_dir.mkdir(parents=True)
+    fake_kcc = bin_dir / "kcc-c2e.exe"
+    fake_kcc.write_text("stub")
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python.exe"))
+    monkeypatch.setattr("shutil.which", lambda _: None)
+
+    local_app = tmp_path / "LocalAppData"
+    fake_kp4 = local_app / "Amazon" / "Kindle Previewer 4" / "lib" / "fc" / "bin" / "KindlePreviewer4CLI.exe"
+    fake_kp4.parent.mkdir(parents=True)
+    fake_kp4.write_text("stub")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "pfx86"))
+
+    disc = PlatformDiscovery(system="win32")
+    assert disc.find_kcc() == fake_kcc
+    assert disc.find_previewer4() == fake_kp4
+
+
+def test_platform_discovery_unrar_which(tmp_path, monkeypatch):
+    fake_unar = tmp_path / "unar"
+    fake_unar.write_text("stub")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: str(fake_unar) if name == "unar" else None,
+    )
+    disc = PlatformDiscovery(system="darwin")
+    assert disc.find_unrar() == fake_unar
+
+
+def test_platform_discovery_run_doctor(tmp_path, monkeypatch):
+    kcc = tmp_path / "kcc-c2e"
+    calibre = tmp_path / "calibre-debug"
+    kp4 = tmp_path / "KindlePreviewer4CLI"
+    unrar = tmp_path / "unrar"
+    for p in (kcc, calibre, kp4, unrar):
+        p.write_text("stub")
+
+    disc = PlatformDiscovery(system="darwin")
+    monkeypatch.setattr(disc, "find_kcc", lambda override=None: kcc)
+    monkeypatch.setattr(disc, "find_calibre", lambda override=None: calibre)
+    monkeypatch.setattr(disc, "find_previewer4", lambda override=None: kp4)
+    monkeypatch.setattr(disc, "find_unrar", lambda: unrar)
+
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        recorded_cmds.append(cmd)
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+        if "KFX Output" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="KFX Output 2.19.0", stderr="")
+        if "--help" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="comic2ebook v13.0.1 - ...", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="1.0.0", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    statuses = disc.run_doctor()
+    by_name = {s.name: s for s in statuses}
+    assert all(isinstance(s, ToolStatus) for s in statuses)
+    assert by_name["kcc-c2e"].found is True
+    assert by_name["kcc-c2e"].version == "comic2ebook v13.0.1 - ..."
+    assert any(cmd[0] == str(kcc) and cmd[1] == "--help" for cmd in recorded_cmds)
+    assert by_name["calibre-debug"].found is True
+    assert by_name["KFX Output"].found is True
+    assert by_name["Kindle Previewer 4"].found is True
+    assert by_name["unrar/unar/7z"].found is True
+
+
+def test_platform_discovery_find_unrar_includes_7zz(tmp_path, monkeypatch):
+    fake_7zz = tmp_path / "7zz"
+    fake_7zz.write_text("stub")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: str(fake_7zz) if name == "7zz" else None,
+    )
+    disc = PlatformDiscovery(system="darwin")
+    assert disc.find_unrar() == fake_7zz
+
+
+def test_platform_discovery_run_doctor_missing_tools(monkeypatch):
+    disc = PlatformDiscovery(system="darwin")
+    monkeypatch.setattr(disc, "find_kcc", lambda override=None: None)
+    monkeypatch.setattr(disc, "find_calibre", lambda override=None: None)
+    monkeypatch.setattr(disc, "find_previewer4", lambda override=None: None)
+    monkeypatch.setattr(disc, "find_unrar", lambda: None)
+
+    statuses = disc.run_doctor()
+    by_name = {s.name: s for s in statuses}
+    assert by_name["kcc-c2e"].found is False
+    assert by_name["calibre-debug"].found is False
+    assert by_name["KFX Output"].found is False
+    assert by_name["KFX Output"].details == "calibre-debug not found"
+    assert by_name["Kindle Previewer 4"].found is False
+    assert by_name["unrar/unar/7z"].found is False
+

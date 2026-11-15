@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manga2kindle"
+version = "0.1.0"
+description = "Cross-platform headless CLI to convert CBZ/CBR manga into PDOC-tagged KFX with Guided View panels"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python-headless>=4.8.0",
+    "pillow>=10.0.0",
+    "typer[all]>=0.9.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "rarfile>=4.0",
+    "KindleComicConverter @ git+https://github.com/ciromattia/kcc.git",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+manga2kindle = "manga2kindle.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manga2kindle"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
