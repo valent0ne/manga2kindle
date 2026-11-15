@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import uuid
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image
 
@@ -23,6 +24,7 @@ from manga2kindle.packaging.ion import (
     SYM_ABSOLUTE,
     SYM_ACTION,
     SYM_ACTIONS,
+    SYM_ALT_STYLE,
     SYM_AUXILIARY_DATA,
     SYM_BINDING,
     SYM_BLOCK,
@@ -31,6 +33,7 @@ from manga2kindle.packaging.ion import (
     SYM_CATEGORIES,
     SYM_CATEGORY_NAME,
     SYM_CHILDREN,
+    SYM_CLIP,
     SYM_CONTAINER,
     SYM_CONTENT_FEATURES,
     SYM_COUNT,
@@ -40,6 +43,8 @@ from manga2kindle.packaging.ion import (
     SYM_EIDHASH_EID_SECTION_MAP,
     SYM_EXTERNAL_RESOURCE,
     SYM_FEATURES_LIST,
+    SYM_FILL_COLOR,
+    SYM_FILL_OPACITY,
     SYM_FIT_BOTH,
     SYM_FIT_TYPE,
     SYM_FIXED,
@@ -62,6 +67,7 @@ from manga2kindle.packaging.ion import (
     SYM_LOCAL_SOURCE_FILE_NAME,
     SYM_LOCATION,
     SYM_MAGNIFY,
+    SYM_MAGNIFY_TARGET,
     SYM_MAJOR_VERSION,
     SYM_METADATA,
     SYM_MINOR_VERSION,
@@ -72,7 +78,6 @@ from manga2kindle.packaging.ion import (
     SYM_PAGE_PROGRESSION_DIR,
     SYM_PAGE_TEMPLATE_TYPE,
     SYM_PAGE_WIDTH,
-    SYM_PAN_ZOOM_VIEWER,
     SYM_PERCENTAGE,
     SYM_PNG,
     SYM_POSITION_MAP,
@@ -95,6 +100,8 @@ from manga2kindle.packaging.ion import (
     SYM_STORYLINE,
     SYM_STORYLINE_ID,
     SYM_STRUCTURE,
+    SYM_STYLE,
+    SYM_STYLE_NAME,
     SYM_SYS_MAX_ID,
     SYM_SYS_VERSION,
     SYM_TARGET_ID,
@@ -189,8 +196,47 @@ def _dim_pct(val: float | int, total: float | int) -> IonStruct:
     ])
 
 
+@dataclass(frozen=True)
+class PanelZoomLayout:
+    """Screen-fit viewport and zoomed image placement for a Guided View panel."""
+
+    scale: float
+    vp_left: float
+    vp_top: float
+    vp_w: float
+    vp_h: float
+    img_left: float
+    img_top: float
+    img_w: float
+    img_h: float
+
+
 class KpfBuilder:
     """Fixed-layout KPF package builder with Guided View panel magnification."""
+
+    @staticmethod
+    def compute_panel_zoom_layout(
+        panel: PanelBox,
+        page_w: int,
+        page_h: int,
+    ) -> PanelZoomLayout:
+        """Compute Kindle Create screen-fit clipping viewport and zoomed image coordinates."""
+        scale = min(float(page_w) / float(panel.w), float(page_h) / float(panel.h))
+        vp_w = float(panel.w) * scale
+        vp_h = float(panel.h) * scale
+        vp_left = (float(page_w) - vp_w) / 2.0
+        vp_top = (float(page_h) - vp_h) / 2.0
+        return PanelZoomLayout(
+            scale=scale,
+            vp_left=vp_left,
+            vp_top=vp_top,
+            vp_w=vp_w,
+            vp_h=vp_h,
+            img_left=-float(panel.x) * scale,
+            img_top=-float(panel.y) * scale,
+            img_w=float(page_w) * scale,
+            img_h=float(page_h) * scale,
+        )
 
     @staticmethod
     def compute_zoom_rect(
@@ -236,6 +282,8 @@ class KpfBuilder:
 
         ids = IdAllocator()
         res_list_id = ids.next_id("d")
+        # Single-letter prefix 'a' is required by KFX Output SHORT symbol validation.
+        bg_style_ids = (ids.next_id("a"), ids.next_id("a"))
         page_data = self._allocate_page_data(pages, ids)
 
         fragments: list[tuple[str, str, bytes]] = []
@@ -251,6 +299,7 @@ class KpfBuilder:
             page_data=page_data,
             ids=ids,
             res_list_id=res_list_id,
+            bg_style_ids=bg_style_ids,
             title=title,
             config=config,
             author=author,
@@ -262,7 +311,7 @@ class KpfBuilder:
         for pd in page_data:
             self._append_page_fragments(
                 pd=pd,
-                config=config,
+                bg_style_ids=bg_style_ids,
                 fragments=fragments,
                 frag_props=frag_props,
                 gc_frag_props=gc_frag_props,
@@ -327,6 +376,9 @@ class KpfBuilder:
                     "ordinal": p.ordinal if p.ordinal > 0 else (idx + 1),
                     "src_eid": ids.next_id("p"),
                     "tgt_eid": ids.next_id("t"),
+                    "bg_eid": ids.next_id("b"),
+                    "vp_eid": ids.next_id("v"),
+                    "zoom_img_eid": ids.next_id("z"),
                 }
                 for idx, p in enumerate(page.panels)
             ]
@@ -359,6 +411,7 @@ class KpfBuilder:
         page_data: list[dict],
         ids: IdAllocator,
         res_list_id: str,
+        bg_style_ids: tuple[str, str],
         title: str,
         config: ConversionConfig,
         author: str | None,
@@ -479,11 +532,123 @@ class KpfBuilder:
         ]))
         self._record_blob(fragments, frag_props, gc_reachable, res_list_id, "auxiliary_data", res_list_ion)
 
+        # Backdrop style fragments ($157) shared by Guided View popup containers
+        for st_id in bg_style_ids:
+            st_ion = IonAnnotation([SYM_STYLE], IonStruct([
+                (SYM_STYLE_NAME, IonEidRef(st_id)),
+                (SYM_FILL_COLOR, 0),
+                (SYM_FILL_OPACITY, IonFloat64(1.0)),
+            ]))
+            self._record_blob(fragments, frag_props, gc_reachable, st_id, "style", st_ion)
+
+    def _append_panel_fragments(
+        self,
+        *,
+        p_info: dict,
+        page_w: int,
+        page_h: int,
+        e_id: str,
+        bg_style_ids: tuple[str, str],
+        fragments: list[tuple[str, str, bytes]],
+        frag_props: list[tuple[str, str, str]],
+        gc_reachable: set[str],
+    ) -> list[str]:
+        """Append Guided View trigger, $439 popup target, backdrop, viewport, and zoom image."""
+        p_box: PanelBox = p_info["panel"]
+        ordinal: int = p_info["ordinal"]
+        src_eid: str = p_info["src_eid"]
+        tgt_eid: str = p_info["tgt_eid"]
+        bg_eid: str = p_info["bg_eid"]
+        vp_eid: str = p_info["vp_eid"]
+        zoom_img_eid: str = p_info["zoom_img_eid"]
+        bg_style_id, bg_alt_style_id = bg_style_ids
+
+        layout = self.compute_panel_zoom_layout(p_box, page_w, page_h)
+        pct_100 = _dim_pct(100, 100)
+        pct_0 = _dim_pct(0, 100)
+
+        activate_act = IonStruct([
+            (SYM_ACTION, IonSymbol(SYM_MAGNIFY)),
+            (SYM_SOURCE_ID, IonEidRef(src_eid)),
+            (SYM_TARGET_ID, IonEidRef(tgt_eid)),
+        ])
+        src_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
+            (SYM_SELF_REF, IonEidRef(src_eid)),
+            (SYM_POSITION_TYPE, IonSymbol(SYM_ABSOLUTE)),
+            (SYM_FIT_TYPE, IonSymbol(SYM_FIT_BOTH)),
+            (SYM_WIDTH, IonFloat64(float(p_box.w))),
+            (SYM_HEIGHT, IonFloat64(float(p_box.h))),
+            (SYM_TOP, IonFloat64(float(p_box.y))),
+            (SYM_LEFT, IonFloat64(float(p_box.x))),
+            (SYM_ACTIONS, IonList([activate_act])),
+            (SYM_ORDINAL, ordinal),
+            (SYM_NODE_TYPE, IonSymbol(SYM_CONTAINER)),
+        ]))
+        self._record_blob(fragments, frag_props, gc_reachable, src_eid, "structure", src_node)
+
+        tgt_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
+            (SYM_SELF_REF, IonEidRef(tgt_eid)),
+            (SYM_WIDTH, pct_100),
+            (SYM_HEIGHT, pct_100),
+            (SYM_POSITION_TYPE, IonSymbol(SYM_ABSOLUTE)),
+            (SYM_NODE_TYPE, IonSymbol(SYM_MAGNIFY_TARGET)),
+            (SYM_FIT_TYPE, IonSymbol(SYM_FIT_BOTH)),
+            (SYM_CHILDREN, IonList([IonEidRef(bg_eid), IonEidRef(vp_eid)])),
+        ]))
+        self._record_blob(fragments, frag_props, gc_reachable, tgt_eid, "structure", tgt_node)
+        frag_props.append((tgt_eid, "child", bg_eid))
+        frag_props.append((tgt_eid, "child", vp_eid))
+
+        bg_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
+            (SYM_SELF_REF, IonEidRef(bg_eid)),
+            (SYM_WIDTH, pct_100),
+            (SYM_HEIGHT, pct_100),
+            (SYM_TOP, pct_0),
+            (SYM_LEFT, pct_0),
+            (SYM_STYLE, IonEidRef(bg_style_id)),
+            (SYM_ALT_STYLE, IonEidRef(bg_alt_style_id)),
+            (SYM_NODE_TYPE, IonSymbol(SYM_CONTAINER)),
+        ]))
+        self._record_blob(fragments, frag_props, gc_reachable, bg_eid, "structure", bg_node)
+        frag_props.append((bg_eid, "child", bg_style_id))
+        frag_props.append((bg_eid, "child", bg_alt_style_id))
+
+        vp_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
+            (SYM_SELF_REF, IonEidRef(vp_eid)),
+            (SYM_POSITION_TYPE, IonSymbol(SYM_ABSOLUTE)),
+            (SYM_FIT_TYPE, IonSymbol(SYM_FIT_BOTH)),
+            (SYM_WIDTH, IonFloat64(layout.vp_w)),
+            (SYM_HEIGHT, IonFloat64(layout.vp_h)),
+            (SYM_TOP, IonFloat64(layout.vp_top)),
+            (SYM_LEFT, IonFloat64(layout.vp_left)),
+            (SYM_CLIP, True),
+            (SYM_NODE_TYPE, IonSymbol(SYM_CONTAINER)),
+            (SYM_CHILDREN, IonList([IonEidRef(zoom_img_eid)])),
+        ]))
+        self._record_blob(fragments, frag_props, gc_reachable, vp_eid, "structure", vp_node)
+        frag_props.append((vp_eid, "child", zoom_img_eid))
+
+        zoom_img_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
+            (SYM_SELF_REF, IonEidRef(zoom_img_eid)),
+            (SYM_POSITION_TYPE, IonSymbol(SYM_ABSOLUTE)),
+            (SYM_FIT_TYPE, IonSymbol(SYM_FIT_BOTH)),
+            (SYM_WIDTH, IonFloat64(layout.img_w)),
+            (SYM_HEIGHT, IonFloat64(layout.img_h)),
+            (SYM_TOP, IonFloat64(layout.img_top)),
+            (SYM_LEFT, IonFloat64(layout.img_left)),
+            (SYM_NODE_TYPE, IonSymbol(SYM_LEAF)),
+            (SYM_RESOURCE_ID, IonEidRef(e_id)),
+        ]))
+        self._record_blob(fragments, frag_props, gc_reachable, zoom_img_eid, "structure", zoom_img_node)
+        frag_props.append((zoom_img_eid, "child", e_id))
+
+        return [src_eid, tgt_eid, bg_eid, vp_eid, zoom_img_eid]
+
     def _append_page_fragments(
         self,
         *,
         pd: dict,
-        config: ConversionConfig,
+        bg_style_ids: tuple[str, str],
         fragments: list[tuple[str, str, bytes]],
         frag_props: list[tuple[str, str, str]],
         gc_frag_props: list[tuple[str, str, str]],
@@ -521,18 +686,22 @@ class KpfBuilder:
         self._record_blob(fragments, frag_props, gc_reachable, sid, "section", section_ion)
         frag_props.append((sid, "child", l_id))
 
-        # Storyline
-        story_children = [i_cont] + [p["src_eid"] for p in panels] + [p["tgt_eid"] for p in panels]
+        # Storyline contains ONLY the page image container; panels nest inside i_cont
         story_ion = IonAnnotation([SYM_STORYLINE], IonStruct([
             (SYM_STORYLINE_ID, IonEidRef(l_id)),
-            (SYM_CHILDREN, IonList([IonEidRef(cid) for cid in story_children])),
+            (SYM_CHILDREN, IonList([IonEidRef(i_cont)])),
         ]))
         self._record_blob(fragments, frag_props, gc_reachable, l_id, "storyline", story_ion)
-        for cid in [*story_children, l_id]:
+        for cid in (i_cont, l_id):
             frag_props.append((l_id, "child", cid))
             gc_frag_props.append((l_id, "child", cid))
 
-        # Image container + leaf
+        # Page container holds leaf image followed by interleaved src/tgt panel triggers & popups
+        cont_children = [i_leaf]
+        for p_info in panels:
+            cont_children.append(p_info["src_eid"])
+            cont_children.append(p_info["tgt_eid"])
+
         cont_ion = IonAnnotation([SYM_STRUCTURE], IonStruct([
             (SYM_SELF_REF, IonEidRef(i_cont)),
             (SYM_WIDTH, w),
@@ -540,10 +709,11 @@ class KpfBuilder:
             (SYM_POSITION_TYPE, IonSymbol(SYM_ABSOLUTE)),
             (SYM_LAYOUT_TYPE, IonSymbol(SYM_BLOCK)),
             (SYM_NODE_TYPE, IonSymbol(SYM_CONTAINER)),
-            (SYM_CHILDREN, IonList([IonEidRef(i_leaf)])),
+            (SYM_CHILDREN, IonList([IonEidRef(cid) for cid in cont_children])),
         ]))
         self._record_blob(fragments, frag_props, gc_reachable, i_cont, "structure", cont_ion)
-        frag_props.append((i_cont, "child", i_leaf))
+        for cid in cont_children:
+            frag_props.append((i_cont, "child", cid))
 
         leaf_ion = IonAnnotation([SYM_STRUCTURE], IonStruct([
             (SYM_SELF_REF, IonEidRef(i_leaf)),
@@ -557,50 +727,20 @@ class KpfBuilder:
         self._record_blob(fragments, frag_props, gc_reachable, i_leaf, "structure", leaf_ion)
         frag_props.append((i_leaf, "child", e_id))
 
-        # Guided View Panel Containers
-        binding_sym = (
-            SYM_RIGHT_TO_LEFT_BINDING
-            if config.direction == ReadingDirection.RTL
-            else SYM_LEFT_TO_RIGHT_BINDING
-        )
+        panel_eids: list[str] = []
         for p_info in panels:
-            p_box: PanelBox = p_info["panel"]
-            ordinal: int = p_info["ordinal"]
-            src_eid: str = p_info["src_eid"]
-            tgt_eid: str = p_info["tgt_eid"]
-            zoom_rect = self.compute_zoom_rect(p_box, w, h, config.zoom_factor)
-
-            activate_act = IonStruct([
-                (SYM_ACTION, IonSymbol(SYM_MAGNIFY)),
-                (SYM_SOURCE_ID, IonEidRef(src_eid)),
-                (SYM_TARGET_ID, IonEidRef(tgt_eid)),
-            ])
-            src_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
-                (SYM_SELF_REF, IonEidRef(src_eid)),
-                (SYM_NODE_TYPE, IonSymbol(SYM_CONTAINER)),
-                (SYM_LAYOUT_TYPE, IonSymbol(SYM_FIT_BOTH)),
-                (SYM_FIT_TYPE, IonSymbol(SYM_FIT_BOTH)),
-                (SYM_LEFT, _dim_pct(p_box.x, w)),
-                (SYM_TOP, _dim_pct(p_box.y, h)),
-                (SYM_WIDTH, _dim_pct(p_box.w, w)),
-                (SYM_HEIGHT, _dim_pct(p_box.h, h)),
-                (SYM_PAN_ZOOM_VIEWER, IonSymbol(binding_sym)),
-                (SYM_ORDINAL, ordinal),
-                (SYM_ACTIONS, IonList([activate_act])),
-            ]))
-            self._record_blob(fragments, frag_props, gc_reachable, src_eid, "structure", src_node)
-
-            tgt_node = IonAnnotation([SYM_STRUCTURE], IonStruct([
-                (SYM_SELF_REF, IonEidRef(tgt_eid)),
-                (SYM_NODE_TYPE, IonSymbol(SYM_CONTAINER)),
-                (SYM_LAYOUT_TYPE, IonSymbol(SYM_FIT_BOTH)),
-                (SYM_FIT_TYPE, IonSymbol(SYM_FIT_BOTH)),
-                (SYM_LEFT, _dim_pct(zoom_rect.x, w)),
-                (SYM_TOP, _dim_pct(zoom_rect.y, h)),
-                (SYM_WIDTH, _dim_pct(zoom_rect.w, w)),
-                (SYM_HEIGHT, _dim_pct(zoom_rect.h, h)),
-            ]))
-            self._record_blob(fragments, frag_props, gc_reachable, tgt_eid, "structure", tgt_node)
+            panel_eids.extend(
+                self._append_panel_fragments(
+                    p_info=p_info,
+                    page_w=w,
+                    page_h=h,
+                    e_id=e_id,
+                    bg_style_ids=bg_style_ids,
+                    fragments=fragments,
+                    frag_props=frag_props,
+                    gc_reachable=gc_reachable,
+                )
+            )
 
         # External resource & bcRawMedia row
         rsrc_rel_path = f"res/{rsrc_id}"
@@ -634,7 +774,7 @@ class KpfBuilder:
         ]))
         self._record_blob(fragments, frag_props, gc_reachable, d_id, "auxiliary_data", aux_ion)
 
-        spim_eids = [t_eid, i_cont, i_leaf] + [p["src_eid"] for p in panels] + [p["tgt_eid"] for p in panels]
+        spim_eids = [t_eid, i_cont, i_leaf] + panel_eids
         spm_ion = IonAnnotation([SYM_SECTION_POSITION_ID_MAP], IonStruct([
             (SYM_SECTION_ID, IonEidRef(sid)),
             (SYM_POSITION_MAP, IonList([
@@ -647,9 +787,8 @@ class KpfBuilder:
         )
 
         eid_section_map.extend([(sid, sid), (t_eid, sid), (i_cont, sid), (i_leaf, sid)])
-        for p_info in panels:
-            eid_section_map.append((p_info["src_eid"], sid))
-            eid_section_map.append((p_info["tgt_eid"], sid))
+        for panel_eid in panel_eids:
+            eid_section_map.append((panel_eid, sid))
         section_pid_counts.append((sid, len(spim_eids)))
 
     def _append_eid_maps(

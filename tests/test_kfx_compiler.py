@@ -322,6 +322,32 @@ class TestKfxCompilerIntegration:
         assert kfx_path.stat().st_size > 0
         assert compiler.verify_pdoc(kfx_path) is True
 
+        # Verify KFX Output preserves Kindle Create Guided View hierarchy ($439 targets, $157 styles)
+        raw_kfx = kfx_path.read_bytes()
+        assert b"yj_publisher_panels" in raw_kfx
+        inspect_res = subprocess.run(
+            [
+                str(calibre_debug),
+                "-c",
+                (
+                    "import os, sys; from calibre.utils.config import config_dir; "
+                    "sys.path.insert(0, os.path.join(config_dir, 'plugins', 'KFX Output.zip')); "
+                    "from kfxlib.yj_book import YJ_Book; "
+                    f"b = YJ_Book({str(kfx_path)!r}); b.decode_book(); b.check_consistency(); "
+                    "st = [f for f in b.fragments if f.ftype == '$157']; "
+                    "sl = [f for f in b.fragments if f.ftype == '$259']; "
+                    "tgts = [c for f in sl for top in f.value['$146'] for c in top['$146'] if c.get('$159') == '$439']; "
+                    "assert len(st) == 2, len(st); "
+                    "assert len(tgts) == 4, len(tgts); "
+                    "print('GUIDED_VIEW_OK', len(st), len(tgts))"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "GUIDED_VIEW_OK 2 4" in inspect_res.stdout
+
         corrupt_kfx = tmp_path / "corrupt.kfx"
         corrupt_kfx.write_bytes(b"not-a-real-kfx-PDOC")
         assert compiler.verify_pdoc(corrupt_kfx) is False
