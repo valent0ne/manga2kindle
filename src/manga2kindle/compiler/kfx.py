@@ -31,6 +31,8 @@ class KfxCompiler:
             [str(self.calibre_debug_path), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
 
@@ -78,7 +80,7 @@ class KfxCompiler:
         if proc.returncode != 0:
             return False
 
-        for line in reversed(proc.stdout.splitlines()):
+        for line in reversed((proc.stdout or "").splitlines()):
             if line.startswith(_META_PREFIX):
                 raw_json = line[len(_META_PREFIX) :]
                 try:
