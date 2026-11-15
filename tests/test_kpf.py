@@ -22,13 +22,22 @@ from manga2kindle.packaging.ion import (
     ION_BVM,
     SYM_ACTION,
     SYM_ACTIONS,
+    SYM_ALT_STYLE,
+    SYM_CLIP,
+    SYM_FILL_COLOR,
+    SYM_FILL_OPACITY,
     SYM_FIT_BOTH,
+    SYM_LEAF,
     SYM_MAGNIFY,
+    SYM_MAGNIFY_TARGET,
+    SYM_NODE_TYPE,
     SYM_ORDINAL,
     SYM_PAN_ZOOM_VIEWER,
-    SYM_RIGHT_TO_LEFT_BINDING,
+    SYM_RESOURCE_ID,
     SYM_SOURCE_ID,
     SYM_STRUCTURE,
+    SYM_STYLE,
+    SYM_STYLE_NAME,
     SYM_TARGET_ID,
     YJ_SYMBOLS_MAX_ID,
     IonAnnotation,
@@ -177,6 +186,49 @@ class TestComputeZoomRect:
         assert zoom.h <= 1200
         assert zoom.x == 0
         assert zoom.y == 0
+
+
+class TestComputePanelZoomLayout:
+    """Unit tests for Kindle Create screen-fit magnification geometry."""
+
+    def test_width_constrained_panel(self) -> None:
+        """Wide panel scales to full page width and centers vertically."""
+        panel = PanelBox(x=573, y=991, w=475, h=446, ordinal=1)
+        layout = KpfBuilder.compute_panel_zoom_layout(panel, page_w=1048, page_h=1696)
+        expected_scale = 1048.0 / 475.0
+        assert layout.scale == pytest.approx(expected_scale)
+        assert layout.vp_w == pytest.approx(1048.0)
+        assert layout.vp_h == pytest.approx(446.0 * expected_scale)
+        assert layout.vp_left == pytest.approx(0.0)
+        assert layout.vp_top == pytest.approx((1696.0 - 446.0 * expected_scale) / 2.0)
+        assert layout.img_w == pytest.approx(1048.0 * expected_scale)
+        assert layout.img_h == pytest.approx(1696.0 * expected_scale)
+        assert layout.img_left == pytest.approx(-573.0 * expected_scale)
+        assert layout.img_top == pytest.approx(-991.0 * expected_scale)
+
+    def test_height_constrained_panel(self) -> None:
+        """Tall narrow panel scales to full page height and centers horizontally."""
+        panel = PanelBox(x=100, y=0, w=400, h=1696, ordinal=1)
+        layout = KpfBuilder.compute_panel_zoom_layout(panel, page_w=1048, page_h=1696)
+        assert layout.scale == pytest.approx(1.0)
+        assert layout.vp_w == pytest.approx(400.0)
+        assert layout.vp_h == pytest.approx(1696.0)
+        assert layout.vp_left == pytest.approx(324.0)
+        assert layout.vp_top == pytest.approx(0.0)
+        assert layout.img_left == pytest.approx(-100.0)
+        assert layout.img_top == pytest.approx(0.0)
+
+    def test_full_page_panel(self) -> None:
+        """Full-page splash/cover panel uses scale 1.0 with zero offset."""
+        panel = PanelBox(x=0, y=0, w=1048, h=1696, ordinal=1)
+        layout = KpfBuilder.compute_panel_zoom_layout(panel, page_w=1048, page_h=1696)
+        assert layout.scale == pytest.approx(1.0)
+        assert (layout.vp_left, layout.vp_top, layout.vp_w, layout.vp_h) == pytest.approx(
+            (0.0, 0.0, 1048.0, 1696.0)
+        )
+        assert (layout.img_left, layout.img_top, layout.img_w, layout.img_h) == pytest.approx(
+            (0.0, 0.0, 1048.0, 1696.0)
+        )
 
 
 class TestKpfBuilderIntegration:
@@ -350,31 +402,84 @@ class TestKpfBuilderIntegration:
                 assert b"rsrc" in ext_blob
                 assert b"res/rsrc" not in ext_blob
 
-            # Verify Guided View trigger ($608 p*) and target ($608 t*) containers
-            cur.execute("SELECT id, payload_value FROM fragments WHERE id LIKE 'p%' ORDER BY id")
+            # Verify $157 backdrop style fragments exist cleanly
+            style_frags = {
+                fid: frags[fid][1]
+                for fid, k, v in prop_keys
+                if k == "element_type" and v == "style"
+            }
+            assert len(style_frags) == 2
+            style_annot = IonBinaryWriter.encode_varuint(SYM_STYLE)
+            fill_color_kv = IonBinaryWriter.encode_varuint(SYM_FILL_COLOR) + IonBinaryWriter.encode_int(0)
+            fill_opacity_kv = (
+                IonBinaryWriter.encode_varuint(SYM_FILL_OPACITY) + IonBinaryWriter.encode_float64(1.0)
+            )
+            for st_id, st_blob in style_frags.items():
+                assert style_annot in st_blob
+                assert (
+                    IonBinaryWriter.encode_varuint(SYM_STYLE_NAME)
+                    + IonBinaryWriter.encode_eid_ref(st_id)
+                ) in st_blob
+                assert fill_color_kv in st_blob
+                assert fill_opacity_kv in st_blob
+
+            # Verify storyline references ONLY the image container i_cont (panels nest under i_cont)
+            child_links = {(row[0], row[2]) for row in props if row[1] == "child"}
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id GLOB 'p[0-9]*' ORDER BY id")
             panel_nodes = cur.fetchall()
-            cur.execute("SELECT id, payload_value FROM fragments WHERE id LIKE 't%' ORDER BY id")
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id GLOB 't[0-9]*' ORDER BY id")
             target_nodes = cur.fetchall()
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id GLOB 'b[0-9]*' ORDER BY id")
+            backdrop_nodes = cur.fetchall()
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id GLOB 'v[0-9]*' ORDER BY id")
+            viewport_nodes = cur.fetchall()
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id GLOB 'z[0-9]*' ORDER BY id")
+            zoom_img_nodes = cur.fetchall()
             assert len(panel_nodes) == 4
             assert len(target_nodes) == 4
+            assert len(backdrop_nodes) == 4
+            assert len(viewport_nodes) == 4
+            assert len(zoom_img_nodes) == 4
+
+            # Storyline children must NOT directly include src/tgt panel nodes
+            for fid, child_id in child_links:
+                if fid.startswith("l"):
+                    assert not child_id.startswith("p")
+                    assert not child_id.startswith("t")
 
             actions_field = IonBinaryWriter.encode_varuint(SYM_ACTIONS)
             magnify_kv = (
                 IonBinaryWriter.encode_varuint(SYM_ACTION)
                 + IonBinaryWriter.encode_symbol(SYM_MAGNIFY)
             )
-            pan_zoom_kv = (
-                IonBinaryWriter.encode_varuint(SYM_PAN_ZOOM_VIEWER)
-                + IonBinaryWriter.encode_symbol(SYM_RIGHT_TO_LEFT_BINDING)
-            )
+            pan_zoom_field = IonBinaryWriter.encode_varuint(SYM_PAN_ZOOM_VIEWER)
             fit_both_sym = IonBinaryWriter.encode_symbol(SYM_FIT_BOTH)
             struct_annot = IonBinaryWriter.encode_varuint(SYM_STRUCTURE)
+            magnify_target_kv = (
+                IonBinaryWriter.encode_varuint(SYM_NODE_TYPE)
+                + IonBinaryWriter.encode_symbol(SYM_MAGNIFY_TARGET)
+            )
+            clip_true_kv = IonBinaryWriter.encode_varuint(SYM_CLIP) + b"\x11"
+            leaf_kv = (
+                IonBinaryWriter.encode_varuint(SYM_NODE_TYPE)
+                + IonBinaryWriter.encode_symbol(SYM_LEAF)
+            )
 
             target_map = dict(target_nodes)
+            backdrop_map = dict(backdrop_nodes)
+            viewport_map = dict(viewport_nodes)
+            zoom_img_map = dict(zoom_img_nodes)
             expected_ordinals = [1, 2, 1, 2]
             for (src_eid, p_val), expected_ord in zip(panel_nodes, expected_ordinals):
+                suffix = src_eid[1:]
+                tgt_eid = f"t{suffix}"
+                bg_eid = f"b{suffix}"
+                vp_eid = f"v{suffix}"
+                zoom_img_eid = f"z{suffix}"
+
+                # Trigger node: actions + ordinal + pixel geometry, NO $684
                 assert struct_annot in p_val
-                assert pan_zoom_kv in p_val
+                assert pan_zoom_field not in p_val
                 assert actions_field in p_val
                 assert magnify_kv in p_val
                 ord_kv = (
@@ -387,16 +492,37 @@ class TestKpfBuilderIntegration:
                     + IonBinaryWriter.encode_eid_ref(src_eid)
                 )
                 assert src_ref_kv in p_val
-                tgt_eid = f"t{src_eid[1:]}"
                 tgt_ref_kv = (
                     IonBinaryWriter.encode_varuint(SYM_TARGET_ID)
                     + IonBinaryWriter.encode_eid_ref(tgt_eid)
                 )
                 assert tgt_ref_kv in p_val
+
+                # Target popup ($439) -> [backdrop ($157/$429), clipping viewport ($476: True) -> zoomed image ($271/$175)]
                 t_val = target_map[tgt_eid]
                 assert struct_annot in t_val
+                assert magnify_target_kv in t_val
                 assert fit_both_sym in t_val
                 assert actions_field not in t_val
+                assert (tgt_eid, bg_eid) in child_links
+                assert (tgt_eid, vp_eid) in child_links
+
+                b_val = backdrop_map[bg_eid]
+                assert IonBinaryWriter.encode_varuint(SYM_STYLE) in b_val
+                assert IonBinaryWriter.encode_varuint(SYM_ALT_STYLE) in b_val
+
+                v_val = viewport_map[vp_eid]
+                assert clip_true_kv in v_val
+                assert (vp_eid, zoom_img_eid) in child_links
+
+                z_val = zoom_img_map[zoom_img_eid]
+                assert leaf_kv in z_val
+                assert IonBinaryWriter.encode_varuint(SYM_RESOURCE_ID) in z_val
+
+            # Each 2-panel page has 3 base EIDs + 5 per panel = 13 EIDs
+            cur.execute("SELECT payload_value FROM fragments WHERE id='yj.section_pid_count_map'")
+            pid_map = cur.fetchone()[0]
+            assert b"\x21\x0d" in pid_map
         finally:
             conn.close()
 
@@ -430,16 +556,18 @@ class TestKpfBuilderIntegration:
             # Symbol 376 (0x0178) and binding 442 (0x01BA) in document_data
             assert b"\x72\x01\x78" in doc_data
             assert b"\x72\x01\xba" in doc_data
-            # Guided View source panels ($684 / SYM_PAN_ZOOM_VIEWER) must emit $442 (0x72 0x01 0xba), NOT $441 (0x72 0x01 0xb9)
+            # Guided View source panels emit magnify actions without deprecated $684 pan_zoom_viewer
             cur.execute("SELECT payload_value FROM fragments WHERE id LIKE 'p%'")
             gv_nodes = [row[0] for row in cur.fetchall()]
             pan_zoom_field = IonBinaryWriter.encode_varuint(SYM_PAN_ZOOM_VIEWER)
-            rtl_sym = IonBinaryWriter.encode_symbol(SYM_RIGHT_TO_LEFT_BINDING)
-            ltr_sym = IonBinaryWriter.encode_symbol(442)
+            magnify_kv = (
+                IonBinaryWriter.encode_varuint(SYM_ACTION)
+                + IonBinaryWriter.encode_symbol(SYM_MAGNIFY)
+            )
             assert len(gv_nodes) == 4
             for node in gv_nodes:
-                assert (pan_zoom_field + ltr_sym) in node
-                assert (pan_zoom_field + rtl_sym) not in node
+                assert pan_zoom_field not in node
+                assert magnify_kv in node
         finally:
             conn.close()
 
