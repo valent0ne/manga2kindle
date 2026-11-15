@@ -24,10 +24,11 @@ _IMAGE_EXTENSIONS = frozenset(
 )
 _IGNORED_FILENAMES = frozenset({"thumbs.db", "comicinfo.xml"})
 _IGNORED_DIRS = frozenset({"__macosx"})
-_SPREAD_FLAGS: dict[SpreadMode, str] = {
-    SpreadMode.SPLIT: "0",
-    SpreadMode.ROTATE: "1",
-    SpreadMode.KEEP: "2",
+_SPREAD_CLI_ARGS: dict[SpreadMode, list[str]] = {
+    SpreadMode.SPLIT: ["-r", "0"],
+    SpreadMode.ROTATE: ["-r", "1"],
+    # KCC -r 2 means "Both (Split + Rotate)"; -r 1 --norotate keeps spreads unsplit and unrotated.
+    SpreadMode.KEEP: ["-r", "1", "--norotate"],
 }
 
 
@@ -175,8 +176,7 @@ class KccBackend:
             [
                 "-q",
                 "-u",
-                "-r",
-                _SPREAD_FLAGS[config.spread_mode],
+                *_SPREAD_CLI_ARGS[config.spread_mode],
                 "-f",
                 "CBZ",
                 "--mozjpeg",

@@ -334,11 +334,9 @@ def test_kcc_backend_ltr_spread_modes_and_custom_profile(
     discovery.find_kcc.return_value = fake_kcc
 
     captured_cmds: list[list[str]] = []
-    captured_envs: list[dict[str, str]] = []
 
     def fake_run(cmd, **kwargs):
         captured_cmds.append(cmd)
-        captured_envs.append(kwargs.get("env", {}))
         out_dir = Path(cmd[cmd.index("-o") + 1])
         with zipfile.ZipFile(out_dir / "out.cbz", "w") as zf:
             zf.writestr("0001.jpg", _make_jpg_bytes(1400, 1800))
@@ -347,9 +345,9 @@ def test_kcc_backend_ltr_spread_modes_and_custom_profile(
     monkeypatch.setattr("manga2kindle.preprocessor.subprocess.run", fake_run)
 
     custom_profile = DeviceProfile.from_name("CUSTOM", custom_size=(1400, 1800))
-    for spread_mode, expected_r in [
-        (SpreadMode.ROTATE, "1"),
-        (SpreadMode.KEEP, "2"),
+    for spread_mode, expected_r, expect_norotate in [
+        (SpreadMode.ROTATE, "1", False),
+        (SpreadMode.KEEP, "1", True),
     ]:
         captured_cmds.clear()
         cfg = _make_config(
@@ -366,6 +364,7 @@ def test_kcc_backend_ltr_spread_modes_and_custom_profile(
         assert "-m" not in cmd
         assert "-p" in cmd and cmd[cmd.index("-p") + 1] == "OTHER"
         assert cmd[cmd.index("-r") + 1] == expected_r
+        assert ("--norotate" in cmd) is expect_norotate
         assert cmd[cmd.index("--customwidth") + 1] == "1400"
         assert cmd[cmd.index("--customheight") + 1] == "1800"
 
