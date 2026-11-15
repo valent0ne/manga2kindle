@@ -151,3 +151,7 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 1. Connect your Kindle via USB.
 2. Copy the generated `.kfx` files into the Kindle's `documents/` folder (for example `/Volumes/Kindle/documents/` on macOS or `E:\documents\` on Windows).
 3. Safely eject the Kindle. Because `manga2kindle` tags and verifies every output file as `PDOC`, covers and Guided View panel zoom work natively via USB sideloading without Send-to-Kindle.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
