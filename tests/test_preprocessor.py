@@ -22,6 +22,7 @@ from manga2kindle.platform import PlatformDiscovery
 from manga2kindle.preprocessor import (
     ImagePreprocessingError,
     ImagePreprocessor,
+    PillowFallbackBackend,
 )
 
 
@@ -80,7 +81,7 @@ def test_pillow_fallback_autocrop_gamma_quantize_and_canvas(tmp_path: Path) -> N
     config = _make_config(tmp_path, no_kcc=True)
     work_dir = tmp_path / "work"
 
-    result = ImagePreprocessor().process(pages, work_dir, config)
+    result = PillowFallbackBackend().process(pages, work_dir, config)
 
     assert len(result) == 2
     assert [p.index for p in result] == [0, 1]
@@ -143,7 +144,7 @@ def test_pillow_fallback_spread_split_rtl_and_ltr(tmp_path: Path) -> None:
         spread_mode=SpreadMode.SPLIT,
         no_kcc=True,
     )
-    rtl_pages = ImagePreprocessor().process(pages, tmp_path / "work_rtl", rtl_cfg)
+    rtl_pages = PillowFallbackBackend().process(pages, tmp_path / "work_rtl", rtl_cfg)
     assert len(rtl_pages) == 2
     assert [p.index for p in rtl_pages] == [0, 1]
     assert [p.is_cover for p in rtl_pages] == [True, False]
@@ -164,7 +165,7 @@ def test_pillow_fallback_spread_split_rtl_and_ltr(tmp_path: Path) -> None:
         spread_mode=SpreadMode.SPLIT,
         no_kcc=True,
     )
-    ltr_pages = ImagePreprocessor().process(pages, tmp_path / "work_ltr", ltr_cfg)
+    ltr_pages = PillowFallbackBackend().process(pages, tmp_path / "work_ltr", ltr_cfg)
     assert len(ltr_pages) == 2
     with Image.open(ltr_pages[0].processed_path) as first, Image.open(
         ltr_pages[1].processed_path
@@ -194,7 +195,7 @@ def test_pillow_fallback_spread_rotate_and_keep(tmp_path: Path) -> None:
 
     # ROTATE: 2000x1000 -> 1000x2000 -> scaled to 840x1680 centered horizontally on 1264x1680
     rotate_cfg = _make_config(tmp_path, spread_mode=SpreadMode.ROTATE, no_kcc=True)
-    rotated = ImagePreprocessor().process(pages, tmp_path / "work_rot", rotate_cfg)
+    rotated = PillowFallbackBackend().process(pages, tmp_path / "work_rot", rotate_cfg)
     assert len(rotated) == 1
     assert (rotated[0].width, rotated[0].height) == (1264, 1680)
     with Image.open(rotated[0].processed_path) as rot_img:
@@ -209,7 +210,7 @@ def test_pillow_fallback_spread_rotate_and_keep(tmp_path: Path) -> None:
 
     # KEEP: 2000x1000 -> fitted cleanly within landscape (2*1264, 1680) -> (2528, 1264)
     keep_cfg = _make_config(tmp_path, spread_mode=SpreadMode.KEEP, no_kcc=True)
-    kept = ImagePreprocessor().process(pages, tmp_path / "work_keep", keep_cfg)
+    kept = PillowFallbackBackend().process(pages, tmp_path / "work_keep", keep_cfg)
     assert len(kept) == 1
     assert kept[0].is_spread is True
     assert kept[0].width > kept[0].height
@@ -239,7 +240,7 @@ def test_pillow_fallback_portrait_wide_banner_not_erroneously_split(tmp_path: Pa
         )
     ]
     cfg = _make_config(tmp_path, spread_mode=SpreadMode.SPLIT, no_kcc=True)
-    result = ImagePreprocessor().process(pages, tmp_path / "work_banner", cfg)
+    result = PillowFallbackBackend().process(pages, tmp_path / "work_banner", cfg)
     assert len(result) == 1
     assert (result[0].width, result[0].height) == (1264, 1680)
     assert result[0].is_spread is False
@@ -330,9 +331,9 @@ def test_kcc_backend_stages_pages_builds_command_and_unpacks_cbz(
     assert len(result) == 3
     assert [p.index for p in result] == [0, 1, 2]
     assert [p.is_cover for p in result] == [True, False, False]
-    # Natural order: page_1 (1264x1500), page_2 (1000x1680), page_10 (1264x1680)
+    # Natural order: cover page_1 normalized to 1600x2560, interior page_2 (1000x1680), page_10 (1264x1680)
     assert [(p.width, p.height) for p in result] == [
-        (1264, 1500),
+        (1600, 2560),
         (1000, 1680),
         (1264, 1680),
     ]
@@ -429,3 +430,33 @@ def test_kcc_backend_raises_without_silent_fallback_when_missing_or_fails(
     )
     with pytest.raises(ImagePreprocessingError, match="no CBZ"):
         ImagePreprocessor(discovery=ok_discovery).process(pages, tmp_path / "w3", config)
+
+
+def test_image_preprocessor_normalizes_cover_to_1600x2560_letterbox(tmp_path: Path) -> None:
+    """Cover page is fit & letterboxed to config.cover_size (1600x2560) preserving artwork."""
+    cover_img = Image.new("RGB", (1131, 1696), color=(20, 90, 180))
+    cover_src = _save_image(cover_img, tmp_path / "extracted" / "0000_cover.png")
+    page_img = Image.new("L", (800, 1200), color=180)
+    page_src = _save_image(page_img, tmp_path / "extracted" / "0001_page.png")
+
+    pages = [
+        PageAsset(index=0, source_path=cover_src, width=1131, height=1696, is_cover=True),
+        PageAsset(index=1, source_path=page_src, width=800, height=1200, is_cover=False),
+    ]
+    config = _make_config(tmp_path, no_kcc=True)
+    result = ImagePreprocessor().process(pages, tmp_path / "work_cover", config)
+
+    assert len(result) == 2
+    assert (result[0].width, result[0].height) == (1600, 2560)
+    assert result[0].is_cover is True
+    assert (result[1].width, result[1].height) == (1264, 1680)
+    assert result[1].is_cover is False
+
+    # 1131x1696 scaled to width 1600 -> height = round(1696 * 1600 / 1131) = 2399;
+    # top/bottom letterbox margin = (2560 - 2399) // 2 = 80px.
+    with Image.open(result[0].processed_path) as out_cover:
+        assert out_cover.size == (1600, 2560)
+        assert out_cover.mode == "RGB"
+        assert out_cover.getpixel((800, 10)) == (255, 255, 255)
+        assert out_cover.getpixel((800, 2550)) == (255, 255, 255)
+        assert out_cover.getpixel((800, 1280)) == (20, 90, 180)

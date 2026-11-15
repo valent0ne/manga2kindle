@@ -6,7 +6,7 @@ import os
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ReadingDirection(str, Enum):
@@ -22,6 +22,9 @@ class SpreadMode(str, Enum):
     SPLIT = "split"
     ROTATE = "rotate"
     KEEP = "keep"
+
+
+DEFAULT_COVER_SIZE: tuple[int, int] = (1600, 2560)
 
 
 _DEVICE_PRESETS: dict[str, tuple[int, int, str]] = {
@@ -113,3 +116,12 @@ class ConversionConfig(BaseModel):
     kcc_path: Path | None = None
     calibre_path: Path | None = None
     previewer_path: Path | None = None
+    cover_size: tuple[int, int] = Field(default=DEFAULT_COVER_SIZE)
+
+    @field_validator("cover_size")
+    @classmethod
+    def _validate_cover_size(cls, value: tuple[int, int]) -> tuple[int, int]:
+        width, height = value
+        if width <= 0 or height <= 0:
+            raise ValueError("cover_size dimensions must be positive integers")
+        return value
