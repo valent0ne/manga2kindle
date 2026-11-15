@@ -185,21 +185,26 @@ class IonBinaryWriter:
             return bytes([(type_id << 4) | length])
         return bytes([(type_id << 4) | 14]) + cls.encode_varuint(length)
 
+    @staticmethod
+    def _to_big_endian_bytes(val: int) -> bytes:
+        """Convert a positive integer into minimal big-endian bytes."""
+        data = bytearray()
+        v = val
+        while v > 0:
+            data.append(v & 0xFF)
+            v >>= 8
+        data.reverse()
+        return bytes(data)
+
     @classmethod
     def encode_int(cls, val: int) -> bytes:
         """Encode integer (type 2 for positive/zero, type 3 for negative)."""
         if val == 0:
             return b"\x20"
         negative = val < 0
-        abs_val = abs(val)
-        data = bytearray()
-        v = abs_val
-        while v > 0:
-            data.append(v & 0xFF)
-            v >>= 8
-        data.reverse()
+        data = cls._to_big_endian_bytes(abs(val))
         type_id = 3 if negative else 2
-        return cls._ion_type_descriptor(type_id, len(data)) + bytes(data)
+        return cls._ion_type_descriptor(type_id, len(data)) + data
 
     @classmethod
     def encode_float64(cls, val: float) -> bytes:
@@ -214,16 +219,13 @@ class IonBinaryWriter:
 
     @classmethod
     def encode_symbol(cls, sid: int) -> bytes:
-        """Encode an Ion symbol ID (type 7)."""
+        """Encode a non-negative Ion symbol ID (type 7)."""
+        if sid < 0:
+            raise ValueError(f"Symbol ID must be non-negative, got {sid}")
         if sid == 0:
             return b"\x70"
-        data = bytearray()
-        v = sid
-        while v > 0:
-            data.append(v & 0xFF)
-            v >>= 8
-        data.reverse()
-        return cls._ion_type_descriptor(7, len(data)) + bytes(data)
+        data = cls._to_big_endian_bytes(sid)
+        return cls._ion_type_descriptor(7, len(data)) + data
 
     @classmethod
     def encode_eid_ref(cls, eid: str) -> bytes:
@@ -262,7 +264,7 @@ class IonBinaryWriter:
 
     @classmethod
     def encode(cls, value: Any, include_bvm: bool = True) -> bytes:
-        """Encode an arbitrary Ion value or Python primitive."""
+        """Encode an Ion value or Python primitive; bytes/bytearray pass through as pre-encoded Ion."""
         if value is None:
             raw = b"\x0f"
         elif isinstance(value, bool):

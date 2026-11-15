@@ -20,6 +20,16 @@ from manga2kindle.models import (
 )
 from manga2kindle.packaging.ion import (
     ION_BVM,
+    SYM_ACTION,
+    SYM_ACTIONS,
+    SYM_FIT_BOTH,
+    SYM_MAGNIFY,
+    SYM_ORDINAL,
+    SYM_PAN_ZOOM_VIEWER,
+    SYM_RIGHT_TO_LEFT_BINDING,
+    SYM_SOURCE_ID,
+    SYM_STRUCTURE,
+    SYM_TARGET_ID,
     YJ_SYMBOLS_MAX_ID,
     IonAnnotation,
     IonBinaryWriter,
@@ -82,6 +92,8 @@ class TestIonBinaryWriter:
         assert IonBinaryWriter.encode(IonSymbol(0), include_bvm=False) == b"\x70"
         # $42 is b"\x71\x2a"
         assert IonBinaryWriter.encode(IonSymbol(42), include_bvm=False) == b"\x71\x2a"
+        with pytest.raises(ValueError, match="non-negative"):
+            IonBinaryWriter.encode_symbol(-1)
 
     def test_encode_eid_ref(self) -> None:
         """EID reference must serialize as $598::'eid_string' annotation."""
@@ -197,7 +209,8 @@ class TestKpfBuilderIntegration:
             height=1680,
             is_cover=False,
             panels=[
-                PanelBox(x=50, y=100, w=1164, h=1480, ordinal=1),
+                PanelBox(x=632, y=100, w=580, h=700, ordinal=1),
+                PanelBox(x=50, y=850, w=550, h=700, ordinal=2),
             ],
         )
         return [page1, page2]
@@ -335,14 +348,53 @@ class TestKpfBuilderIntegration:
                 assert b"rsrc" in ext_blob
                 assert b"res/rsrc" not in ext_blob
 
-            # Check Guided View panel containers exist
-            cur.execute("SELECT payload_value FROM fragments WHERE id LIKE 'p%'")
+            # Verify Guided View trigger ($608 p*) and target ($608 t*) containers
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id LIKE 'p%' ORDER BY id")
             panel_nodes = cur.fetchall()
-            # 2 panels on page 1 + 1 panel on page 2 = 3 panels
-            assert len(panel_nodes) == 3
-            for (p_val,) in panel_nodes:
-                # Guided View actions ($428: $468 magnify action)
-                assert bytes([0x04, 0xD6]) in p_val or b"p" in p_val  # EID references
+            cur.execute("SELECT id, payload_value FROM fragments WHERE id LIKE 't%' ORDER BY id")
+            target_nodes = cur.fetchall()
+            assert len(panel_nodes) == 4
+            assert len(target_nodes) == 4
+
+            actions_field = IonBinaryWriter.encode_varuint(SYM_ACTIONS)
+            magnify_kv = (
+                IonBinaryWriter.encode_varuint(SYM_ACTION)
+                + IonBinaryWriter.encode_symbol(SYM_MAGNIFY)
+            )
+            pan_zoom_kv = (
+                IonBinaryWriter.encode_varuint(SYM_PAN_ZOOM_VIEWER)
+                + IonBinaryWriter.encode_symbol(SYM_RIGHT_TO_LEFT_BINDING)
+            )
+            fit_both_sym = IonBinaryWriter.encode_symbol(SYM_FIT_BOTH)
+            struct_annot = IonBinaryWriter.encode_varuint(SYM_STRUCTURE)
+
+            target_map = dict(target_nodes)
+            expected_ordinals = [1, 2, 1, 2]
+            for (src_eid, p_val), expected_ord in zip(panel_nodes, expected_ordinals):
+                assert struct_annot in p_val
+                assert pan_zoom_kv in p_val
+                assert actions_field in p_val
+                assert magnify_kv in p_val
+                ord_kv = (
+                    IonBinaryWriter.encode_varuint(SYM_ORDINAL)
+                    + IonBinaryWriter.encode_int(expected_ord)
+                )
+                assert ord_kv in p_val
+                src_ref_kv = (
+                    IonBinaryWriter.encode_varuint(SYM_SOURCE_ID)
+                    + IonBinaryWriter.encode_eid_ref(src_eid)
+                )
+                assert src_ref_kv in p_val
+                tgt_eid = f"t{src_eid[1:]}"
+                tgt_ref_kv = (
+                    IonBinaryWriter.encode_varuint(SYM_TARGET_ID)
+                    + IonBinaryWriter.encode_eid_ref(tgt_eid)
+                )
+                assert tgt_ref_kv in p_val
+                t_val = target_map[tgt_eid]
+                assert struct_annot in t_val
+                assert fit_both_sym in t_val
+                assert actions_field not in t_val
         finally:
             conn.close()
 
