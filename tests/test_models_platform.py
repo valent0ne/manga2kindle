@@ -47,6 +47,15 @@ def test_conversion_config_defaults_and_validators(tmp_path):
     assert cfg.no_kcc is False
     assert cfg.keep_temp is False
     assert cfg.workers >= 1
+    assert cfg.cover_size == (1600, 2560)
+
+    with pytest.raises(ValidationError):
+        ConversionConfig(
+            input_path=tmp_path / "in.cbz",
+            output_path=tmp_path / "out.kfx",
+            profile=profile,
+            cover_size=(0, 2560),
+        )
 
     with pytest.raises(ValidationError):
         ConversionConfig(

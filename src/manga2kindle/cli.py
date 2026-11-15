@@ -15,6 +15,7 @@ from rich.table import Table
 
 from manga2kindle import __version__
 from manga2kindle.models import (
+    DEFAULT_COVER_SIZE,
     ConversionConfig,
     DeviceProfile,
     ReadingDirection,
@@ -45,6 +46,16 @@ def _parse_custom_dimensions(raw: str) -> tuple[int, int]:
     if len(parts) != 2:
         raise ValueError(f"Expected WIDTHxHEIGHT (e.g. 1264x1680), got '{raw}'")
     return int(parts[0].strip()), int(parts[1].strip())
+
+
+def _resolve_cover_size(raw: str) -> tuple[int, int]:
+    try:
+        width, height = _parse_custom_dimensions(raw)
+        if width <= 0 or height <= 0:
+            raise ValueError("Cover dimensions must be positive integers.")
+        return width, height
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _resolve_profile(profile: str, custom_size: str | None) -> DeviceProfile:
@@ -165,9 +176,17 @@ def convert(
         str | None,
         typer.Option("--author", help="Book author metadata."),
     ] = None,
+    cover_size: Annotated[
+        str,
+        typer.Option(
+            "--cover-size",
+            help="Target cover WIDTHxHEIGHT (fit & letterboxed without cropping).",
+        ),
+    ] = f"{DEFAULT_COVER_SIZE[0]}x{DEFAULT_COVER_SIZE[1]}",
 ) -> None:
     """Convert CBZ, CBR, image folder, or batch directory into PDOC-tagged KFX."""
     device_profile = _resolve_profile(profile, custom_size)
+    resolved_cover_size = _resolve_cover_size(cover_size)
     pipeline = ConversionPipeline()
 
     try:
@@ -199,6 +218,7 @@ def convert(
             workers=workers,
             kcc_path=kcc_path,
             calibre_path=calibre_path,
+            cover_size=resolved_cover_size,
         )
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         console.print(f"[red]Error:[/red] {exc}")

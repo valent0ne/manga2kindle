@@ -171,9 +171,10 @@ class TestPreviewPanelsCli:
         assert result.exit_code == 0, result.output
         overlays = sorted(out_dir.glob("*.png"))
         assert len(overlays) == 3
-        for overlay in overlays:
+        expected_sizes = [(1600, 2560), (1264, 1680), (1264, 1680)]
+        for overlay, expected_size in zip(overlays, expected_sizes):
             with Image.open(overlay) as img:
-                assert img.size == (1264, 1680)
+                assert img.size == expected_size
 
         assert created_temps, "Expected pipeline to create a temporary staging directory"
         for temp_dir in created_temps:
@@ -560,6 +561,16 @@ class TestConvertCliMocked:
         bad_workers = runner.invoke(app, ["convert", "-i", str(cbz_path), "-w", "0"])
         assert bad_workers.exit_code != 0
 
+        bad_cover_fmt = runner.invoke(
+            app, ["convert", "-i", str(cbz_path), "--cover-size", "not-a-size"]
+        )
+        assert bad_cover_fmt.exit_code != 0
+
+        bad_cover_zero = runner.invoke(
+            app, ["convert", "-i", str(cbz_path), "--cover-size", "0x2560"]
+        )
+        assert bad_cover_zero.exit_code != 0
+
         batch_dir = tmp_path / "batch_val"
         batch_dir.mkdir()
         _make_cbz(batch_dir / "c1.cbz", num_pages=1)
@@ -579,6 +590,37 @@ class TestConvertCliMocked:
             app, ["convert", "-i", str(batch_dir), "--title", "Series"]
         )
         assert bad_batch_title.exit_code != 0
+
+    def test_convert_forwards_custom_cover_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "cover_flag.cbz", num_pages=1)
+        out_kfx = tmp_path / "cover_flag.kfx"
+        captured: list[ConversionConfig] = []
+
+        def fake_run_single(self, config: ConversionConfig, **kwargs) -> Path:
+            captured.append(config)
+            config.output_path.write_bytes(b"kfx")
+            return config.output_path
+
+        monkeypatch.setattr(ConversionPipeline, "run_single", fake_run_single)
+
+        res = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "-o",
+                str(out_kfx),
+                "--no-kcc",
+                "--cover-size",
+                "1375x2200",
+            ],
+        )
+        assert res.exit_code == 0, res.output
+        assert len(captured) == 1
+        assert captured[0].cover_size == (1375, 2200)
 
 
 class TestConvertCliIntegration:
@@ -612,3 +654,23 @@ class TestConvertCliIntegration:
         assert out_kfx.is_file()
         assert out_kfx.stat().st_size > 0
         assert KfxCompiler(calibre_debug).verify_pdoc(out_kfx) is True
+
+        # Verify compiled KFX cover_image resource has 1600x2560 dimensions
+        import subprocess
+        inspect = subprocess.run(
+            [
+                str(calibre_debug),
+                "-c",
+                (
+                    "import os, sys; from calibre.utils.config import config_dir; "
+                    "sys.path.insert(0, os.path.join(config_dir, 'plugins', 'KFX Output.zip')); "
+                    "from kfxlib.yj_book import YJ_Book; "
+                    f"b = YJ_Book({str(out_kfx)!r}); b.decode_book(); "
+                    "r = [f for f in b.fragments if f.ftype == '$164' and str(f.fid) == 'e0'][0]; "
+                    "assert (r.value['$422'], r.value['$423']) == (1600, 2560), r.value"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
