@@ -61,6 +61,20 @@ def _stage_file(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _flatten_image(img: Image.Image, mode: str) -> Image.Image:
+    """Apply EXIF orientation and composite any alpha/palette transparency onto white."""
+    transposed = ImageOps.exif_transpose(img)
+    if transposed.mode in ("RGBA", "LA") or (
+        transposed.mode == "P" and "transparency" in transposed.info
+    ):
+        rgba = transposed.convert("RGBA")
+        white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        return Image.alpha_composite(white_bg, rgba).convert(mode)
+    if transposed.mode != mode:
+        return transposed.convert(mode)
+    return transposed.copy()
+
+
 def _is_valid_archive_image(raw_name: str) -> bool:
     try:
         parts = ArchiveExtractor.validate_member_parts(raw_name)
@@ -295,16 +309,7 @@ class PillowFallbackBackend:
 
     @staticmethod
     def _to_grayscale(img: Image.Image) -> Image.Image:
-        transposed = ImageOps.exif_transpose(img)
-        if transposed.mode in ("RGBA", "LA") or (
-            transposed.mode == "P" and "transparency" in transposed.info
-        ):
-            rgba = transposed.convert("RGBA")
-            white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-            return Image.alpha_composite(white_bg, rgba).convert("L")
-        if transposed.mode != "L":
-            return transposed.convert("L")
-        return transposed.copy()
+        return _flatten_image(img, "L")
 
     def _autocrop_white(self, img: Image.Image) -> Image.Image:
         mask = img.point(lambda p: 255 if p < self._WHITE_THRESHOLD else 0, mode="1")
@@ -386,9 +391,56 @@ class ImagePreprocessor:
         work_dir: Path,
         config: ConversionConfig,
     ) -> list[PageAsset]:
-        """Preprocess extracted pages for target Kindle E-Ink dimensions."""
+        """Preprocess extracted pages and normalize cover to config.cover_size."""
         if not pages:
             return []
-        if config.no_kcc:
-            return self._pillow_backend.process(pages, work_dir, config)
-        return self._kcc_backend.process(pages, work_dir, config)
+        processed = (
+            self._pillow_backend.process(pages, work_dir, config)
+            if config.no_kcc
+            else self._kcc_backend.process(pages, work_dir, config)
+        )
+        if processed and processed[0].is_cover:
+            cover_source = (
+                pages[0].source_path
+                if pages[0].source_path.is_file()
+                else processed[0].processed_path
+            )
+            if cover_source is not None:
+                self._normalize_cover(
+                    processed[0],
+                    source_path=cover_source,
+                    cover_size=config.cover_size,
+                )
+        return processed
+
+    @staticmethod
+    def _normalize_cover(
+        cover_page: PageAsset,
+        *,
+        source_path: Path,
+        cover_size: tuple[int, int],
+    ) -> None:
+        """Fit and letterbox the cover image to cover_size without cropping artwork."""
+        if cover_page.processed_path is None:
+            return
+        target_w, target_h = cover_size
+        with Image.open(source_path) as raw:
+            rgb = _flatten_image(raw, "RGB")
+
+        scale = min(target_w / rgb.width, target_h / rgb.height)
+        new_w = min(target_w, max(1, round(rgb.width * scale)))
+        new_h = min(target_h, max(1, round(rgb.height * scale)))
+        resized = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+        canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
+
+        out_path = cover_page.processed_path
+        if out_path.suffix.lower() in {".jpg", ".jpeg"}:
+            canvas.save(out_path, format="JPEG", quality=95)
+        else:
+            canvas.save(out_path, format="PNG", optimize=True)
+        canvas.close()
+
+        cover_page.width, cover_page.height = _measure_image(out_path)
+        cover_page.is_spread = False
