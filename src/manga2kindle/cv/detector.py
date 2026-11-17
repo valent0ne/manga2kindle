@@ -7,36 +7,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from manga2kindle.cv.boxes import (
+    DEFAULT_BLEED_MARGIN,
+    Rect,
+    compute_iou,
+    nms_and_prune,
+    pad_and_clamp,
+)
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.models import PanelBox
 
 _MAX_PANEL_AREA_RATIO = 0.98
 _MAX_ASPECT_RATIO = 15.0
-_BLEED_SAFETY_MARGIN = 2
-
-Rect = tuple[int, int, int, int]
-
-
-def compute_iou(box_a: Rect, box_b: Rect) -> float:
-    """Compute Intersection-over-Union (IoU) for two (x, y, w, h) rectangles."""
-    ax, ay, aw, ah = box_a
-    bx, by, bw, bh = box_b
-
-    inter_x1 = max(ax, bx)
-    inter_y1 = max(ay, by)
-    inter_x2 = min(ax + aw, bx + bw)
-    inter_y2 = min(ay + ah, by + bh)
-
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-    if inter_area == 0:
-        return 0.0
-
-    union_area = (aw * ah) + (bw * bh) - inter_area
-    if union_area <= 0:
-        return 0.0
-    return inter_area / union_area
+_BLEED_SAFETY_MARGIN = DEFAULT_BLEED_MARGIN
 
 
 class PanelDetector:
@@ -82,13 +65,8 @@ class PanelDetector:
 
     @staticmethod
     def non_max_suppression(boxes: list[Rect], iou_threshold: float) -> list[Rect]:
-        """Prune smaller overlapping boxes whose IoU with a larger kept box exceeds threshold."""
-        sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-        kept: list[Rect] = []
-        for candidate in sorted_boxes:
-            if all(compute_iou(candidate, existing) <= iou_threshold for existing in kept):
-                kept.append(candidate)
-        return kept
+        """Prune smaller overlapping or nested boxes via containment and IoU NMS."""
+        return nms_and_prune(boxes, iou_threshold=iou_threshold)
 
     def _filter_contours(
         self,
@@ -123,26 +101,10 @@ class PanelDetector:
 
     def _pad_and_clamp(self, rect: Rect, page_w: int, page_h: int) -> PanelBox:
         """Apply single-pass padding expansion and clamp within bleed-safe page bounds."""
-        x, y, w, h = rect
-        pad_x = int(round(w * self.padding))
-        pad_y = int(round(h * self.padding))
-
-        margin_x = _BLEED_SAFETY_MARGIN if page_w > 2 * _BLEED_SAFETY_MARGIN else 0
-        margin_y = _BLEED_SAFETY_MARGIN if page_h > 2 * _BLEED_SAFETY_MARGIN else 0
-
-        x1 = max(margin_x, x - pad_x)
-        y1 = max(margin_y, y - pad_y)
-        x2 = min(page_w - margin_x, x + w + pad_x)
-        y2 = min(page_h - margin_y, y + h + pad_y)
-
-        if margin_x > 0:
-            x1 = min(x1, page_w - margin_x - 1)
-        if margin_y > 0:
-            y1 = min(y1, page_h - margin_y - 1)
-
-        return PanelBox(
-            x=x1,
-            y=y1,
-            w=max(1, x2 - x1),
-            h=max(1, y2 - y1),
+        return pad_and_clamp(
+            rect,
+            page_w,
+            page_h,
+            padding=self.padding,
+            bleed_margin=_BLEED_SAFETY_MARGIN,
         )
