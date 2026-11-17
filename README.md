@@ -211,6 +211,8 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `--no-kcc` | `false` | Use pure-Pillow E-Ink preprocessing instead of `kcc-c2e` |
 | `--keep-temp` | `false` | Keep temporary staging and intermediate `.kpf` directories |
 | `-w, --workers` | CPU count | Parallel worker threads |
+| `--batch-workers` | `auto` | Concurrent archives in batch mode (`auto` from RAM/KCC) |
+| `--gpu-batch-size` | `auto` | Pages per GPU batch for neural detectors (`auto` from VRAM) |
 | `--title` / `--author` | archive/folder name / `None` | Override KFX book title (single book) and author metadata |
 | `--kcc-path` / `--calibre-path` | auto-discovered | Explicit executable path overrides (`doctor` also accepts `--previewer-path`) |
 
