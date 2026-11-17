@@ -126,6 +126,7 @@ class MagiBackend:
             trust_remote_code=True,
             local_files_only=True,
             torch_dtype=torch_dtype,
+            attn_implementation="eager",
         )
         self._model = model.to(self._device).eval()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -192,7 +193,10 @@ def fetch_model(
                     f"expected {expected}, got {actual}"
                 )
 
-        tmp_path.replace(target_path)
+        try:
+            tmp_path.replace(target_path)
+        except OSError:
+            shutil.move(str(tmp_path), str(target_path))
     except Exception:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
