@@ -112,6 +112,21 @@ class ConversionPipeline:
             f"Directory contains no .cbz/.cbr archives or image files: {input_path}"
         )
 
+    @staticmethod
+    def _resolve_batch_workers(
+        workers: int,
+        item_count: int,
+        *,
+        no_kcc: bool,
+        detector_kind: DetectorKind,
+    ) -> tuple[int, int]:
+        """Avoid spawning nested KCC process pools or competing GPU workers across books."""
+        if item_count <= 1 or not no_kcc or detector_kind == DetectorKind.MAGI:
+            return 1, max(1, workers)
+        batch_workers = min(max(1, workers), item_count)
+        per_book_workers = max(1, workers // batch_workers)
+        return batch_workers, per_book_workers
+
     @classmethod
     def resolve_single_output(cls, input_path: Path, output_path: Path | None) -> Path:
         """Resolve exact output .kfx path for a single archive or image folder."""
@@ -269,8 +284,12 @@ class ConversionPipeline:
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
-        batch_workers = min(config.workers, len(targets))
-        per_book_workers = max(1, config.workers // batch_workers)
+        batch_workers, per_book_workers = self._resolve_batch_workers(
+            config.workers,
+            len(targets),
+            no_kcc=config.no_kcc,
+            detector_kind=config.detector.kind,
+        )
 
         def _convert_one(
             archive_path: Path, target_kfx: Path
@@ -487,8 +506,12 @@ class ConversionPipeline:
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
-        batch_workers = min(config.workers, len(archives))
-        per_book_workers = max(1, config.workers // batch_workers)
+        batch_workers, per_book_workers = self._resolve_batch_workers(
+            config.workers,
+            len(archives),
+            no_kcc=config.no_kcc,
+            detector_kind=config.detector.kind,
+        )
 
         def _preview_one(archive_path: Path) -> tuple[Path, Path | None, Exception | None]:
             preview_dir = out_dir / f"{archive_path.stem}_preview"
