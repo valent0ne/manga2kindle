@@ -49,11 +49,16 @@ This spec introduces a **3-layer pluggable backend architecture** (`CONTOUR` →
 
 ### `AUTO` Policy
 Order: **`MAGI` → `ONNX_YOLO` → `CONTOUR`**.
-- `MAGI` is selected only if the `[magi]` extra is installed, weights are cached locally, a GPU (`cuda` or `mps`) is available, and `--allow-remote-code` is enabled (or configured).
-- `ONNX_YOLO` is selected if `[onnx]` is installed and weights are cached locally.
+- `MAGI` is selected only if the `[magi]` extra is installed, weights are cached locally, a GPU (`cuda` or `mps`) is available, and `--allow-remote-code` is enabled. If `[magi]`, GPU, and cached weights are all present without `--allow-remote-code`, `AUTO` logs a warning and skips `MAGI`. (Explicit `--detector magi` may specify `--device cpu`.)
+- `ONNX_YOLO` is selected if `[onnx]` is installed and weights are cached locally (or `--detector-model` points to a local `.onnx` file).
 - `CONTOUR` is always available as the instant fallback.
-- Any load failure or zero-panel result in `AUTO` logs a warning and falls through to the next layer before the full-page fallback.
-- Explicit `--detector <name>` fails fast with an actionable message if dependencies/weights are missing.
+- `AUTO` logs which backend is active on startup. A load/initialization failure disables that backend for the remainder of the run with a single warning and falls through to the next layer. A zero-panel page result (`panels=[]`) in `AUTO` logs a warning/note and falls through to remaining layers for that page before applying the full-page fallback `[PanelBox(0, 0, page_w, page_h)]`.
+- Explicit `--detector <name>` fails fast with an actionable error if dependencies, weights, requested execution provider, or `--allow-remote-code` are missing, and only falls back to full-page `[PanelBox(0, 0, page_w, page_h)]` when detection legitimately returns zero panels on a page.
+
+### Device & Execution Provider Mapping
+- `DevicePreference(str, Enum)`: `AUTO = "auto"`, `CPU = "cpu"`, `CUDA = "cuda"`, `MPS = "mps"`.
+- **`MagiBackend`:** Maps directly to `torch` devices (`cuda`, `mps`, `cpu`).
+- **`OnnxYoloBackend`:** `auto` selects the highest-priority provider available in `onnxruntime.get_available_providers()` (`CUDAExecutionProvider` → `CoreMLExecutionProvider` → `DmlExecutionProvider` → `CPUExecutionProvider`). Explicit `mps` maps to `CoreMLExecutionProvider` on Apple Silicon; explicit `cuda` maps to `CUDAExecutionProvider` (or `DmlExecutionProvider` only when `auto`). Unavailable explicit providers raise an actionable `RuntimeError`.
 
 ## 4. Architecture
 
@@ -62,72 +67,84 @@ New or updated modules under `src/manga2kindle/cv/`:
 ```text
 cv/
   backends/
-    __init__.py        # BackendRegistry, create_backend(kind, config)
+    __init__.py        # BackendRegistry, resolve_auto_chain, detect_with_fallback
     base.py            # PanelDetectorBackend (Protocol), DetectionResult
-    contour.py         # ContourBackend (moved from detector.py)
+    contour.py         # ContourBackend (extracted from detector.py)
     onnx_yolo.py       # OnnxYoloBackend (Layer 2: deepghs/manga109_yolo ONNX)
     magi.py            # MagiBackend (Layer 3: ragavsachdeva/magiv3)
-  detector.py          # Thin compatibility shim re-exporting ContourBackend as PanelDetector
-  sorter.py            # Fixed XY-cut / gutter-aware reading-order sorter
-  boxes.py             # Shared geometry: compute_iou, compute_containment, nms_and_prune, pad_and_clamp
-  benchmark.py         # Evaluation harness + PopManga/CoMix loaders
-  preview.py           # Extended for multi-backend color-coded / side-by-side overlays
+  detector.py          # Compatibility wrapper preserving PanelDetector -> list[PanelBox] API
+  sorter.py            # Fixed two-tier XY-cut / gutter-aware reading-order sorter
+  boxes.py             # Shared geometry: compute_iou, compute_containment, nms_and_prune[_indices], pad_and_clamp
+  models_hub.py        # OS cache resolution (platformdirs), pinned downloads, SHA-256 verification, license notices
+  benchmark.py         # Evaluation harness + PopManga/CoMix/local loaders
+  preview.py           # Extended with side-by-side multi-backend comparison overlays
 ```
 
 ### Shared Geometry & Bugfixes (`boxes.py` & `sorter.py`)
 1. **Containment Suppression (`boxes.py`):**
-   - Add `compute_containment(inner, outer) = inter_area / min(area_a, area_b)`.
-   - In `nms_and_prune(boxes, iou_threshold=0.4, containment_threshold=0.85)`: sort boxes by area descending (or confidence descending when scores are provided, keeping the larger box when one strictly contains the other), and suppress any smaller box whose `IoU > iou_threshold` **or** `containment > containment_threshold`.
-   - Reused by all three backends so nested/contained panels never render separately.
+   - Add `compute_containment(box_a, box_b) = inter_area / min(area_a, area_b)` (returning `0.0` if either box has zero area).
+   - Provide `nms_and_prune_indices(boxes, iou_threshold=0.4, containment_threshold=0.85, scores=None, preserve_order=False) -> list[int]` and convenience wrapper `nms_and_prune(...) -> list[Rect]`, executed in two stages:
+     1. **Containment pass** (sorted by `area` descending, ties by `score` descending): suppress any smaller box strictly contained inside a larger surviving box (`compute_containment(cand, kept) > containment_threshold` and `area(cand) < area(kept)`), ensuring a higher-confidence inset box never suppresses its enclosing outer panel.
+     2. **IoU NMS pass** (sorted by `(score, area)` descending when `scores` are provided, else `area` descending): suppress any candidate with `compute_iou(cand, kept) > iou_threshold`.
+   - When `preserve_order=True` (used by `MagiBackend`), return surviving indices/boxes in their original input order so native reading order is never scrambled; returning indices also keeps `DetectionResult.scores` 1:1 aligned with `DetectionResult.panels`.
 2. **Stacked-Panel Reading Order (`sorter.py`):**
-   - Replace flat `_sort_by_rows` with **recursive XY-cut / gutter-aware partitioning**:
-     - First try splitting the box set along horizontal gutters (vertical gaps where no box spans across, or minimal overlap) into top-to-bottom bands.
-     - Within each band, split along vertical gutters (horizontal gaps where no box spans across) into columns ordered RTL (`x` descending) or LTR (`x` ascending).
-     - Recurse on each sub-group until 1 box remains (or fall back to top-to-bottom, then RTL/LTR when boxes overlap without a clean cut).
-   - Two panels stacked vertically next to a tall neighbor are now cleanly isolated into a sub-column and ordered top-to-bottom.
+   - Replace flat `_sort_by_rows` in `_sort_group` with **two-tier recursive XY-cut gutter partitioning** (after existing `_sort_spread_halves` when `is_spread=True` and `page_width` is known):
+     1. Try **strict** horizontal gutter split (non-overlapping `y` intervals sorted top-to-bottom); if `>= 2` bands, recurse on each band.
+     2. Otherwise try **strict** vertical gutter split (non-overlapping `x` intervals ordered RTL `x` descending or LTR `x` ascending); if `>= 2` columns, recurse on each column.
+     3. If neither strict cut splits the group (e.g., `padding=0.02` causes 2–15px overlap across tight gutters), retry horizontal then vertical cuts using **inset** intervals (inset each box edge by up to `min(24, int(0.05 * dim))` so minor border/padding overlap never bridges a real gutter).
+     4. If still unsplittable (genuinely overlapping/diagonal layout), fall back to `_sort_by_rows` with `row_tolerance_px` and `(y, -x/x)` ordering.
+   - Two panels stacked vertically next to a tall neighbor are cleanly isolated into a column and ordered top-to-bottom even after `pad_and_clamp` expansion.
 
 ### Domain Types (`models.py`)
-- `DetectorKind(str, Enum)`: `AUTO`, `CONTOUR`, `ONNX_YOLO`, `MAGI`.
-- `DetectionResult` (dataclass): `panels: list[PanelBox]`, `ordered: bool`, `backend: DetectorKind`, `scores: list[float] | None`.
-- `DetectorConfig` (Pydantic): `kind`, `model_path: Path | None`, `model_id: str | None`, `device` (`auto|cpu|cuda|mps`), `score_threshold`, `iou_threshold`, `containment_threshold`, `padding`, `min_panel_area`, `allow_remote_code: bool`.
+- `DetectorKind(str, Enum)`: `AUTO = "auto"`, `CONTOUR = "contour"`, `ONNX_YOLO = "onnx"`, `MAGI = "magi"`.
+- `DevicePreference(str, Enum)`: `AUTO = "auto"`, `CPU = "cpu"`, `CUDA = "cuda"`, `MPS = "mps"`.
+- `DetectionResult` (dataclass): `panels: list[PanelBox]`, `ordered: bool`, `backend: DetectorKind`, `page_width: int = 0`, `page_height: int = 0`, `scores: list[float] | None = None`.
+- `DetectorConfig` (Pydantic): `kind: DetectorKind = DetectorKind.AUTO`, `model_path: Path | None = None`, `model_id: str | None = None`, `device: DevicePreference = DevicePreference.AUTO`, `score_threshold: float = 0.35`, `iou_threshold: float = 0.4`, `containment_threshold: float = 0.85`, `padding: float = 0.02`, `min_panel_area: float = 0.03`, `allow_remote_code: bool = False`.
+- `ConversionConfig` (Pydantic): Add `detector: DetectorConfig = Field(default_factory=DetectorConfig)`. Top-level `padding` and `min_panel_area` stay backward-compatible and synchronize with `detector` via a `model_validator` when `detector` uses default field values.
 
-### Interface
+### Interface & Pipeline Integration
 ```python
 class PanelDetectorBackend(Protocol):
     kind: DetectorKind
     def detect(self, image_path: Path) -> DetectionResult: ...
     def detect_batch(self, image_paths: Sequence[Path]) -> list[DetectionResult]: ...
 ```
-- All backends return `PanelBox` in source-page pixel coordinates, clamped to bleed-safe bounds.
-- Reading order: if `DetectionResult.ordered` is `True` (`MAGI`), preserve it; otherwise run `PanelSorter`.
+- All backends return `PanelBox` in source-page pixel coordinates, clamped via `pad_and_clamp`. When zero panels are detected, `backend.detect()` returns `panels=[]` (no synthetic full-page box) so `AUTO` fallback and `benchmark` see true empty detections; `detect_with_fallback()` (pipeline) and the `PanelDetector` wrapper (`detector.py`) apply `[PanelBox(0, 0, page_w, page_h, ordinal=1)]` when no backend finds panels.
+- `min_panel_area` filters contour noise in `ContourBackend`; learned backends (`OnnxYoloBackend`, `MagiBackend`) filter by `score_threshold` (if scored) and degenerate zero/sub-pixel bounds so valid small panels (e.g., 4-koma strips) are not inadvertently dropped.
+- Reading order: if `DetectionResult.ordered` is `True` (`MAGI`), preserve it and ensure 1-based `ordinal` (`1..N`); otherwise run `PanelSorter`.
+- **Concurrency & Model Reuse (`pipeline.py`):** `ConversionPipeline` resolves and caches backend instances once per run (and across batch workers), rather than reloading weights per page or per book. `OnnxYoloBackend` and `MagiBackend` guard inference with a lock and run `detect_batch()` under `torch.inference_mode()` so multi-worker `run_batch` never triggers GPU OOM or ORT thread oversubscription; `ContourBackend.detect_batch()` may parallelize CPU work across `workers`.
 
-### Models & Cache Hygiene
-- Cached weights live in the OS user cache directory via `platformdirs` (`pathlib.Path`), never inside the repository.
-- `manga2kindle models fetch <name>` downloads pinned revisions, verifies SHA-256, and prints model source, size, and license terms before/after download.
+### Models & Cache Hygiene (`models_hub.py`)
+- Cached weights live in `platformdirs.user_cache_dir("manga2kindle")` (`pathlib.Path`), never inside the repository.
+- `[onnx]` fetches single pinned `.onnx` files over HTTPS via stdlib `urllib.request` (no `huggingface_hub` dependency required) and verifies SHA-256; `[magi]` uses `huggingface_hub.snapshot_download` (pulled by `transformers`) with a pinned commit hash.
+- `manga2kindle models fetch <name>` (and `models list`) prints model source, size, and license notice before downloading; runtime inference loads strictly from local cache (`local_files_only=True`) and never downloads implicitly.
 
 ## 5. CLI & Pre-Conversion Preview
 
 - **`convert`:**
   - `--detector [auto|contour|onnx|magi]` (default `auto`)
-  - `--detector-model PATH_OR_ID`
-  - `--device [auto|cpu|cuda|mps]`
-  - `--score-threshold FLOAT`
+  - `--detector-model PATH_OR_ID` (resolved as `model_path` when it exists on disk, ends with `.onnx`, or has path separators/drive/dot prefix; otherwise resolved as a registered hub key or HF `owner/repo` `model_id`; missing explicit paths fail fast)
+  - `--device [auto|cpu|cuda|mps]` (default `auto`)
+  - `--score-threshold FLOAT` (default `0.35`, `[0.0, 1.0]`)
   - `--allow-remote-code` (required for `magi`)
-  - `--preview-only` (runs extraction, preprocessing, and panel detection/sorting, writes preview overlays, and exits without KPF/KFX compilation—ideal for checking a chapter before mass converting)
+  - `--preview-only` (supports both single and batch inputs: runs extraction, preprocessing, and panel detection/sorting, writes preview overlays to `<input.parent>/<name>_preview` / `<out_dir>/<stem>_preview` or explicit dir, and skips `calibre-debug` lookup + KPF/KFX compilation)
 - **`preview-panels`:**
   - Accepts all `--detector*`, `--device`, `--score-threshold`, `--allow-remote-code` flags.
-  - `--compare contour,onnx,magi`: renders side-by-side or color-coded comparison PNGs with backend name, panel count, and reading-order arrows so the user can visually compare layers before batch conversion.
+  - `--compare contour,onnx,magi`: accepts a comma-separated list of explicit backends (rejects `auto`; fails fast if any requested backend is unavailable), and renders **side-by-side tiled comparison PNGs** with per-backend color-coded boxes, `[ordinal]` badges, reading-order arrows, and a `BACKEND (N panels)` header banner so the user can visually compare layers before batch conversion.
+- **`models` subcommands:**
+  - `manga2kindle models list`: show available registered models, cache paths, cache status, and licenses.
+  - `manga2kindle models fetch <name>`: download pinned model artifacts with SHA-256 verification and license notice.
 - **`doctor`:**
-  - Reports `onnxruntime` (and active providers), `torch` + CUDA/MPS availability, cached models, and active default `AUTO` layer.
+  - Reports `onnxruntime` (and active providers), `torch` + CUDA/MPS availability, cached models, and resolved `AUTO` layer as optional diagnostics (never causing `doctor` to exit nonzero when absent).
 - **Optional extras in `pyproject.toml`:**
   - `onnx = ["onnxruntime>=1.17", "platformdirs>=4.0"]`
-  - `magi = ["torch>=2.2", "transformers>=4.40", "einops>=0.7", "timm>=0.9", "platformdirs>=4.0"]`
-  - `benchmark = ["datasets>=2.18"]` (for streaming/loading Hugging Face benchmark splits locally)
+  - `magi = ["torch>=2.2", "transformers>=4.40", "einops>=0.7", "timm>=0.9", "platformdirs>=4.0"]` (plus `scipy` / `torchvision` if required by the pinned `magiv3` commit)
+  - `benchmark = ["datasets>=2.18", "psutil>=5.9"]` (for loading Hugging Face benchmark splits and cross-platform Windows/macOS RAM tracking)
 
 ## 6. Licensing & Public Repo Compliance
 
 - Project license is **AGPL-3.0-or-later**.
-- **Never** commit datasets, model weights, sample manga pages, or machine-specific local paths to git. Ensure `.gitignore` covers `benchmarks/`, `data/`, `*.onnx`, `*.safetensors`, `*.pt`, and local cache folders.
+- **Never** commit datasets, model weights, sample manga pages, or machine-specific local paths to git. Ensure `.gitignore` covers `benchmarks/`, `data/`, `*_preview/`, `*.onnx`, `*.safetensors`, `*.pt`, `*.bin`, `*.pth`, `*.parquet`, `*.arrow`, and local cache folders.
 - **Model & Dataset Terms:**
   - `ragavsachdeva/magiv3` & `ragavsachdeva/popmanga_test`: **non-commercial / personal / research use only** (PopManga also requires Hugging Face login + terms acceptance). Displayed at `models fetch` / `benchmark` time and documented in `README.md`.
   - `deepghs/manga109_yolo`: trained on `Manga109-s`; document attribution in `README.md` and `docs/`.
@@ -135,14 +152,20 @@ class PanelDetectorBackend(Protocol):
 
 ## 7. Benchmark & Evaluation (`manga2kindle benchmark`)
 
-### Dataset Choice
+### Dataset Choice & Protocol
 - **Primary Benchmark:** **`ragavsachdeva/popmanga_test` (PopManga)** (~2,000 modern manga pages with COCO-style panel bounding boxes **and** reading-order ground truth).
   - Chosen because it is the official benchmark for Magi, requires no manual access request (only HF login/terms), and evaluates both **panel detection** and **reading order** out of the box.
-- **Optional Cross-Domain Evaluation:** **`emanuelevivoli/comix-v0_1-pages` (CoMix)** for testing generalization on Western/diverse comic layouts, plus any user-supplied local folder (`--pages DIR --truth FILE`).
+- **Optional Cross-Domain Evaluation:** **`emanuelevivoli/comix-v0_1-pages` (CoMix)** for testing generalization on Western/diverse comic layouts, plus any user-supplied local folder (`--pages DIR --truth FILE`, supporting COCO JSON or a simple JSON list of `{image, panels: [[x, y, w, h], ...]}` in reading order).
 - *Why not Manga109-s / MangaSeg as primary:* Manga109-s requires a manual access approval gate and lacks reading-order annotations; MangaSeg adds pixel masks on top of Manga109 whereas Kindle Guided View targets rectangular regions.
+- **Evaluation Protocol:**
+  - Evaluates raw dataset page images directly (`backend.detect()` without full-page fallback or KCC/Pillow resizing) so coordinates match dataset ground truth.
+  - `--limit N` selects the same deterministic slice across all compared detectors (`--direction` defaults to `rtl` for `popmanga` and `ltr` for `comix`, overridable via CLI).
+  - Reading-order metrics (`pairwise_order_acc`, `kendall_tau`) perform **1-to-1 greedy IoU matching (`IoU >= 0.50`)** between predicted and ground-truth panels per page, then score the induced order over matched pairs (`n >= 2`).
+  - Latency excludes a warmup pass and calls `torch.cuda.synchronize()` before stopping timers on CUDA; `peak_ram_mb` uses `psutil` RSS tracking and `peak_vram_mb` uses `torch.cuda.max_memory_allocated()`.
 
 ### Metrics Reported
 `manga2kindle benchmark --dataset popmanga --detectors contour,onnx,magi --limit 200 --out report.json`
+Also supports `--split`, `--direction`, `--device`, `--score-threshold`, `--allow-remote-code`, and `--pages DIR --truth FILE`.
 Prints a Rich comparison table and writes a JSON summary with:
 - **Panel Recall & Precision** at `IoU >= 0.50` and `IoU >= 0.75`
 - **Mean Best-Match IoU**
