@@ -18,8 +18,10 @@ from manga2kindle.extractor import ArchiveExtractor, natural_sort_key
 from manga2kindle.models import (
     ConversionConfig,
     DetectorConfig,
+    DetectorKind,
     DeviceProfile,
     PageAsset,
+    PanelBox,
     ReadingDirection,
     SpreadMode,
 )
@@ -336,6 +338,25 @@ class ConversionPipeline:
             )
         return [self.run_single(config, title=title, author=author)]
 
+    @staticmethod
+    def validate_compare_backends(
+        compare: list[DetectorKind],
+        detector_config: DetectorConfig,
+    ) -> list[DetectorKind]:
+        """Validate and deduplicate --compare backends, failing fast on invalid options."""
+        unique_kinds = list(dict.fromkeys(compare))
+        if not unique_kinds:
+            raise ValueError("At least one backend must be specified for --compare.")
+        if DetectorKind.AUTO in unique_kinds:
+            raise ValueError(
+                "--compare does not support 'auto'; specify concrete backends (contour, onnx, magi)."
+            )
+        if DetectorKind.MAGI in unique_kinds and not detector_config.allow_remote_code:
+            raise ValueError(
+                "Using 'magi' in --compare requires --allow-remote-code."
+            )
+        return unique_kinds
+
     def preview_panels(
         self,
         input_path: Path,
@@ -347,6 +368,8 @@ class ConversionPipeline:
         padding: float = 0.02,
         min_panel_area: float = 0.03,
         detector: DetectorConfig | None = None,
+        detector_config: DetectorConfig | None = None,
+        compare: list[DetectorKind] | None = None,
         no_kcc: bool = False,
         keep_temp: bool = False,
         workers: int = 4,
@@ -354,9 +377,17 @@ class ConversionPipeline:
     ) -> list[Path]:
         """Extract, preprocess, detect/sort panels, and render numbered PNG debug overlays."""
         resolved_profile = profile or DeviceProfile.from_name("KPW5")
-        output_dir.mkdir(parents=True, exist_ok=True)
+        detector_cfg = (
+            detector_config
+            or detector
+            or DetectorConfig(padding=padding, min_panel_area=min_panel_area)
+        )
 
-        detector_cfg = detector or DetectorConfig(padding=padding, min_panel_area=min_panel_area)
+        compare_kinds: list[DetectorKind] | None = None
+        if compare is not None:
+            compare_kinds = self.validate_compare_backends(compare, detector_cfg)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
         config = ConversionConfig(
             input_path=input_path,
             output_path=output_dir,
@@ -372,20 +403,58 @@ class ConversionPipeline:
             kcc_path=kcc_path,
         )
 
-        active_registry = self._resolve_registry(config.detector)
+        compare_registries: dict[DetectorKind, BackendRegistry] | None = None
+        active_registry: BackendRegistry | None = None
+        if compare_kinds is not None:
+            compare_registries = {}
+            for kind in compare_kinds:
+                reg = BackendRegistry(detector_cfg.model_copy(update={"kind": kind}))
+                reg.resolve()
+                compare_registries[kind] = reg
+        else:
+            active_registry = self._resolve_registry(config.detector)
+
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_preview_"))
         try:
             pages = self.extractor.extract(input_path, work_dir)
             processed = self.preprocessor.process(pages, work_dir, config)
+            renderer = PanelPreviewRenderer()
+            pad = max(4, len(str(len(processed))))
+
+            if compare_registries is not None and compare_kinds is not None:
+                annotated_by_kind: dict[DetectorKind, list[PageAsset]] = {
+                    kind: self._detect_and_sort_pages(
+                        processed,
+                        registry=reg,
+                        direction=direction,
+                        workers=workers,
+                    )
+                    for kind, reg in compare_registries.items()
+                }
+
+                def _render_compare_page(page_idx: int) -> Path:
+                    base_page = processed[page_idx]
+                    img_path = base_page.processed_path or base_page.source_path
+                    out_file = output_dir / f"page_{base_page.index + 1:0{pad}d}.png"
+                    results: dict[DetectorKind, list[PanelBox]] = {
+                        kind: annotated_by_kind[kind][page_idx].panels
+                        for kind in compare_kinds
+                    }
+                    return renderer.render_comparison(img_path, results, out_file)
+
+                indices = list(range(len(processed)))
+                if workers > 1 and len(indices) > 1:
+                    with ThreadPoolExecutor(max_workers=min(workers, len(indices))) as executor:
+                        return list(executor.map(_render_compare_page, indices))
+                return [_render_compare_page(idx) for idx in indices]
+
+            assert active_registry is not None
             annotated = self._detect_and_sort_pages(
                 processed,
                 registry=active_registry,
                 direction=direction,
                 workers=workers,
             )
-
-            renderer = PanelPreviewRenderer()
-            pad = max(4, len(str(len(annotated))))
 
             def _render_page(page: PageAsset) -> Path:
                 img_path = page.processed_path or page.source_path
@@ -399,3 +468,66 @@ class ConversionPipeline:
         finally:
             if not keep_temp:
                 shutil.rmtree(work_dir, ignore_errors=True)
+
+    def preview_batch(
+        self,
+        config: ConversionConfig,
+        *,
+        on_success: Callable[[Path, Path], None] | None = None,
+        on_error: Callable[[Path, Exception], None] | None = None,
+    ) -> list[Path]:
+        """Render panel preview overlays for all CBZ/CBR archives in config.input_path."""
+        archives = self._find_archives(config.input_path)
+        if not archives:
+            raise ValueError(f"No .cbz or .cbr archives found in {config.input_path}")
+
+        out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.last_batch_errors = []
+
+        batch_workers = min(config.workers, len(archives))
+        per_book_workers = max(1, config.workers // batch_workers)
+
+        def _preview_one(archive_path: Path) -> tuple[Path, Path | None, Exception | None]:
+            preview_dir = out_dir / f"{archive_path.stem}_preview"
+            try:
+                self.preview_panels(
+                    input_path=archive_path,
+                    output_dir=preview_dir,
+                    profile=config.profile,
+                    direction=config.direction,
+                    spread_mode=config.spread_mode,
+                    padding=config.padding,
+                    min_panel_area=config.min_panel_area,
+                    detector_config=config.detector,
+                    no_kcc=config.no_kcc,
+                    keep_temp=config.keep_temp,
+                    workers=per_book_workers,
+                    kcc_path=config.kcc_path,
+                )
+                return archive_path, preview_dir, None
+            except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
+                logger.error("Failed to preview %s: %s", archive_path, exc)
+                return archive_path, None, exc
+
+        if batch_workers > 1:
+            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                outcomes = list(executor.map(_preview_one, archives))
+        else:
+            outcomes = [_preview_one(arch) for arch in archives]
+
+        succeeded_dirs: list[Path] = []
+        errors: list[tuple[Path, Exception]] = []
+        for archive_path, preview_dir, exc in outcomes:
+            if exc is not None or preview_dir is None:
+                err = exc if exc is not None else RuntimeError("Unknown preview failure")
+                errors.append((archive_path, err))
+                if on_error is not None:
+                    on_error(archive_path, err)
+            else:
+                succeeded_dirs.append(preview_dir)
+                if on_success is not None:
+                    on_success(archive_path, preview_dir)
+
+        self.last_batch_errors = errors
+        return succeeded_dirs

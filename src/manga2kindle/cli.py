@@ -134,6 +134,37 @@ def _build_detector_config(
     )
 
 
+def _parse_compare_backends(raw: str | None) -> list[DetectorKind] | None:
+    """Parse a comma-separated --compare backend list into DetectorKind enums."""
+    if raw is None:
+        return None
+    parts = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise typer.BadParameter("--compare requires at least one backend (e.g. contour,onnx).")
+    kinds: list[DetectorKind] = []
+    for part in parts:
+        try:
+            kinds.append(DetectorKind(part))
+        except ValueError as exc:
+            valid = ", ".join(k.value for k in DetectorKind if k != DetectorKind.AUTO)
+            raise typer.BadParameter(
+                f"Unknown detector backend '{part}' in --compare. Choose from: {valid}"
+            ) from exc
+    return kinds
+
+
+def _resolve_preview_only_dir(input_path: Path, output: Path | None) -> Path:
+    """Resolve the preview output directory for `convert --preview-only` on a single input."""
+    default_name = ConversionPipeline.resolve_input_name(input_path)
+    if output is None:
+        return input_path.resolve().parent / f"{default_name}_preview"
+    if output.suffix.lower() == ".kfx":
+        return output.parent / f"{output.stem}_preview"
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Output path exists and is not a directory: {output}")
+    return output
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"manga2kindle {__version__}")
@@ -267,6 +298,13 @@ def convert(
             help="Target cover WIDTHxHEIGHT (stretched to fill without borders).",
         ),
     ] = f"{DEFAULT_COVER_SIZE[0]}x{DEFAULT_COVER_SIZE[1]}",
+    preview_only: Annotated[
+        bool,
+        typer.Option(
+            "--preview-only",
+            help="Render panel preview PNGs and exit without compiling KPF/KFX.",
+        ),
+    ] = False,
 ) -> None:
     """Convert CBZ, CBR, image folder, or batch directory into PDOC-tagged KFX."""
     device_profile = _resolve_profile(profile, custom_size)
@@ -281,10 +319,16 @@ def convert(
             resolved_output = (
                 input_path
                 if is_batch
-                else ConversionPipeline.resolve_single_output(input_path, None)
+                else (
+                    _resolve_preview_only_dir(input_path, None)
+                    if preview_only
+                    else ConversionPipeline.resolve_single_output(input_path, None)
+                )
             )
         elif is_batch:
             resolved_output = ConversionPipeline.resolve_batch_output_dir(input_path, output)
+        elif preview_only:
+            resolved_output = _resolve_preview_only_dir(input_path, output)
         else:
             resolved_output = ConversionPipeline.resolve_single_output(input_path, output)
 
@@ -317,6 +361,50 @@ def convert(
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+    if preview_only:
+        if is_batch:
+            try:
+                preview_dirs = pipeline.preview_batch(config)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]Batch preview failed:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+
+            for preview_dir in preview_dirs:
+                console.print(f"[green]Rendered preview(s):[/green] {preview_dir}")
+            for failed_archive, err in pipeline.last_batch_errors:
+                console.print(f"[red]Failed:[/red] {failed_archive.name} - {err}")
+
+            total = len(preview_dirs) + len(pipeline.last_batch_errors)
+            console.print(
+                f"[bold]Batch preview summary:[/bold] {len(preview_dirs)}/{total} succeeded, "
+                f"{len(pipeline.last_batch_errors)} failed."
+            )
+            if pipeline.last_batch_errors:
+                raise typer.Exit(code=1)
+            return
+
+        try:
+            rendered = pipeline.preview_panels(
+                input_path=input_path,
+                output_dir=resolved_output,
+                profile=device_profile,
+                direction=direction,
+                spread_mode=spread_mode,
+                padding=padding,
+                min_panel_area=min_panel_area,
+                detector_config=detector_cfg,
+                no_kcc=no_kcc,
+                keep_temp=keep_temp,
+                workers=workers,
+                kcc_path=kcc_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Preview failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        console.print(f"[green]Rendered {len(rendered)} panel preview(s) to:[/green] {resolved_output}")
+        return
 
     if is_batch:
         try:
@@ -437,9 +525,17 @@ def preview_panels(
         int,
         typer.Option("-w", "--workers", min=1, help="Parallel worker thread count."),
     ] = os.cpu_count() or 4,
+    compare: Annotated[
+        str | None,
+        typer.Option(
+            "--compare",
+            help="Comma-separated backends to compare side-by-side (e.g. contour,onnx,magi).",
+        ),
+    ] = None,
 ) -> None:
     """Render debug overlays showing detected panels and reading-order arrows."""
     device_profile = _resolve_profile(profile, custom_size)
+    compare_kinds = _parse_compare_backends(compare)
     default_name = ConversionPipeline.resolve_input_name(input_path)
     target_dir = output_dir or (input_path.resolve().parent / f"{default_name}_preview")
     if target_dir.exists() and not target_dir.is_dir():
@@ -465,7 +561,8 @@ def preview_panels(
             spread_mode=spread_mode,
             padding=padding,
             min_panel_area=min_panel_area,
-            detector=detector_cfg,
+            detector_config=detector_cfg,
+            compare=compare_kinds,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             workers=workers,
