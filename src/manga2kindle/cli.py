@@ -51,7 +51,6 @@ _TOOL_REQUIREMENTS: dict[str, str] = {
     "kcc-c2e": "Required*",
     "calibre-debug": "Required",
     "KFX Output": "Required",
-    "Kindle Previewer 4": "Optional",
     "unrar/unar/7z": "Opt (CBR)",
     "onnxruntime": "Optional",
     "torch": "Optional",
@@ -329,6 +328,13 @@ def convert(
             help="Render panel preview PNGs and exit without compiling KPF/KFX.",
         ),
     ] = False,
+    skip_existing: Annotated[
+        bool,
+        typer.Option(
+            "--skip-existing",
+            help="Skip conversion if the output .kfx file already exists.",
+        ),
+    ] = False,
 ) -> None:
     """Convert CBZ, CBR, image folder, or batch directory into PDOC-tagged KFX."""
     device_profile = _resolve_profile(profile, custom_size)
@@ -378,6 +384,7 @@ def convert(
             detector=detector_cfg,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
+            skip_existing=skip_existing,
             workers=workers,
             batch_workers=batch_workers,
             kcc_path=kcc_path,
@@ -441,14 +448,23 @@ def convert(
 
         for out_kfx in outputs:
             console.print(f"[green]Converted:[/green] {out_kfx}")
+        for skipped_kfx in pipeline.last_batch_skipped:
+            console.print(f"[yellow]Skipped (already exists):[/yellow] {skipped_kfx}")
         for failed_archive, err in pipeline.last_batch_errors:
             console.print(f"[red]Failed:[/red] {failed_archive.name} - {err}")
 
-        total = len(outputs) + len(pipeline.last_batch_errors)
-        console.print(
-            f"[bold]Batch summary:[/bold] {len(outputs)}/{total} succeeded, "
-            f"{len(pipeline.last_batch_errors)} failed."
-        )
+        total = len(outputs) + len(pipeline.last_batch_skipped) + len(pipeline.last_batch_errors)
+        if pipeline.last_batch_skipped:
+            console.print(
+                f"[bold]Batch summary:[/bold] {len(outputs)}/{total} succeeded, "
+                f"{len(pipeline.last_batch_skipped)} skipped, "
+                f"{len(pipeline.last_batch_errors)} failed."
+            )
+        else:
+            console.print(
+                f"[bold]Batch summary:[/bold] {len(outputs)}/{total} succeeded, "
+                f"{len(pipeline.last_batch_errors)} failed."
+            )
         if pipeline.last_batch_errors:
             raise typer.Exit(code=1)
         return
@@ -459,7 +475,10 @@ def convert(
         console.print(f"[red]Conversion failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[green]Converted (PDOC verified):[/green] {out_kfx}")
+    if pipeline.last_single_skipped:
+        console.print(f"[yellow]Skipped (already exists):[/yellow] {out_kfx}")
+    else:
+        console.print(f"[green]Converted (PDOC verified):[/green] {out_kfx}")
 
 
 @app.command("preview-panels")
@@ -621,17 +640,12 @@ def doctor(
         Path | None,
         typer.Option("--calibre-path", help="Explicit path to calibre-debug executable."),
     ] = None,
-    previewer_path: Annotated[
-        Path | None,
-        typer.Option("--previewer-path", help="Explicit path to KindlePreviewer4CLI."),
-    ] = None,
 ) -> None:
     """Check Python libraries and external CLI dependencies."""
     discovery = PlatformDiscovery()
     statuses = discovery.run_doctor(
         kcc_override=kcc_path,
         calibre_override=calibre_path,
-        previewer_override=previewer_path,
     )
 
     table = Table(title="manga2kindle Dependency Check", expand=True)

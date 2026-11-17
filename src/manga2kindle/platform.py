@@ -109,31 +109,6 @@ class PlatformDiscovery:
             ]
         return self._first_existing(candidates)
 
-    def find_previewer4(self, override: Path | None = None) -> Path | None:
-        """Locate Kindle Previewer 4 CLI executable."""
-        if override is not None:
-            return override if override.is_file() else None
-
-        exe_name = "KindlePreviewer4CLI.exe" if self._is_windows else "KindlePreviewer4CLI"
-        which_hit = self._which([exe_name, "KindlePreviewer4CLI"])
-        if which_hit is not None:
-            return which_hit
-
-        if self._is_windows:
-            roots = self._env_dirs("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)")
-            candidates: list[Path] = []
-            for root in roots:
-                kp4_dir = root / "Amazon" / "Kindle Previewer 4"
-                candidates.append(kp4_dir / "KindlePreviewer4CLI.exe")
-                candidates.append(kp4_dir / "lib" / "fc" / "bin" / "KindlePreviewer4CLI.exe")
-        else:
-            candidates = [
-                Path("/Applications/Kindle Previewer 4.app/Contents/MacOS/KindlePreviewer4CLI"),
-                Path.home()
-                / "Applications/Kindle Previewer 4.app/Contents/MacOS/KindlePreviewer4CLI",
-            ]
-        return self._first_existing(candidates)
-
     def find_unrar(self) -> Path | None:
         """Locate an archive extractor capable of handling CBR (RAR) archives."""
         names = (
@@ -183,12 +158,10 @@ class PlatformDiscovery:
         self,
         kcc_override: Path | None = None,
         calibre_override: Path | None = None,
-        previewer_override: Path | None = None,
     ) -> list[ToolStatus]:
         """Run diagnostic checks for all external dependencies required by manga2kindle."""
         kcc_path = self.find_kcc(override=kcc_override)
         calibre_path = self.find_calibre(override=calibre_override)
-        kp4_path = self.find_previewer4(override=previewer_override)
         unrar_path = self.find_unrar()
 
         statuses = [
@@ -219,7 +192,6 @@ class PlatformDiscovery:
                 )
             )
 
-        statuses.append(self._check_tool("Kindle Previewer 4", kp4_path))
         statuses.append(self._check_tool("unrar/unar/7z", unrar_path))
         statuses.extend(self._check_detector_diagnostics())
         return statuses

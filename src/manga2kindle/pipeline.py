@@ -51,6 +51,8 @@ class ConversionPipeline:
         self.builder = builder or KpfBuilder()
         self._backend_registry = backend_registry
         self.last_batch_errors: list[tuple[Path, Exception]] = []
+        self.last_batch_skipped: list[Path] = []
+        self.last_single_skipped: bool = False
 
     def _resolve_registry(
         self,
@@ -229,6 +231,14 @@ class ConversionPipeline:
         registry: BackendRegistry | None = None,
     ) -> Path:
         """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
+        self.last_single_skipped = False
+        input_name = self.resolve_input_name(config.input_path)
+        output_kfx = self.resolve_single_output(config.input_path, config.output_path)
+        if config.skip_existing and output_kfx.exists():
+            logger.info("Skipping existing output: %s", output_kfx)
+            self.last_single_skipped = True
+            return output_kfx
+
         calibre_path = self.discovery.find_calibre(override=config.calibre_path)
         if calibre_path is None:
             raise KfxCompilationError(
@@ -237,8 +247,6 @@ class ConversionPipeline:
             )
 
         active_registry = self._resolve_registry(config.detector, registry)
-        input_name = self.resolve_input_name(config.input_path)
-        output_kfx = self.resolve_single_output(config.input_path, config.output_path)
         book_title = (title or "").strip() or input_name
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_"))
 
@@ -288,6 +296,7 @@ class ConversionPipeline:
         author: str | None = None,
         on_success: Callable[[Path, Path], None] | None = None,
         on_error: Callable[[Path, Exception], None] | None = None,
+        on_skip: Callable[[Path, Path], None] | None = None,
     ) -> list[Path]:
         """Convert all CBZ/CBR archives in config.input_path concurrently."""
         archives = self._find_archives(config.input_path)
@@ -308,6 +317,21 @@ class ConversionPipeline:
             seen_names[key] = archive_path
             targets.append((archive_path, out_kfx))
 
+        self.last_batch_errors = []
+        self.last_batch_skipped = []
+        pending_targets: list[tuple[Path, Path]] = []
+        for archive_path, out_kfx in targets:
+            if config.skip_existing and out_kfx.exists():
+                logger.info("Skipping existing output: %s", out_kfx)
+                self.last_batch_skipped.append(out_kfx)
+                if on_skip is not None:
+                    on_skip(archive_path, out_kfx)
+            else:
+                pending_targets.append((archive_path, out_kfx))
+
+        if not pending_targets:
+            return []
+
         calibre_path = self.discovery.find_calibre(override=config.calibre_path)
         if calibre_path is None:
             raise KfxCompilationError(
@@ -317,11 +341,10 @@ class ConversionPipeline:
 
         batch_registry = self._resolve_registry(config.detector)
         out_dir.mkdir(parents=True, exist_ok=True)
-        self.last_batch_errors = []
 
         batch_workers, per_book_workers = self._resolve_batch_workers(
             config.workers,
-            len(targets),
+            len(pending_targets),
             no_kcc=config.no_kcc,
             detector_kind=config.detector.kind,
             batch_workers_override=config.batch_workers,
@@ -353,10 +376,10 @@ class ConversionPipeline:
         if batch_workers > 1:
             with ThreadPoolExecutor(max_workers=batch_workers) as executor:
                 outcomes = list(
-                    executor.map(lambda item: _convert_one(item[0], item[1]), targets)
+                    executor.map(lambda item: _convert_one(item[0], item[1]), pending_targets)
                 )
         else:
-            outcomes = [_convert_one(arch, tgt) for arch, tgt in targets]
+            outcomes = [_convert_one(arch, tgt) for arch, tgt in pending_targets]
 
         succeeded: list[Path] = []
         errors: list[tuple[Path, Exception]] = []
