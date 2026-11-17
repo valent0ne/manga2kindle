@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import sys
 from pathlib import Path
@@ -14,9 +16,16 @@ from rich.console import Console
 from rich.table import Table
 
 from manga2kindle import __version__
+from manga2kindle.cv import benchmark as cv_benchmark
+from manga2kindle.cv import models_hub
+from manga2kindle.cv.backends import resolve_auto_chain
+from manga2kindle.cv.benchmark import BenchmarkDatasetKind, BenchmarkMetrics
 from manga2kindle.models import (
     DEFAULT_COVER_SIZE,
     ConversionConfig,
+    DetectorConfig,
+    DetectorKind,
+    DevicePreference,
     DeviceProfile,
     ReadingDirection,
     SpreadMode,
@@ -29,6 +38,12 @@ app = typer.Typer(
     help="Convert CBZ/CBR manga into PDOC-tagged KFX files with Guided View panels.",
     no_args_is_help=True,
 )
+models_app = typer.Typer(
+    name="models",
+    help="List and download panel detection model weights.",
+    no_args_is_help=True,
+)
+app.add_typer(models_app, name="models")
 console = Console()
 
 _REQUIRED_TOOLS = frozenset({"kcc-c2e", "calibre-debug", "KFX Output"})
@@ -38,6 +53,10 @@ _TOOL_REQUIREMENTS: dict[str, str] = {
     "KFX Output": "Required",
     "Kindle Previewer 4": "Optional",
     "unrar/unar/7z": "Opt (CBR)",
+    "onnxruntime": "Optional",
+    "torch": "Optional",
+    "Cached Models": "Optional",
+    "AUTO Detector": "Optional",
 }
 
 
@@ -87,6 +106,68 @@ def _resolve_profile(profile: str, custom_size: str | None) -> DeviceProfile:
         return DeviceProfile.from_name(normalized)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _build_detector_config(
+    *,
+    detector: DetectorKind,
+    detector_model: str | None,
+    device: DevicePreference,
+    score_threshold: float,
+    allow_remote_code: bool,
+    padding: float,
+    min_panel_area: float,
+) -> DetectorConfig:
+    """Build a DetectorConfig from shared CLI detector options."""
+    model_path: Path | None = None
+    model_id: str | None = None
+    if detector_model is not None:
+        if detector == DetectorKind.MAGI:
+            model_path, model_id = models_hub.resolve_magi_model_spec(detector_model)
+        else:
+            model_path, model_id = models_hub.resolve_model_spec(detector_model)
+
+    return DetectorConfig(
+        kind=detector,
+        model_path=model_path,
+        model_id=model_id,
+        device=device,
+        score_threshold=score_threshold,
+        allow_remote_code=allow_remote_code,
+        padding=padding,
+        min_panel_area=min_panel_area,
+    )
+
+
+def _parse_compare_backends(raw: str | None) -> list[DetectorKind] | None:
+    """Parse a comma-separated --compare backend list into DetectorKind enums."""
+    if raw is None:
+        return None
+    parts = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise typer.BadParameter("--compare requires at least one backend (e.g. contour,onnx).")
+    kinds: list[DetectorKind] = []
+    for part in parts:
+        try:
+            kinds.append(DetectorKind(part))
+        except ValueError as exc:
+            valid = ", ".join(k.value for k in DetectorKind if k != DetectorKind.AUTO)
+            raise typer.BadParameter(
+                f"Unknown detector backend '{part}' in --compare. Choose from: {valid}"
+            ) from exc
+    return kinds
+
+
+def _resolve_preview_only_dir(input_path: Path, output: Path | None) -> Path:
+    """Resolve the preview output directory for `convert --preview-only` on a single input."""
+    default_name = ConversionPipeline.resolve_input_name(input_path)
+    if output is None:
+        return input_path.resolve().parent / f"{default_name}_preview"
+    if output.suffix.lower() == ".kfx":
+        return output.parent / f"{output.stem}_preview"
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Output path exists and is not a directory: {output}")
+    return output
 
 
 def _version_callback(value: bool) -> None:
@@ -148,6 +229,45 @@ def convert(
         float,
         typer.Option("--min-panel-area", min=0.01, max=0.50, help="Minimum panel area ratio."),
     ] = 0.03,
+    detector: Annotated[
+        DetectorKind,
+        typer.Option(
+            "--detector",
+            case_sensitive=False,
+            help="Panel detector backend: auto, magi, onnx, or contour.",
+        ),
+    ] = DetectorKind.AUTO,
+    detector_model: Annotated[
+        str | None,
+        typer.Option(
+            "--detector-model",
+            help="Detector model key, Hugging Face repo ID, or local weights path.",
+        ),
+    ] = None,
+    device: Annotated[
+        DevicePreference,
+        typer.Option(
+            "--device",
+            case_sensitive=False,
+            help="Inference device for neural detectors: auto, cpu, cuda, or mps.",
+        ),
+    ] = DevicePreference.AUTO,
+    score_threshold: Annotated[
+        float,
+        typer.Option(
+            "--score-threshold",
+            min=0.0,
+            max=1.0,
+            help="Confidence threshold for neural panel detectors.",
+        ),
+    ] = 0.25,
+    allow_remote_code: Annotated[
+        bool,
+        typer.Option(
+            "--allow-remote-code",
+            help="Allow executing remote model code (required to enable Magi).",
+        ),
+    ] = False,
     kcc_path: Annotated[
         Path | None,
         typer.Option("--kcc-path", help="Explicit path to kcc-c2e executable."),
@@ -183,6 +303,13 @@ def convert(
             help="Target cover WIDTHxHEIGHT (stretched to fill without borders).",
         ),
     ] = f"{DEFAULT_COVER_SIZE[0]}x{DEFAULT_COVER_SIZE[1]}",
+    preview_only: Annotated[
+        bool,
+        typer.Option(
+            "--preview-only",
+            help="Render panel preview PNGs and exit without compiling KPF/KFX.",
+        ),
+    ] = False,
 ) -> None:
     """Convert CBZ, CBR, image folder, or batch directory into PDOC-tagged KFX."""
     device_profile = _resolve_profile(profile, custom_size)
@@ -197,13 +324,28 @@ def convert(
             resolved_output = (
                 input_path
                 if is_batch
-                else ConversionPipeline.resolve_single_output(input_path, None)
+                else (
+                    _resolve_preview_only_dir(input_path, None)
+                    if preview_only
+                    else ConversionPipeline.resolve_single_output(input_path, None)
+                )
             )
         elif is_batch:
             resolved_output = ConversionPipeline.resolve_batch_output_dir(input_path, output)
+        elif preview_only:
+            resolved_output = _resolve_preview_only_dir(input_path, output)
         else:
             resolved_output = ConversionPipeline.resolve_single_output(input_path, output)
 
+        detector_cfg = _build_detector_config(
+            detector=detector,
+            detector_model=detector_model,
+            device=device,
+            score_threshold=score_threshold,
+            allow_remote_code=allow_remote_code,
+            padding=padding,
+            min_panel_area=min_panel_area,
+        )
         config = ConversionConfig(
             input_path=input_path,
             output_path=resolved_output,
@@ -213,6 +355,7 @@ def convert(
             zoom_factor=zoom_factor,
             padding=padding,
             min_panel_area=min_panel_area,
+            detector=detector_cfg,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             workers=workers,
@@ -223,6 +366,50 @@ def convert(
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+    if preview_only:
+        if is_batch:
+            try:
+                preview_dirs = pipeline.preview_batch(config)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]Batch preview failed:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+
+            for preview_dir in preview_dirs:
+                console.print(f"[green]Rendered preview(s):[/green] {preview_dir}")
+            for failed_archive, err in pipeline.last_batch_errors:
+                console.print(f"[red]Failed:[/red] {failed_archive.name} - {err}")
+
+            total = len(preview_dirs) + len(pipeline.last_batch_errors)
+            console.print(
+                f"[bold]Batch preview summary:[/bold] {len(preview_dirs)}/{total} succeeded, "
+                f"{len(pipeline.last_batch_errors)} failed."
+            )
+            if pipeline.last_batch_errors:
+                raise typer.Exit(code=1)
+            return
+
+        try:
+            rendered = pipeline.preview_panels(
+                input_path=input_path,
+                output_dir=resolved_output,
+                profile=device_profile,
+                direction=direction,
+                spread_mode=spread_mode,
+                padding=padding,
+                min_panel_area=min_panel_area,
+                detector_config=detector_cfg,
+                no_kcc=no_kcc,
+                keep_temp=keep_temp,
+                workers=workers,
+                kcc_path=kcc_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Preview failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        console.print(f"[green]Rendered {len(rendered)} panel preview(s) to:[/green] {resolved_output}")
+        return
 
     if is_batch:
         try:
@@ -288,6 +475,45 @@ def preview_panels(
         float,
         typer.Option("--min-panel-area", min=0.01, max=0.50, help="Minimum panel area ratio."),
     ] = 0.03,
+    detector: Annotated[
+        DetectorKind,
+        typer.Option(
+            "--detector",
+            case_sensitive=False,
+            help="Panel detector backend: auto, magi, onnx, or contour.",
+        ),
+    ] = DetectorKind.AUTO,
+    detector_model: Annotated[
+        str | None,
+        typer.Option(
+            "--detector-model",
+            help="Detector model key, Hugging Face repo ID, or local weights path.",
+        ),
+    ] = None,
+    device: Annotated[
+        DevicePreference,
+        typer.Option(
+            "--device",
+            case_sensitive=False,
+            help="Inference device for neural detectors: auto, cpu, cuda, or mps.",
+        ),
+    ] = DevicePreference.AUTO,
+    score_threshold: Annotated[
+        float,
+        typer.Option(
+            "--score-threshold",
+            min=0.0,
+            max=1.0,
+            help="Confidence threshold for neural panel detectors.",
+        ),
+    ] = 0.25,
+    allow_remote_code: Annotated[
+        bool,
+        typer.Option(
+            "--allow-remote-code",
+            help="Allow executing remote model code (required to enable Magi).",
+        ),
+    ] = False,
     kcc_path: Annotated[
         Path | None,
         typer.Option("--kcc-path", help="Explicit path to kcc-c2e executable."),
@@ -304,9 +530,17 @@ def preview_panels(
         int,
         typer.Option("-w", "--workers", min=1, help="Parallel worker thread count."),
     ] = os.cpu_count() or 4,
+    compare: Annotated[
+        str | None,
+        typer.Option(
+            "--compare",
+            help="Comma-separated backends to compare side-by-side (e.g. contour,onnx,magi).",
+        ),
+    ] = None,
 ) -> None:
     """Render debug overlays showing detected panels and reading-order arrows."""
     device_profile = _resolve_profile(profile, custom_size)
+    compare_kinds = _parse_compare_backends(compare)
     default_name = ConversionPipeline.resolve_input_name(input_path)
     target_dir = output_dir or (input_path.resolve().parent / f"{default_name}_preview")
     if target_dir.exists() and not target_dir.is_dir():
@@ -315,6 +549,15 @@ def preview_panels(
     pipeline = ConversionPipeline()
 
     try:
+        detector_cfg = _build_detector_config(
+            detector=detector,
+            detector_model=detector_model,
+            device=device,
+            score_threshold=score_threshold,
+            allow_remote_code=allow_remote_code,
+            padding=padding,
+            min_panel_area=min_panel_area,
+        )
         rendered = pipeline.preview_panels(
             input_path=input_path,
             output_dir=target_dir,
@@ -323,6 +566,8 @@ def preview_panels(
             spread_mode=spread_mode,
             padding=padding,
             min_panel_area=min_panel_area,
+            detector_config=detector_cfg,
+            compare=compare_kinds,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             workers=workers,
@@ -398,3 +643,303 @@ def doctor(
             "--calibre-path / --kcc-path overrides."
         )
         raise typer.Exit(code=1)
+
+
+def _safe_is_cached(checker, key: str) -> str:
+    try:
+        return "[green]Yes[/green]" if checker(key) else "[dim]No[/dim]"
+    except RuntimeError:
+        return "[yellow]Unknown[/yellow]"
+
+
+@models_app.command("list")
+def models_list() -> None:
+    """List registered panel detection models, cache status, and license notices."""
+    table = Table(title="manga2kindle Registered Models", expand=True)
+    table.add_column("Key", style="bold", no_wrap=True)
+    table.add_column("Backend", no_wrap=True)
+    table.add_column("Cached", no_wrap=True)
+    table.add_column("Repository", overflow="fold")
+    table.add_column("License Notice", overflow="fold")
+
+    for spec in models_hub.list_registered_models():
+        table.add_row(
+            spec.key,
+            DetectorKind.ONNX_YOLO.value,
+            _safe_is_cached(models_hub.is_model_cached, spec.key),
+            f"{spec.repo_id}@{spec.revision[:8]}",
+            spec.license_notice,
+        )
+
+    for magi_spec in models_hub.list_registered_magi_models():
+        table.add_row(
+            magi_spec.key,
+            DetectorKind.MAGI.value,
+            _safe_is_cached(models_hub.is_magi_cached, magi_spec.key),
+            f"{magi_spec.repo_id}@{magi_spec.revision[:8]}",
+            magi_spec.license_notice,
+        )
+
+    console.print(table)
+
+
+@models_app.command("fetch")
+def models_fetch(
+    name: Annotated[
+        str,
+        typer.Argument(help="Model key to download (e.g. manga109-yolo-s, manga109-yolo-n, magiv3)."),
+    ] = models_hub.DEFAULT_ONNX_MODEL_KEY,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Re-download even if weights are already cached."),
+    ] = False,
+) -> None:
+    """Download and verify a registered panel detection model into the local cache."""
+    try:
+        try:
+            spec = models_hub.get_model_spec(name)
+            dest = models_hub.fetch_model(spec.key, force=force)
+            notice = spec.license_notice
+        except ValueError:
+            magi_spec = models_hub.get_magi_model_spec(name)
+            dest = models_hub.fetch_magi_model(magi_spec.key, force=force)
+            notice = magi_spec.license_notice
+    except (ValueError, RuntimeError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Cached model:[/green] {dest}")
+    console.print(f"[dim]License notice: {notice}[/dim]")
+
+
+def _print_benchmark_notices(
+    dataset: BenchmarkDatasetKind,
+    backend_kinds: list[DetectorKind],
+    detector_model: str | None,
+) -> None:
+    """Display dataset and model license/attribution notices before loading."""
+    dataset_notice = cv_benchmark.get_dataset_license_notice(dataset)
+    if dataset_notice:
+        console.print(f"[dim]Dataset license notice: {dataset_notice}[/dim]")
+
+    for kind in backend_kinds:
+        if kind == DetectorKind.ONNX_YOLO:
+            try:
+                _, model_key = models_hub.resolve_model_spec(
+                    detector_model or models_hub.DEFAULT_ONNX_MODEL_KEY
+                )
+                if model_key is not None:
+                    spec = models_hub.get_model_spec(model_key)
+                    console.print(f"[dim]Model license ({spec.key}): {spec.license_notice}[/dim]")
+            except ValueError:
+                pass
+        elif kind == DetectorKind.MAGI:
+            try:
+                _, model_key = models_hub.resolve_magi_model_spec(
+                    detector_model or models_hub.DEFAULT_MAGI_MODEL_KEY
+                )
+                if model_key is not None:
+                    spec = models_hub.get_magi_model_spec(model_key)
+                    console.print(f"[dim]Model license ({spec.key}): {spec.license_notice}[/dim]")
+            except ValueError:
+                pass
+
+
+def _render_benchmark_table(results: list[BenchmarkMetrics], title: str) -> Table:
+    table = Table(title=title, expand=True)
+    table.add_column("Backend", style="bold", no_wrap=True)
+    table.add_column("Pages", justify="right")
+    table.add_column("P@50", justify="right")
+    table.add_column("R@50", justify="right")
+    table.add_column("P@75", justify="right")
+    table.add_column("R@75", justify="right")
+    table.add_column("mIoU", justify="right")
+    table.add_column("Dup%", justify="right")
+    table.add_column("Count%", justify="right")
+    table.add_column("PairAcc", justify="right")
+    table.add_column("Tau", justify="right")
+    table.add_column("ms/pg", justify="right")
+    table.add_column("RAM MB", justify="right")
+    table.add_column("VRAM MB", justify="right")
+
+    for row in results:
+        table.add_row(
+            row.backend.value,
+            str(row.pages_evaluated),
+            f"{row.precision_50:.3f}",
+            f"{row.recall_50:.3f}",
+            f"{row.precision_75:.3f}",
+            f"{row.recall_75:.3f}",
+            f"{row.mean_iou:.3f}",
+            f"{row.nested_duplicate_rate * 100:.1f}%",
+            f"{row.exact_count_match * 100:.1f}%",
+            f"{row.pairwise_order_acc:.3f}",
+            f"{row.kendall_tau:.3f}",
+            f"{row.ms_per_page:.1f}",
+            f"{row.peak_ram_mb:.1f}",
+            f"{row.peak_vram_mb:.1f}",
+        )
+    return table
+
+
+@app.command()
+def benchmark(
+    dataset: Annotated[
+        BenchmarkDatasetKind,
+        typer.Option(
+            "--dataset",
+            case_sensitive=False,
+            help="Benchmark dataset: popmanga, comix, or local.",
+        ),
+    ] = BenchmarkDatasetKind.POPMANGA,
+    split: Annotated[
+        str,
+        typer.Option("--split", help="Dataset split for popmanga or comix."),
+    ] = "test",
+    pages_dir: Annotated[
+        Path | None,
+        typer.Option("--pages-dir", help="Page images directory (required when --dataset local)."),
+    ] = None,
+    truth: Annotated[
+        Path | None,
+        typer.Option("--truth", help="Ground-truth JSON/COCO file (required when --dataset local)."),
+    ] = None,
+    cache_dir: Annotated[
+        Path | None,
+        typer.Option("--cache-dir", help="Optional local cache directory for HF datasets."),
+    ] = None,
+    backends: Annotated[
+        str,
+        typer.Option(
+            "--backends",
+            help="Comma-separated backends to evaluate (e.g. contour,onnx,magi).",
+        ),
+    ] = "contour",
+    direction: Annotated[
+        ReadingDirection | None,
+        typer.Option(
+            "-d",
+            "--direction",
+            case_sensitive=False,
+            help="Reading direction override (defaults to rtl for popmanga/local, ltr for comix).",
+        ),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="Maximum number of pages to evaluate."),
+    ] = None,
+    warmup: Annotated[
+        int,
+        typer.Option("--warmup", min=0, help="Warmup pages excluded from timing."),
+    ] = 1,
+    device: Annotated[
+        DevicePreference,
+        typer.Option(
+            "--device",
+            case_sensitive=False,
+            help="Inference device for neural detectors: auto, cpu, cuda, or mps.",
+        ),
+    ] = DevicePreference.AUTO,
+    score_threshold: Annotated[
+        float,
+        typer.Option(
+            "--score-threshold",
+            min=0.0,
+            max=1.0,
+            help="Confidence threshold for neural panel detectors.",
+        ),
+    ] = 0.25,
+    allow_remote_code: Annotated[
+        bool,
+        typer.Option(
+            "--allow-remote-code",
+            help="Allow executing remote model code (required to enable Magi).",
+        ),
+    ] = False,
+    detector_model: Annotated[
+        str | None,
+        typer.Option(
+            "--detector-model",
+            help="Detector model key, Hugging Face repo ID, or local weights path.",
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Optional path to write JSON benchmark report."),
+    ] = None,
+) -> None:
+    """Evaluate panel detection backends against PopManga, CoMix, or a local dataset."""
+    backend_kinds = _parse_compare_backends(backends) or [DetectorKind.CONTOUR]
+    if any(k == DetectorKind.AUTO for k in backend_kinds):
+        console.print("[red]Error:[/red] Specify concrete backends (contour, onnx, magi) instead of auto.")
+        raise typer.Exit(code=1)
+
+    effective_direction = direction or cv_benchmark.default_direction_for_dataset(dataset)
+    _print_benchmark_notices(dataset, backend_kinds, detector_model)
+
+    try:
+        if dataset == BenchmarkDatasetKind.LOCAL:
+            if pages_dir is None or truth is None:
+                raise ValueError("--pages-dir and --truth are required when --dataset local is used.")
+            samples = cv_benchmark.load_local_dataset(pages_dir, truth, limit=limit)
+        elif dataset == BenchmarkDatasetKind.POPMANGA:
+            samples = cv_benchmark.load_popmanga_split(
+                split,
+                cache_dir=cache_dir,
+                limit=limit,
+                trust_remote_code=allow_remote_code,
+            )
+        else:
+            samples = cv_benchmark.load_comix_split(
+                split,
+                cache_dir=cache_dir,
+                limit=limit,
+                trust_remote_code=allow_remote_code,
+            )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    results: list[BenchmarkMetrics] = []
+    for kind in backend_kinds:
+        try:
+            cfg = _build_detector_config(
+                detector=kind,
+                detector_model=detector_model,
+                device=device,
+                score_threshold=score_threshold,
+                allow_remote_code=allow_remote_code,
+                padding=0.02,
+                min_panel_area=0.03,
+            )
+            backend = resolve_auto_chain(cfg)[0]
+            metrics = cv_benchmark.run_benchmark(
+                samples,
+                backend,
+                direction=effective_direction,
+                warmup=warmup,
+            )
+            results.append(metrics)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Benchmark failed for '{kind.value}':[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+    table = _render_benchmark_table(
+        results,
+        title=f"Benchmark ({dataset.value}, dir={effective_direction.value}, pages={len(samples)})",
+    )
+    console.print(table)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "dataset": dataset.value,
+            "direction": effective_direction.value,
+            "pages_evaluated": len(samples),
+            "results": [
+                {**dataclasses.asdict(item), "backend": item.backend.value}
+                for item in results
+            ],
+        }
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        console.print(f"[green]Wrote benchmark report:[/green] {out}")

@@ -221,4 +221,99 @@ class PlatformDiscovery:
 
         statuses.append(self._check_tool("Kindle Previewer 4", kp4_path))
         statuses.append(self._check_tool("unrar/unar/7z", unrar_path))
+        statuses.extend(self._check_detector_diagnostics())
         return statuses
+
+    @staticmethod
+    def _check_detector_diagnostics() -> list[ToolStatus]:
+        """Collect optional ML runtime, cached model, and AUTO detector chain diagnostics."""
+        results: list[ToolStatus] = []
+
+        try:
+            import onnxruntime as ort
+
+            providers = ort.get_available_providers()
+            results.append(
+                ToolStatus(
+                    name="onnxruntime",
+                    found=True,
+                    version=getattr(ort, "__version__", None),
+                    details=f"providers: {', '.join(providers)}" if providers else "no providers",
+                )
+            )
+        except ImportError:
+            results.append(
+                ToolStatus(
+                    name="onnxruntime",
+                    found=False,
+                    details="Optional (pip install manga2kindle[onnx])",
+                )
+            )
+
+        try:
+            import torch
+
+            cuda_mod = getattr(torch, "cuda", None)
+            cuda_ok = bool(cuda_mod.is_available()) if cuda_mod is not None else False
+            backends_mod = getattr(torch, "backends", None)
+            mps_backend = getattr(backends_mod, "mps", None) if backends_mod is not None else None
+            mps_ok = bool(mps_backend is not None and mps_backend.is_available())
+            results.append(
+                ToolStatus(
+                    name="torch",
+                    found=True,
+                    version=getattr(torch, "__version__", None),
+                    details=f"CUDA={cuda_ok}, MPS={mps_ok}",
+                )
+            )
+        except ImportError:
+            results.append(
+                ToolStatus(
+                    name="torch",
+                    found=False,
+                    details="Optional (pip install manga2kindle[magi])",
+                )
+            )
+
+        from manga2kindle.cv.models_hub import (
+            is_magi_cached,
+            is_model_cached,
+            list_registered_magi_models,
+            list_registered_models,
+        )
+
+        cached_keys: list[str] = []
+        try:
+            for spec in list_registered_models():
+                if is_model_cached(spec.key):
+                    cached_keys.append(spec.key)
+            for magi_spec in list_registered_magi_models():
+                if is_magi_cached(magi_spec.key):
+                    cached_keys.append(magi_spec.key)
+        except RuntimeError:
+            cached_keys = []
+
+        results.append(
+            ToolStatus(
+                name="Cached Models",
+                found=bool(cached_keys),
+                details=", ".join(cached_keys)
+                if cached_keys
+                else "None cached (run: manga2kindle models fetch)",
+            )
+        )
+
+        from manga2kindle.cv.backends import resolve_auto_chain
+        from manga2kindle.models import DetectorConfig
+
+        chain = resolve_auto_chain(DetectorConfig())
+        chain_names = [backend.kind.value for backend in chain]
+        results.append(
+            ToolStatus(
+                name="AUTO Detector",
+                found=True,
+                version=chain_names[0] if chain_names else None,
+                details=f"chain: {' -> '.join(chain_names)}",
+            )
+        )
+        return results

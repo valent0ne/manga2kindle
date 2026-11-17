@@ -1,0 +1,257 @@
+"""Pluggable panel detection backends, AUTO fallback chain, and session registry."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Sequence
+from pathlib import Path
+
+from manga2kindle.cv.backends.base import DetectionResult, PanelDetectorBackend
+from manga2kindle.cv.backends.contour import ContourBackend
+from manga2kindle.cv.backends.magi import MagiBackend
+from manga2kindle.cv.backends.onnx_yolo import OnnxYoloBackend
+from manga2kindle.cv.io import read_image_bgr
+from manga2kindle.cv.models_hub import (
+    DEFAULT_MAGI_MODEL_KEY,
+    is_magi_cached,
+    resolve_magi_model_spec,
+)
+from manga2kindle.cv.sorter import PanelSorter
+from manga2kindle.models import (
+    DetectorConfig,
+    DetectorKind,
+    DevicePreference,
+    PanelBox,
+)
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "BackendRegistry",
+    "ContourBackend",
+    "DetectionResult",
+    "MagiBackend",
+    "OnnxYoloBackend",
+    "PanelDetectorBackend",
+    "detect_with_fallback",
+    "resolve_auto_chain",
+]
+
+
+def _build_contour_backend(config: DetectorConfig) -> ContourBackend:
+    return ContourBackend(
+        min_panel_area=config.min_panel_area,
+        padding=config.padding,
+        iou_threshold=config.iou_threshold,
+        containment_threshold=config.containment_threshold,
+    )
+
+
+def _probe_magi_readiness(config: DetectorConfig) -> tuple[bool, str]:
+    """Return (True, 'ready') if Magi deps, GPU, and local weights are all available."""
+    try:
+        import torch
+        import transformers  # noqa: F401
+    except ImportError:
+        return False, "magi dependencies not installed"
+
+    cuda_ok = bool(torch.cuda.is_available())
+    mps_backend = getattr(torch.backends, "mps", None)
+    mps_ok = bool(mps_backend is not None and mps_backend.is_available())
+
+    if config.device == DevicePreference.CPU:
+        return False, "device=cpu disables GPU Magi auto-selection"
+    if config.device == DevicePreference.CUDA and not cuda_ok:
+        return False, "CUDA unavailable"
+    if config.device == DevicePreference.MPS and not mps_ok:
+        return False, "MPS unavailable"
+    if config.device == DevicePreference.AUTO and not (cuda_ok or mps_ok):
+        return False, "no GPU available"
+
+    if config.model_path is not None:
+        has_weights = config.model_path.is_dir()
+    else:
+        raw_spec = config.model_id or DEFAULT_MAGI_MODEL_KEY
+        try:
+            local_path, model_key = resolve_magi_model_spec(raw_spec)
+        except ValueError:
+            return False, "invalid magi model spec"
+        if local_path is not None:
+            has_weights = local_path.is_dir()
+        elif model_key is not None:
+            try:
+                has_weights = is_magi_cached(model_key)
+            except (ValueError, RuntimeError):
+                has_weights = False
+        else:
+            has_weights = False
+
+    if not has_weights:
+        return False, "magi weights not cached"
+
+    return True, "ready"
+
+
+def resolve_auto_chain(config: DetectorConfig) -> list[PanelDetectorBackend]:
+    """Resolve an ordered list of instantiated panel detector backends for config.kind."""
+    if config.kind == DetectorKind.CONTOUR:
+        return [_build_contour_backend(config)]
+    if config.kind == DetectorKind.ONNX_YOLO:
+        return [OnnxYoloBackend(config)]
+    if config.kind == DetectorKind.MAGI:
+        return [MagiBackend(config)]
+
+    backends: list[PanelDetectorBackend] = []
+
+    magi_ready, _reason = _probe_magi_readiness(config)
+    if magi_ready:
+        if not config.allow_remote_code:
+            logger.warning(
+                "Skipping Magi backend in AUTO mode: GPU and cached weights are available, "
+                "but allow_remote_code=False. Pass --allow-remote-code to enable Magi."
+            )
+        else:
+            try:
+                backends.append(MagiBackend(config))
+            except (RuntimeError, FileNotFoundError, OSError, ImportError, ValueError) as exc:
+                logger.warning("Magi backend failed to initialize in AUTO mode; falling back: %s", exc)
+
+    try:
+        backends.append(OnnxYoloBackend(config))
+    except (RuntimeError, FileNotFoundError, OSError, ImportError, ValueError) as exc:
+        logger.debug("ONNX YOLO backend unavailable in AUTO mode; falling back: %s", exc)
+
+    backends.append(_build_contour_backend(config))
+    logger.info(
+        "Resolved AUTO panel detector chain (active=%s): %s",
+        backends[0].kind.value,
+        [backend.kind.value for backend in backends],
+    )
+    return backends
+
+
+def detect_with_fallback(
+    image_path: Path,
+    backends: Sequence[PanelDetectorBackend],
+    *,
+    disabled_backends: set[DetectorKind] | None = None,
+    lock: threading.Lock | None = None,
+) -> DetectionResult:
+    """Run candidate backends in order, disabling load-failed backends once and falling back on 0 panels."""
+    last_w = 0
+    last_h = 0
+
+    for backend in backends:
+        if disabled_backends is not None:
+            if lock is not None:
+                with lock:
+                    is_disabled = backend.kind in disabled_backends
+            else:
+                is_disabled = backend.kind in disabled_backends
+            if is_disabled:
+                continue
+
+        try:
+            result = backend.detect(image_path)
+        except (RuntimeError, FileNotFoundError, OSError, ImportError, ValueError) as exc:
+            if disabled_backends is not None:
+                if lock is not None:
+                    with lock:
+                        should_log = backend.kind not in disabled_backends
+                        disabled_backends.add(backend.kind)
+                else:
+                    should_log = backend.kind not in disabled_backends
+                    disabled_backends.add(backend.kind)
+                if should_log:
+                    logger.warning(
+                        "Backend '%s' failed during detection and is disabled for this session: %s",
+                        backend.kind.value,
+                        exc,
+                    )
+            continue
+
+        if result.page_width > 0 and result.page_height > 0:
+            last_w = result.page_width
+            last_h = result.page_height
+
+        if result.panels:
+            return result
+
+    if last_w <= 0 or last_h <= 0:
+        img = read_image_bgr(image_path)
+        last_h, last_w = img.shape[:2]
+
+    return DetectionResult(
+        panels=[PanelBox(x=0, y=0, w=last_w, h=last_h, ordinal=1)],
+        ordered=True,
+        backend=DetectorKind.CONTOUR,
+        page_width=last_w,
+        page_height=last_h,
+    )
+
+
+class BackendRegistry:
+    """Thread-safe session cache for resolved panel detection backends."""
+
+    def __init__(
+        self,
+        config: DetectorConfig | None = None,
+        *,
+        backends: Sequence[PanelDetectorBackend] | None = None,
+    ) -> None:
+        self.config = config or DetectorConfig()
+        self._lock = threading.Lock()
+        self._backends: list[PanelDetectorBackend] | None = (
+            list(backends) if backends is not None else None
+        )
+        self._disabled: set[DetectorKind] = set()
+
+    def resolve(self) -> list[PanelDetectorBackend]:
+        """Resolve and cache the backend chain once per registry instance."""
+        if self._backends is None:
+            with self._lock:
+                if self._backends is None:
+                    self._backends = resolve_auto_chain(self.config)
+        return self._backends
+
+    @property
+    def active_backend(self) -> PanelDetectorBackend | None:
+        """Return the highest-priority non-disabled backend, if any."""
+        backends = self.resolve()
+        with self._lock:
+            for backend in backends:
+                if backend.kind not in self._disabled:
+                    return backend
+        return None
+
+    def detect(self, image_path: Path) -> DetectionResult:
+        """Detect panels on a single page using the cached backend chain and fallback."""
+        return detect_with_fallback(
+            image_path,
+            self.resolve(),
+            disabled_backends=self._disabled,
+            lock=self._lock,
+        )
+
+    def detect_and_sort(
+        self,
+        image_path: Path,
+        sorter: PanelSorter,
+        *,
+        page_width: int = 0,
+        is_spread: bool = False,
+    ) -> list[PanelBox]:
+        """Detect panels and apply PanelSorter only when the backend did not already order them."""
+        result = self.detect(image_path)
+        if result.ordered:
+            return [
+                panel.model_copy(update={"ordinal": idx}) if panel.ordinal <= 0 else panel
+                for idx, panel in enumerate(result.panels, start=1)
+            ]
+        effective_width = page_width if page_width > 0 else result.page_width
+        return sorter.sort(
+            result.panels,
+            page_width=effective_width,
+            is_spread=is_spread,
+        )

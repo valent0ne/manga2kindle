@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manga2kindle"
-version = "0.2.1"
+version = "0.3.0"
 description = "Cross-platform headless CLI to convert CBZ/CBR manga into PDOC-tagged KFX with Guided View panels"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -23,6 +23,29 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+onnx = [
+    "onnxruntime>=1.17",
+    "platformdirs>=4.0",
+]
+magi = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "transformers>=4.40,<4.50",
+    "einops>=0.7",
+    "timm>=0.9",
+    "platformdirs>=4.0",
+    "huggingface_hub>=0.23",
+    "scipy>=1.11",
+    "pytorch-metric-learning>=2.0",
+    "shapely>=2.0",
+    "networkx>=3.0",
+    "matplotlib>=3.7",
+]
+benchmark = [
+    "datasets>=2.18,<4.0",
+    "mloader>=1.1",
+    "psutil>=5.9",
+]
 
 [project.scripts]
 manga2kindle = "manga2kindle.cli:app"
@@ -35,3 +58,16 @@ allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
