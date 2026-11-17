@@ -374,6 +374,7 @@ class ConversionPipeline:
         keep_temp: bool = False,
         workers: int = 4,
         kcc_path: Path | None = None,
+        registry: BackendRegistry | None = None,
     ) -> list[Path]:
         """Extract, preprocess, detect/sort panels, and render numbered PNG debug overlays."""
         resolved_profile = profile or DeviceProfile.from_name("KPW5")
@@ -412,7 +413,7 @@ class ConversionPipeline:
                 reg.resolve()
                 compare_registries[kind] = reg
         else:
-            active_registry = self._resolve_registry(config.detector)
+            active_registry = self._resolve_registry(config.detector, registry)
 
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_preview_"))
         try:
@@ -482,6 +483,7 @@ class ConversionPipeline:
             raise ValueError(f"No .cbz or .cbr archives found in {config.input_path}")
 
         out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
+        batch_registry = self._resolve_registry(config.detector)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
@@ -504,6 +506,7 @@ class ConversionPipeline:
                     keep_temp=config.keep_temp,
                     workers=per_book_workers,
                     kcc_path=config.kcc_path,
+                    registry=batch_registry,
                 )
                 return archive_path, preview_dir, None
             except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode

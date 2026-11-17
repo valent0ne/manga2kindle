@@ -153,7 +153,8 @@ class PanelPreviewRenderer:
             banner = np.full((BANNER_HEIGHT, tile_width, 3), BANNER_BG_BGR, dtype=np.uint8)
             cv2.rectangle(banner, (0, BANNER_HEIGHT - 4), (tile_width - 1, BANNER_HEIGHT - 1), box_color, -1)
 
-            label = f"{kind.value.upper()} ({len(panels)} panels)"
+            panel_word = "panel" if len(panels) == 1 else "panels"
+            label = f"{kind.value.upper()} ({len(panels)} {panel_word})"
             cv2.putText(
                 banner,
                 label,

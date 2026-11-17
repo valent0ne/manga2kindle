@@ -349,6 +349,39 @@ class TestPipelineBackendReuse:
         assert resolve_calls == 1
         assert len(stub_backend.calls) == 5
 
+    def test_preview_batch_reuses_single_backend_across_books(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        batch_dir = tmp_path / "batch_preview"
+        _make_cbz(batch_dir / "vol1.cbz", num_pages=3)
+        _make_cbz(batch_dir / "vol2.cbz", num_pages=2)
+
+        resolve_calls = 0
+        stub_backend = _StubBackend(DetectorKind.CONTOUR)
+
+        def fake_resolve(config: DetectorConfig):
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return [stub_backend]
+
+        monkeypatch.setattr("manga2kindle.cv.backends.resolve_auto_chain", fake_resolve)
+
+        cfg = ConversionConfig(
+            input_path=batch_dir,
+            output_path=tmp_path / "preview_out",
+            profile=DeviceProfile.from_name("KPW5"),
+            no_kcc=True,
+            workers=2,
+        )
+        pipeline = ConversionPipeline()
+        preview_dirs = pipeline.preview_batch(cfg)
+
+        assert len(preview_dirs) == 2
+        assert resolve_calls == 1
+        assert len(stub_backend.calls) == 5
+
 
 class TestModelsAndDoctorCli:
     """Verify `models list`, `models fetch`, and `doctor` optional diagnostics."""

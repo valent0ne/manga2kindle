@@ -14,6 +14,8 @@ from typer.testing import CliRunner
 from manga2kindle.cli import app
 from manga2kindle.cv.backends.base import DetectionResult
 from manga2kindle.cv.benchmark import (
+    DEFAULT_COMIX_DATASET_ID,
+    DEFAULT_POPMANGA_DATASET_ID,
     BenchmarkDatasetKind,
     BenchmarkMetrics,
     BenchmarkSample,
@@ -238,9 +240,42 @@ class TestLocalDatasetLoader:
         with pytest.raises(FileNotFoundError):
             load_local_dataset(tmp_path, tmp_path / "missing.json")
 
+    def test_coco_none_ordinals_do_not_crash(self, tmp_path: Path) -> None:
+        pages_dir = tmp_path / "pages"
+        pages_dir.mkdir()
+        Image.new("RGB", (800, 1200), (255, 255, 255)).save(pages_dir / "page_a.png", "PNG")
+
+        coco = {
+            "images": [{"id": 1, "file_name": "page_a.png", "width": 800, "height": 1200}],
+            "categories": [{"id": 1, "name": "panel"}],
+            "annotations": [
+                {"id": 10, "image_id": 1, "category_id": 1, "bbox": [50, 50, 300, 400], "ordinal": None},
+                {"id": 11, "image_id": 1, "category_id": 1, "bbox": [400, 50, 300, 400], "order": None, "reading_order": None},
+            ],
+        }
+        truth = tmp_path / "coco_none.json"
+        truth.write_text(json.dumps(coco), encoding="utf-8")
+
+        samples = load_local_dataset(pages_dir, truth)
+        assert len(samples) == 1
+        assert [p.ordinal for p in samples[0].ground_truth] == [1, 2]
+
+    def test_missing_file_name_and_image_raises_value_error(self, tmp_path: Path) -> None:
+        pages_dir = tmp_path / "pages"
+        pages_dir.mkdir()
+        truth = tmp_path / "missing_key.json"
+        truth.write_text(json.dumps([{"panels": [[10, 10, 100, 100]]}]), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="missing 'file_name' or 'image'"):
+            load_local_dataset(pages_dir, truth)
+
 
 class TestHfDatasetLoaders:
     """Tests for PopManga and CoMix loaders with mocked `datasets` library."""
+
+    def test_default_dataset_ids_match_spec(self) -> None:
+        assert DEFAULT_POPMANGA_DATASET_ID == "ragavsachdeva/popmanga_test"
+        assert DEFAULT_COMIX_DATASET_ID == "emanuelevivoli/comix-v0_1-pages"
 
     def test_load_popmanga_split_and_comix_split(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

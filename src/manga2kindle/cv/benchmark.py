@@ -19,8 +19,8 @@ from manga2kindle.models import DetectorKind, PanelBox, ReadingDirection
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_POPMANGA_DATASET_ID = "ragavsachdeva/popmanga"
-DEFAULT_COMIX_DATASET_ID = "manga109/comix"
+DEFAULT_POPMANGA_DATASET_ID = "ragavsachdeva/popmanga_test"
+DEFAULT_COMIX_DATASET_ID = "emanuelevivoli/comix-v0_1-pages"
 
 POPMANGA_LICENSE_NOTICE = (
     "PopManga benchmark dataset: subject to upstream academic/non-commercial "
@@ -325,6 +325,30 @@ def _resolve_page_image(pages_dir: Path, file_name: str) -> Path:
     raise FileNotFoundError(f"Benchmark page image not found: {candidate}")
 
 
+def _annotation_sort_key(ann: dict[str, Any]) -> tuple[int, int]:
+    """Return (ordinal, id) sort key for COCO annotations, handling explicit None values."""
+    raw_order = None
+    for key in ("ordinal", "order", "reading_order"):
+        val = ann.get(key)
+        if val is not None:
+            raw_order = val
+            break
+    order_val = int(raw_order) if raw_order is not None else 10**9
+    raw_id = ann.get("id")
+    id_val = int(raw_id) if raw_id is not None else 0
+    return (order_val, id_val)
+
+
+def _extract_entry_file_name(entry: Any, idx: int) -> str:
+    """Extract required image file_name/image from a local benchmark JSON entry."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"Expected dict entry at index {idx}, got {type(entry).__name__}")
+    raw_name = entry.get("file_name") or entry.get("image")
+    if not raw_name:
+        raise ValueError(f"Benchmark entry at index {idx} is missing 'file_name' or 'image'")
+    return str(raw_name)
+
+
 def _load_coco_samples(pages_dir: Path, payload: dict[str, Any]) -> list[BenchmarkSample]:
     panel_category_ids: set[int] | None = None
     categories = payload.get("categories")
@@ -357,12 +381,7 @@ def _load_coco_samples(pages_dir: Path, payload: dict[str, Any]) -> list[Benchma
         file_name = str(image_entry["file_name"])
         image_path = _resolve_page_image(pages_dir, file_name)
         raw_anns = anns_by_image.get(img_id, [])
-        raw_anns.sort(
-            key=lambda a: (
-                int(a.get("ordinal", a.get("order", a.get("reading_order", 10**9)))),
-                int(a.get("id", 0)),
-            )
-        )
+        raw_anns.sort(key=_annotation_sort_key)
         samples.append(
             BenchmarkSample(
                 page_id=str(img_id),
@@ -390,16 +409,10 @@ def load_local_dataset(
 
     if isinstance(payload, dict) and "images" in payload and "annotations" in payload:
         samples = _load_coco_samples(pages_dir, payload)
-    elif isinstance(payload, dict) and isinstance(payload.get("pages"), list):
-        for idx, entry in enumerate(payload["pages"]):
-            file_name = str(entry.get("file_name") or entry.get("image"))
-            page_id = str(entry.get("page_id", Path(file_name).stem or idx))
-            image_path = _resolve_page_image(pages_dir, file_name)
-            panels = _normalize_ground_truth(entry.get("panels", []))
-            samples.append(BenchmarkSample(page_id=page_id, image_path=image_path, ground_truth=panels))
-    elif isinstance(payload, list):
-        for idx, entry in enumerate(payload):
-            file_name = str(entry.get("file_name") or entry.get("image"))
+    elif (isinstance(payload, dict) and isinstance(payload.get("pages"), list)) or isinstance(payload, list):
+        entries = payload["pages"] if isinstance(payload, dict) else payload
+        for idx, entry in enumerate(entries):
+            file_name = _extract_entry_file_name(entry, idx)
             page_id = str(entry.get("page_id", Path(file_name).stem or idx))
             image_path = _resolve_page_image(pages_dir, file_name)
             panels = _normalize_ground_truth(entry.get("panels", []))

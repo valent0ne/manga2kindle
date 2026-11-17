@@ -197,3 +197,39 @@ def test_render_comparison_empty_results_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="at least one"):
         renderer.render_comparison(input_path, {}, tmp_path / "empty_cmp.png")
+
+
+def test_render_comparison_banner_pluralization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """render_comparison uses '1 panel' singular and '0 panels' / '2 panels' plural."""
+    import cv2
+
+    input_path = _create_white_canvas(tmp_path / "page_plural.png", width=600, height=800)
+    output_path = tmp_path / "comparison_plural.png"
+
+    labels: list[str] = []
+    real_put_text = cv2.putText
+
+    def spy_put_text(img, text, org, fontFace, fontScale, color, thickness=1, lineType=cv2.LINE_8):
+        labels.append(text)
+        return real_put_text(img, text, org, fontFace, fontScale, color, thickness, lineType)
+
+    monkeypatch.setattr("manga2kindle.cv.preview.cv2.putText", spy_put_text)
+
+    results = {
+        DetectorKind.CONTOUR: [PanelBox(x=40, y=40, w=520, h=720, ordinal=1)],
+        DetectorKind.ONNX_YOLO: [
+            PanelBox(x=40, y=40, w=250, h=720, ordinal=1),
+            PanelBox(x=310, y=40, w=250, h=720, ordinal=2),
+        ],
+        DetectorKind.MAGI: [],
+    }
+
+    renderer = PanelPreviewRenderer()
+    renderer.render_comparison(input_path, results, output_path)
+
+    assert "CONTOUR (1 panel)" in labels
+    assert "ONNX (2 panels)" in labels
+    assert "MAGI (0 panels)" in labels
