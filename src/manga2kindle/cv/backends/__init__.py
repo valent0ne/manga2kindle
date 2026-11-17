@@ -234,16 +234,14 @@ class BackendRegistry:
             lock=self._lock,
         )
 
-    def detect_and_sort(
-        self,
-        image_path: Path,
+    @staticmethod
+    def _sort_result(
+        result: DetectionResult,
         sorter: PanelSorter,
         *,
         page_width: int = 0,
         is_spread: bool = False,
     ) -> list[PanelBox]:
-        """Detect panels and apply PanelSorter only when the backend did not already order them."""
-        result = self.detect(image_path)
         if result.ordered:
             return [
                 panel.model_copy(update={"ordinal": idx}) if panel.ordinal <= 0 else panel
@@ -255,3 +253,92 @@ class BackendRegistry:
             page_width=effective_width,
             is_spread=is_spread,
         )
+
+    def detect_and_sort(
+        self,
+        image_path: Path,
+        sorter: PanelSorter,
+        *,
+        page_width: int = 0,
+        is_spread: bool = False,
+    ) -> list[PanelBox]:
+        """Detect panels and apply PanelSorter only when the backend did not already order them."""
+        result = self.detect(image_path)
+        return self._sort_result(
+            result,
+            sorter,
+            page_width=page_width,
+            is_spread=is_spread,
+        )
+
+    def detect_batch(self, image_paths: Sequence[Path]) -> list[DetectionResult]:
+        """Detect panels across a batch of pages, falling back per-session on error or per-page on empty."""
+        if not image_paths:
+            return []
+
+        backends = self.resolve()
+        active_backends: list[PanelDetectorBackend]
+        with self._lock:
+            active_backends = [b for b in backends if b.kind not in self._disabled]
+
+        for idx, backend in enumerate(active_backends):
+            try:
+                batch_results = list(backend.detect_batch(image_paths))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Backend %s failed during batch detection (%s); disabling for this session.",
+                    backend.kind.value,
+                    exc,
+                )
+                with self._lock:
+                    self._disabled.add(backend.kind)
+                continue
+
+            if len(batch_results) != len(image_paths):
+                logger.warning(
+                    "Backend %s returned %d results for %d pages; falling back per-page.",
+                    backend.kind.value,
+                    len(batch_results),
+                    len(image_paths),
+                )
+                return [self.detect(path) for path in image_paths]
+
+            remaining = active_backends[idx + 1 :]
+            resolved: list[DetectionResult] = []
+            for path, res in zip(image_paths, batch_results):
+                if res.panels:
+                    resolved.append(res)
+                else:
+                    resolved.append(
+                        detect_with_fallback(
+                            path,
+                            remaining,
+                            disabled_backends=self._disabled,
+                            lock=self._lock,
+                        )
+                    )
+            return resolved
+
+        return [self.detect(path) for path in image_paths]
+
+    def detect_batch_and_sort(
+        self,
+        image_paths: Sequence[Path],
+        sorter: PanelSorter,
+        *,
+        page_widths: Sequence[int] | None = None,
+        is_spreads: Sequence[bool] | None = None,
+    ) -> list[list[PanelBox]]:
+        """Detect and sort panels for a sequence of pages using batched backend inference."""
+        results = self.detect_batch(image_paths)
+        widths = page_widths if page_widths is not None else [0] * len(results)
+        spreads = is_spreads if is_spreads is not None else [False] * len(results)
+        return [
+            self._sort_result(
+                res,
+                sorter,
+                page_width=widths[idx] if idx < len(widths) else 0,
+                is_spread=spreads[idx] if idx < len(spreads) else False,
+            )
+            for idx, res in enumerate(results)
+        ]

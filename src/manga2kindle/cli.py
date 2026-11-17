@@ -117,6 +117,7 @@ def _build_detector_config(
     allow_remote_code: bool,
     padding: float,
     min_panel_area: float,
+    batch_size: int | None = None,
 ) -> DetectorConfig:
     """Build a DetectorConfig from shared CLI detector options."""
     model_path: Path | None = None
@@ -136,6 +137,7 @@ def _build_detector_config(
         allow_remote_code=allow_remote_code,
         padding=padding,
         min_panel_area=min_panel_area,
+        batch_size=batch_size,
     )
 
 
@@ -284,6 +286,23 @@ def convert(
         int,
         typer.Option("-w", "--workers", min=1, help="Parallel worker thread count."),
     ] = os.cpu_count() or 4,
+    batch_workers: Annotated[
+        int | None,
+        typer.Option(
+            "--batch-workers",
+            min=1,
+            help="Concurrent archives in batch mode (default: auto-detected from RAM/KCC).",
+        ),
+    ] = None,
+    gpu_batch_size: Annotated[
+        int | None,
+        typer.Option(
+            "--gpu-batch-size",
+            min=1,
+            max=64,
+            help="Pages per GPU batch for neural detectors (default: auto-detected from VRAM).",
+        ),
+    ] = None,
     calibre_path: Annotated[
         Path | None,
         typer.Option("--calibre-path", help="Explicit path to calibre-debug executable."),
@@ -345,6 +364,7 @@ def convert(
             allow_remote_code=allow_remote_code,
             padding=padding,
             min_panel_area=min_panel_area,
+            batch_size=gpu_batch_size,
         )
         config = ConversionConfig(
             input_path=input_path,
@@ -359,6 +379,7 @@ def convert(
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             workers=workers,
+            batch_workers=batch_workers,
             kcc_path=kcc_path,
             calibre_path=calibre_path,
             cover_size=resolved_cover_size,
@@ -530,6 +551,15 @@ def preview_panels(
         int,
         typer.Option("-w", "--workers", min=1, help="Parallel worker thread count."),
     ] = os.cpu_count() or 4,
+    gpu_batch_size: Annotated[
+        int | None,
+        typer.Option(
+            "--gpu-batch-size",
+            min=1,
+            max=64,
+            help="Pages per GPU batch for neural detectors (default: auto-detected from VRAM).",
+        ),
+    ] = None,
     compare: Annotated[
         str | None,
         typer.Option(
@@ -557,6 +587,7 @@ def preview_panels(
             allow_remote_code=allow_remote_code,
             padding=padding,
             min_panel_area=min_panel_area,
+            batch_size=gpu_batch_size,
         )
         rendered = pipeline.preview_panels(
             input_path=input_path,

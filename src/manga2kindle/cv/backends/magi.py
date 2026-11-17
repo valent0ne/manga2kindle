@@ -30,6 +30,32 @@ from manga2kindle.cv.models_hub import (
 from manga2kindle.models import DetectorConfig, DetectorKind, DevicePreference
 
 
+_BYTES_PER_GIB = 1024**3
+
+
+def resolve_magi_batch_size(device: str, torch_mod: Any, configured: int | None) -> int:
+    """Resolve Magi inference batch size from explicit config or available GPU VRAM."""
+    if configured is not None:
+        return max(1, configured)
+    if device == "cuda":
+        try:
+            cuda_mod = getattr(torch_mod, "cuda", None)
+            if cuda_mod is not None:
+                props = cuda_mod.get_device_properties(0)
+                total_gib = getattr(props, "total_memory", 0) / _BYTES_PER_GIB
+                if total_gib >= 12.0:
+                    return 8
+                if total_gib >= 8.0:
+                    return 4
+                return 2
+        except Exception:  # noqa: BLE001
+            return 2
+        return 2
+    if device == "mps":
+        return 2
+    return 1
+
+
 def _import_magi_deps() -> tuple[Any, Any]:
     """Import torch and transformers lazily so core installs do not require them."""
     try:
@@ -115,6 +141,7 @@ class MagiBackend:
         self._lock = threading.Lock()
         self._torch, transformers = _import_magi_deps()
         self._device = select_torch_device(config.device, self._torch)
+        self._batch_size = resolve_magi_batch_size(self._device, self._torch, config.batch_size)
 
         model_dir, spec = self._resolve_local_model_dir(config)
         auto_class_name = spec.auto_model_class if spec is not None else "AutoModelForCausalLM"
@@ -178,22 +205,22 @@ class MagiBackend:
 
     def detect(self, image_path: Path) -> DetectionResult:
         """Detect panels on a single page image while preserving Magi's native reading order."""
-        bgr_image = read_image_bgr(image_path)
-        orig_h, orig_w = bgr_image.shape[:2]
-        rgb_image = to_rgb_array(bgr_image)
+        return self.detect_batch([image_path])[0]
 
+    def _infer_chunk(self, rgb_images: list[np.ndarray]) -> list[Any]:
         with self._lock, self._torch.inference_mode(), warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*requires_grad=True.*")
             warnings.filterwarnings("ignore", message=".*use_reentrant=False.*")
             if self._processor is not None:
-                raw_results = self._model.predict_detections_and_associations(
-                    [rgb_image],
-                    self._processor,
+                return list(
+                    self._model.predict_detections_and_associations(
+                        rgb_images,
+                        self._processor,
+                    )
                 )
-            else:
-                raw_results = self._model.predict_detections_and_associations([rgb_image])
+            return list(self._model.predict_detections_and_associations(rgb_images))
 
-        page_result = raw_results[0] if raw_results else {}
+    def _parse_page_result(self, page_result: Any, orig_w: int, orig_h: int) -> DetectionResult:
         raw_panels = page_result.get("panels", []) if isinstance(page_result, dict) else []
 
         rects: list[Rect] = []
@@ -240,5 +267,34 @@ class MagiBackend:
         )
 
     def detect_batch(self, image_paths: Sequence[Path]) -> list[DetectionResult]:
-        """Detect panels across a sequence of page images, preserving page order."""
-        return [self.detect(path) for path in image_paths]
+        """Detect panels across a sequence of page images in VRAM-tuned GPU batches."""
+        if not image_paths:
+            return []
+
+        results: list[DetectionResult] = []
+        step = max(1, self._batch_size)
+        for start in range(0, len(image_paths), step):
+            chunk_paths = image_paths[start : start + step]
+            rgb_images: list[np.ndarray] = []
+            dims: list[tuple[int, int]] = []
+            for path in chunk_paths:
+                bgr_image = read_image_bgr(path)
+                orig_h, orig_w = bgr_image.shape[:2]
+                dims.append((orig_w, orig_h))
+                rgb_images.append(to_rgb_array(bgr_image))
+
+            try:
+                raw_chunk = self._infer_chunk(rgb_images)
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower() or len(rgb_images) == 1:
+                    raise
+                cuda_mod = getattr(self._torch, "cuda", None)
+                if cuda_mod is not None and hasattr(cuda_mod, "empty_cache"):
+                    cuda_mod.empty_cache()
+                raw_chunk = [self._infer_chunk([img])[0] for img in rgb_images]
+
+            for idx, (orig_w, orig_h) in enumerate(dims):
+                page_result = raw_chunk[idx] if idx < len(raw_chunk) else {}
+                results.append(self._parse_page_result(page_result, orig_w, orig_h))
+
+        return results

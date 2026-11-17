@@ -350,3 +350,18 @@ class TestMagiModelsHub:
         # Subsequent call without force=True skips snapshot_download
         fetch_magi_model("magiv3", cache_dir=tmp_path)
         assert len(calls) == 1
+
+    def test_resolve_magi_batch_size_by_vram_and_override(self) -> None:
+        from manga2kindle.cv.backends.magi import resolve_magi_batch_size
+
+        fake_cuda_16g = SimpleNamespace(
+            get_device_properties=lambda idx: SimpleNamespace(total_memory=16 * (1024**3))
+        )
+        fake_cuda_8g = SimpleNamespace(
+            get_device_properties=lambda idx: SimpleNamespace(total_memory=8 * (1024**3))
+        )
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), None) == 8
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_8g), None) == 4
+        assert resolve_magi_batch_size("mps", SimpleNamespace(), None) == 2
+        assert resolve_magi_batch_size("cpu", SimpleNamespace(), None) == 1
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), 12) == 12
