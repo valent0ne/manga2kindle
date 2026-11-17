@@ -27,6 +27,20 @@ onnx = [
     "onnxruntime>=1.17",
     "platformdirs>=4.0",
 ]
+magi = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "transformers>=4.40",
+    "einops>=0.7",
+    "timm>=0.9",
+    "platformdirs>=4.0",
+    "huggingface_hub>=0.23",
+    "scipy>=1.11",
+    "pytorch-metric-learning>=2.0",
+    "shapely>=2.0",
+    "networkx>=3.0",
+    "matplotlib>=3.7",
+]
 
 [project.scripts]
 manga2kindle = "manga2kindle.cli:app"

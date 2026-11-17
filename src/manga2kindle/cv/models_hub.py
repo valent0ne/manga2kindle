@@ -16,10 +16,22 @@ MANGA109_YOLO_REPO_ID = "deepghs/manga109_yolo"
 MANGA109_YOLO_REVISION = "6b5730a9f1f34581b87468f2c609e3269a9faccf"
 MANGA109_FRAME_CLASS_ID = 2  # labels.json: ["body", "face", "frame", "text"]
 
+DEFAULT_MAGI_MODEL_KEY = "magiv3"
+MAGIV3_REPO_ID = "ragavsachdeva/magiv3"
+MAGIV3_REVISION = "49c73a225122d53adbaa26d53868be81a57706e2"
+MAGIV2_REPO_ID = "ragavsachdeva/magiv2"
+MAGIV2_REVISION = "fbc890fec52977142e8ee00bfe26e9458b65517c"
+
 _MANGA109_LICENSE_NOTICE = (
     "Weights from deepghs/manga109_yolo (Hugging Face), trained on the "
     "Manga109-s dataset (hal-utokyo/Manga109-s). Subject to Manga109-s "
     "academic/non-commercial dataset terms and upstream model repository license."
+)
+
+_MAGI_LICENSE_NOTICE = (
+    "Weights from ragavsachdeva/magiv3 / magiv2 (Hugging Face). Subject to "
+    "non-commercial / personal / research / not-for-profit use only per the "
+    "upstream model card; commercial use requires a separate license from the authors."
 )
 
 
@@ -211,4 +223,129 @@ def resolve_model_spec(raw: str) -> tuple[Path | None, str | None]:
         return (candidate_path, None)
 
     canonical = _MODEL_ALIASES.get(value, value)
+    return (None, canonical)
+
+
+@dataclass(frozen=True)
+class MagiModelSpec:
+    """Pinned metadata and provenance for a Hugging Face Magi model repository."""
+
+    key: str
+    repo_id: str
+    revision: str
+    license_notice: str
+    auto_model_class: str = "AutoModelForCausalLM"
+    uses_processor: bool = True
+
+
+_MAGI_REGISTRY: dict[str, MagiModelSpec] = {
+    "magiv3": MagiModelSpec(
+        key="magiv3",
+        repo_id=MAGIV3_REPO_ID,
+        revision=MAGIV3_REVISION,
+        license_notice=_MAGI_LICENSE_NOTICE,
+        auto_model_class="AutoModelForCausalLM",
+        uses_processor=True,
+    ),
+    "magiv2": MagiModelSpec(
+        key="magiv2",
+        repo_id=MAGIV2_REPO_ID,
+        revision=MAGIV2_REVISION,
+        license_notice=_MAGI_LICENSE_NOTICE,
+        auto_model_class="AutoModel",
+        uses_processor=False,
+    ),
+}
+
+_MAGI_ALIASES: dict[str, str] = {
+    "magi": DEFAULT_MAGI_MODEL_KEY,
+    "magiv3": "magiv3",
+    MAGIV3_REPO_ID: "magiv3",
+    "magiv2": "magiv2",
+    MAGIV2_REPO_ID: "magiv2",
+}
+
+
+def list_registered_magi_models() -> list[MagiModelSpec]:
+    """Return all registered Magi model specifications."""
+    return list(_MAGI_REGISTRY.values())
+
+
+def get_magi_model_spec(model_key: str) -> MagiModelSpec:
+    """Look up a registered MagiModelSpec by key or known alias."""
+    normalized = model_key.strip()
+    canonical = _MAGI_ALIASES.get(normalized, normalized)
+    spec = _MAGI_REGISTRY.get(canonical)
+    if spec is None:
+        supported = ", ".join(_MAGI_REGISTRY.keys())
+        raise ValueError(f"Unknown Magi model '{model_key}'. Registered models: {supported}")
+    return spec
+
+
+def get_cached_magi_dir(
+    model_key: str = DEFAULT_MAGI_MODEL_KEY,
+    cache_dir: Path | None = None,
+) -> Path:
+    """Return the local cache directory Path for a registered Magi model."""
+    spec = get_magi_model_spec(model_key)
+    base_dir = cache_dir if cache_dir is not None else get_models_cache_dir()
+    return base_dir / spec.key
+
+
+def is_magi_cached(
+    model_key: str = DEFAULT_MAGI_MODEL_KEY,
+    cache_dir: Path | None = None,
+) -> bool:
+    """Return True if the registered Magi snapshot directory is present locally."""
+    target_dir = get_cached_magi_dir(model_key, cache_dir=cache_dir)
+    return target_dir.is_dir() and (target_dir / "config.json").is_file()
+
+
+def fetch_magi_model(
+    model_key: str = DEFAULT_MAGI_MODEL_KEY,
+    cache_dir: Path | None = None,
+    force: bool = False,
+) -> Path:
+    """Download a pinned Magi model snapshot via huggingface_hub into the local cache."""
+    spec = get_magi_model_spec(model_key)
+    target_dir = get_cached_magi_dir(spec.key, cache_dir=cache_dir)
+
+    if not force and is_magi_cached(spec.key, cache_dir=cache_dir):
+        return target_dir
+
+    try:
+        import huggingface_hub
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required to download Magi weights. "
+            "Install the Magi extra with: pip install manga2kindle[magi]"
+        ) from exc
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    huggingface_hub.snapshot_download(
+        repo_id=spec.repo_id,
+        revision=spec.revision,
+        local_dir=str(target_dir),
+        force_download=force,
+    )
+    return target_dir
+
+
+def resolve_magi_model_spec(raw: str) -> tuple[Path | None, str | None]:
+    """Classify a Magi model specifier as a local directory Path or registered model key."""
+    value = raw.strip()
+    if not value:
+        raise ValueError("Magi model specifier must not be empty")
+
+    is_windows_drive = len(value) >= 2 and value[1] == ":" and value[0].isalpha()
+    is_unc_or_relative = value.startswith(("/", "\\", "./", "../", ".\\", "..\\", "~"))
+
+    if is_windows_drive or is_unc_or_relative:
+        return (Path(value).expanduser(), None)
+
+    candidate_path = Path(value).expanduser()
+    if candidate_path.is_dir():
+        return (candidate_path, None)
+
+    canonical = _MAGI_ALIASES.get(value, value)
     return (None, canonical)
