@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import sys
 from pathlib import Path
@@ -14,7 +16,10 @@ from rich.console import Console
 from rich.table import Table
 
 from manga2kindle import __version__
+from manga2kindle.cv import benchmark as cv_benchmark
 from manga2kindle.cv import models_hub
+from manga2kindle.cv.backends import resolve_auto_chain
+from manga2kindle.cv.benchmark import BenchmarkDatasetKind, BenchmarkMetrics
 from manga2kindle.models import (
     DEFAULT_COVER_SIZE,
     ConversionConfig,
@@ -705,3 +710,226 @@ def models_fetch(
 
     console.print(f"[green]Cached model:[/green] {dest}")
     console.print(f"[dim]License notice: {notice}[/dim]")
+
+
+def _print_benchmark_notices(
+    dataset: BenchmarkDatasetKind,
+    backend_kinds: list[DetectorKind],
+    detector_model: str | None,
+) -> None:
+    """Display dataset and model license/attribution notices before loading."""
+    dataset_notice = cv_benchmark.get_dataset_license_notice(dataset)
+    if dataset_notice:
+        console.print(f"[dim]Dataset license notice: {dataset_notice}[/dim]")
+
+    for kind in backend_kinds:
+        if kind == DetectorKind.ONNX_YOLO:
+            try:
+                _, model_key = models_hub.resolve_model_spec(
+                    detector_model or models_hub.DEFAULT_ONNX_MODEL_KEY
+                )
+                if model_key is not None:
+                    spec = models_hub.get_model_spec(model_key)
+                    console.print(f"[dim]Model license ({spec.key}): {spec.license_notice}[/dim]")
+            except ValueError:
+                pass
+        elif kind == DetectorKind.MAGI:
+            try:
+                _, model_key = models_hub.resolve_magi_model_spec(
+                    detector_model or models_hub.DEFAULT_MAGI_MODEL_KEY
+                )
+                if model_key is not None:
+                    spec = models_hub.get_magi_model_spec(model_key)
+                    console.print(f"[dim]Model license ({spec.key}): {spec.license_notice}[/dim]")
+            except ValueError:
+                pass
+
+
+def _render_benchmark_table(results: list[BenchmarkMetrics], title: str) -> Table:
+    table = Table(title=title, expand=True)
+    table.add_column("Backend", style="bold", no_wrap=True)
+    table.add_column("Pages", justify="right")
+    table.add_column("P@50", justify="right")
+    table.add_column("R@50", justify="right")
+    table.add_column("P@75", justify="right")
+    table.add_column("R@75", justify="right")
+    table.add_column("mIoU", justify="right")
+    table.add_column("Dup%", justify="right")
+    table.add_column("Count%", justify="right")
+    table.add_column("PairAcc", justify="right")
+    table.add_column("Tau", justify="right")
+    table.add_column("ms/pg", justify="right")
+    table.add_column("RAM MB", justify="right")
+    table.add_column("VRAM MB", justify="right")
+
+    for row in results:
+        table.add_row(
+            row.backend.value,
+            str(row.pages_evaluated),
+            f"{row.precision_50:.3f}",
+            f"{row.recall_50:.3f}",
+            f"{row.precision_75:.3f}",
+            f"{row.recall_75:.3f}",
+            f"{row.mean_iou:.3f}",
+            f"{row.nested_duplicate_rate * 100:.1f}%",
+            f"{row.exact_count_match * 100:.1f}%",
+            f"{row.pairwise_order_acc:.3f}",
+            f"{row.kendall_tau:.3f}",
+            f"{row.ms_per_page:.1f}",
+            f"{row.peak_ram_mb:.1f}",
+            f"{row.peak_vram_mb:.1f}",
+        )
+    return table
+
+
+@app.command()
+def benchmark(
+    dataset: Annotated[
+        BenchmarkDatasetKind,
+        typer.Option(
+            "--dataset",
+            case_sensitive=False,
+            help="Benchmark dataset: popmanga, comix, or local.",
+        ),
+    ] = BenchmarkDatasetKind.POPMANGA,
+    split: Annotated[
+        str,
+        typer.Option("--split", help="Dataset split for popmanga or comix."),
+    ] = "test",
+    pages_dir: Annotated[
+        Path | None,
+        typer.Option("--pages-dir", help="Page images directory (required when --dataset local)."),
+    ] = None,
+    truth: Annotated[
+        Path | None,
+        typer.Option("--truth", help="Ground-truth JSON/COCO file (required when --dataset local)."),
+    ] = None,
+    cache_dir: Annotated[
+        Path | None,
+        typer.Option("--cache-dir", help="Optional local cache directory for HF datasets."),
+    ] = None,
+    backends: Annotated[
+        str,
+        typer.Option(
+            "--backends",
+            help="Comma-separated backends to evaluate (e.g. contour,onnx,magi).",
+        ),
+    ] = "contour",
+    direction: Annotated[
+        ReadingDirection | None,
+        typer.Option(
+            "-d",
+            "--direction",
+            case_sensitive=False,
+            help="Reading direction override (defaults to rtl for popmanga/local, ltr for comix).",
+        ),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="Maximum number of pages to evaluate."),
+    ] = None,
+    warmup: Annotated[
+        int,
+        typer.Option("--warmup", min=0, help="Warmup pages excluded from timing."),
+    ] = 1,
+    device: Annotated[
+        DevicePreference,
+        typer.Option(
+            "--device",
+            case_sensitive=False,
+            help="Inference device for neural detectors: auto, cpu, cuda, or mps.",
+        ),
+    ] = DevicePreference.AUTO,
+    score_threshold: Annotated[
+        float,
+        typer.Option(
+            "--score-threshold",
+            min=0.0,
+            max=1.0,
+            help="Confidence threshold for neural panel detectors.",
+        ),
+    ] = 0.25,
+    allow_remote_code: Annotated[
+        bool,
+        typer.Option(
+            "--allow-remote-code",
+            help="Allow executing remote model code (required to enable Magi).",
+        ),
+    ] = False,
+    detector_model: Annotated[
+        str | None,
+        typer.Option(
+            "--detector-model",
+            help="Detector model key, Hugging Face repo ID, or local weights path.",
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Optional path to write JSON benchmark report."),
+    ] = None,
+) -> None:
+    """Evaluate panel detection backends against PopManga, CoMix, or a local dataset."""
+    backend_kinds = _parse_compare_backends(backends) or [DetectorKind.CONTOUR]
+    if any(k == DetectorKind.AUTO for k in backend_kinds):
+        console.print("[red]Error:[/red] Specify concrete backends (contour, onnx, magi) instead of auto.")
+        raise typer.Exit(code=1)
+
+    effective_direction = direction or cv_benchmark.default_direction_for_dataset(dataset)
+    _print_benchmark_notices(dataset, backend_kinds, detector_model)
+
+    try:
+        if dataset == BenchmarkDatasetKind.LOCAL:
+            if pages_dir is None or truth is None:
+                raise ValueError("--pages-dir and --truth are required when --dataset local is used.")
+            samples = cv_benchmark.load_local_dataset(pages_dir, truth, limit=limit)
+        elif dataset == BenchmarkDatasetKind.POPMANGA:
+            samples = cv_benchmark.load_popmanga_split(split, cache_dir=cache_dir, limit=limit)
+        else:
+            samples = cv_benchmark.load_comix_split(split, cache_dir=cache_dir, limit=limit)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    results: list[BenchmarkMetrics] = []
+    for kind in backend_kinds:
+        try:
+            cfg = _build_detector_config(
+                detector=kind,
+                detector_model=detector_model,
+                device=device,
+                score_threshold=score_threshold,
+                allow_remote_code=allow_remote_code,
+                padding=0.02,
+                min_panel_area=0.03,
+            )
+            backend = resolve_auto_chain(cfg)[0]
+            metrics = cv_benchmark.run_benchmark(
+                samples,
+                backend,
+                direction=effective_direction,
+                warmup=warmup,
+            )
+            results.append(metrics)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Benchmark failed for '{kind.value}':[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+    table = _render_benchmark_table(
+        results,
+        title=f"Benchmark ({dataset.value}, dir={effective_direction.value}, pages={len(samples)})",
+    )
+    console.print(table)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "dataset": dataset.value,
+            "direction": effective_direction.value,
+            "pages_evaluated": len(samples),
+            "results": [
+                {**dataclasses.asdict(item), "backend": item.backend.value}
+                for item in results
+            ],
+        }
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        console.print(f"[green]Wrote benchmark report:[/green] {out}")

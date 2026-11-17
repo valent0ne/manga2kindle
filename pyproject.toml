@@ -41,6 +41,10 @@ magi = [
     "networkx>=3.0",
     "matplotlib>=3.7",
 ]
+benchmark = [
+    "datasets>=2.18",
+    "psutil>=5.9",
+]
 
 [project.scripts]
 manga2kindle = "manga2kindle.cli:app"
