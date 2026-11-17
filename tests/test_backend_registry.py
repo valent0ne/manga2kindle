@@ -437,3 +437,14 @@ class TestModelsAndDoctorCli:
         auto_status = next(s for s in statuses if s.name == "AUTO Detector")
         assert auto_status.found is True
         assert "contour" in auto_status.details
+
+    def test_resolve_batch_workers_avoids_kcc_and_magi_oversubscription(self) -> None:
+        assert ConversionPipeline._resolve_batch_workers(
+            16, 10, no_kcc=False, detector_kind=DetectorKind.CONTOUR
+        ) == (1, 16)
+        assert ConversionPipeline._resolve_batch_workers(
+            16, 10, no_kcc=True, detector_kind=DetectorKind.MAGI
+        ) == (1, 16)
+        assert ConversionPipeline._resolve_batch_workers(
+            4, 10, no_kcc=True, detector_kind=DetectorKind.CONTOUR
+        ) == (4, 1)
