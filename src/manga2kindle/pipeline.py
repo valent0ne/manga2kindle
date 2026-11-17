@@ -113,15 +113,35 @@ class ConversionPipeline:
         )
 
     @staticmethod
+    def _available_ram_gib() -> float | None:
+        try:
+            import psutil
+        except ImportError:
+            return None
+        return psutil.virtual_memory().available / (1024.0**3)
+
+    @classmethod
     def _resolve_batch_workers(
+        cls,
         workers: int,
         item_count: int,
         *,
         no_kcc: bool,
         detector_kind: DetectorKind,
+        batch_workers_override: int | None = None,
+        available_ram_gib: float | None = None,
     ) -> tuple[int, int]:
-        """Avoid spawning nested KCC process pools or competing GPU workers across books."""
-        if item_count <= 1 or not no_kcc or detector_kind == DetectorKind.MAGI:
+        """Resolve safe outer book concurrency (tunable or auto-detected from RAM/KCC/GPU)."""
+        if item_count <= 1:
+            return 1, max(1, workers)
+        if batch_workers_override is not None:
+            bw = min(max(1, batch_workers_override), item_count)
+            return bw, max(1, workers // bw)
+        if not no_kcc:
+            avail = available_ram_gib if available_ram_gib is not None else cls._available_ram_gib()
+            if workers >= 2 and (avail is None or avail >= 8.0):
+                bw = min(2, item_count)
+                return bw, max(1, workers // bw)
             return 1, max(1, workers)
         batch_workers = min(max(1, workers), item_count)
         per_book_workers = max(1, workers // batch_workers)
@@ -169,6 +189,21 @@ class ConversionPipeline:
         workers: int,
     ) -> list[PageAsset]:
         sorter = PanelSorter(direction=direction)
+        active = registry.active_backend
+        if active is not None and active.kind == DetectorKind.MAGI and len(pages) > 1:
+            paths = [page.processed_path or page.source_path for page in pages]
+            widths = [page.width for page in pages]
+            spreads = [page.is_spread for page in pages]
+            panel_lists = registry.detect_batch_and_sort(
+                paths,
+                sorter,
+                page_widths=widths,
+                is_spreads=spreads,
+            )
+            return [
+                page.model_copy(update={"panels": panels})
+                for page, panels in zip(pages, panel_lists)
+            ]
 
         def _process_page(page: PageAsset) -> PageAsset:
             img_path = page.processed_path or page.source_path
@@ -289,6 +324,7 @@ class ConversionPipeline:
             len(targets),
             no_kcc=config.no_kcc,
             detector_kind=config.detector.kind,
+            batch_workers_override=config.batch_workers,
         )
 
         def _convert_one(
@@ -511,6 +547,7 @@ class ConversionPipeline:
             len(archives),
             no_kcc=config.no_kcc,
             detector_kind=config.detector.kind,
+            batch_workers_override=config.batch_workers,
         )
 
         def _preview_one(archive_path: Path) -> tuple[Path, Path | None, Exception | None]:

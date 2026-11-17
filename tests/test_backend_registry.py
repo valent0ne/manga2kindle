@@ -438,13 +438,16 @@ class TestModelsAndDoctorCli:
         assert auto_status.found is True
         assert "contour" in auto_status.details
 
-    def test_resolve_batch_workers_avoids_kcc_and_magi_oversubscription(self) -> None:
+    def test_resolve_batch_workers_auto_and_tunable(self) -> None:
         assert ConversionPipeline._resolve_batch_workers(
-            16, 10, no_kcc=False, detector_kind=DetectorKind.CONTOUR
+            16, 10, no_kcc=False, detector_kind=DetectorKind.CONTOUR, available_ram_gib=16.0
+        ) == (2, 8)
+        assert ConversionPipeline._resolve_batch_workers(
+            16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, available_ram_gib=4.0
         ) == (1, 16)
         assert ConversionPipeline._resolve_batch_workers(
-            16, 10, no_kcc=True, detector_kind=DetectorKind.MAGI
-        ) == (1, 16)
+            16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, batch_workers_override=3
+        ) == (3, 5)
         assert ConversionPipeline._resolve_batch_workers(
             4, 10, no_kcc=True, detector_kind=DetectorKind.CONTOUR
         ) == (4, 1)

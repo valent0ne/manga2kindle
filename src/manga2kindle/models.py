@@ -129,6 +129,7 @@ class DetectorConfig(BaseModel):
     containment_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     padding: float = Field(default=0.02, ge=0.0, le=0.25)
     min_panel_area: float = Field(default=0.03, ge=0.01, le=0.50)
+    batch_size: int | None = Field(default=None, ge=1, le=64)
     allow_remote_code: bool = False
 
 
@@ -147,6 +148,7 @@ class ConversionConfig(BaseModel):
     no_kcc: bool = False
     keep_temp: bool = False
     workers: int = Field(default_factory=lambda: os.cpu_count() or 4, ge=1)
+    batch_workers: int | None = Field(default=None, ge=1)
     kcc_path: Path | None = None
     calibre_path: Path | None = None
     previewer_path: Path | None = None
