@@ -532,8 +532,9 @@ def _cuda_module_if_available() -> Any | None:
         import torch
     except ImportError:
         return None
-    if torch.cuda.is_available():
-        return torch.cuda
+    cuda_mod = getattr(torch, "cuda", None)
+    if cuda_mod is not None and cuda_mod.is_available():
+        return cuda_mod
     return None
 
 

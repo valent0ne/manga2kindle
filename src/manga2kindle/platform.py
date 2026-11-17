@@ -253,8 +253,10 @@ class PlatformDiscovery:
         try:
             import torch
 
-            cuda_ok = bool(torch.cuda.is_available())
-            mps_backend = getattr(torch.backends, "mps", None)
+            cuda_mod = getattr(torch, "cuda", None)
+            cuda_ok = bool(cuda_mod.is_available()) if cuda_mod is not None else False
+            backends_mod = getattr(torch, "backends", None)
+            mps_backend = getattr(backends_mod, "mps", None) if backends_mod is not None else None
             mps_ok = bool(mps_backend is not None and mps_backend.is_available())
             results.append(
                 ToolStatus(
