@@ -11,12 +11,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from manga2kindle.compiler.kfx import KfxCompilationError, KfxCompiler
-from manga2kindle.cv.detector import PanelDetector
+from manga2kindle.cv.backends import BackendRegistry
 from manga2kindle.cv.preview import PanelPreviewRenderer
 from manga2kindle.cv.sorter import PanelSorter
 from manga2kindle.extractor import ArchiveExtractor, natural_sort_key
 from manga2kindle.models import (
     ConversionConfig,
+    DetectorConfig,
     DeviceProfile,
     PageAsset,
     ReadingDirection,
@@ -40,12 +41,29 @@ class ConversionPipeline:
         extractor: ArchiveExtractor | None = None,
         preprocessor: ImagePreprocessor | None = None,
         builder: KpfBuilder | None = None,
+        backend_registry: BackendRegistry | None = None,
     ) -> None:
         self.discovery = discovery or PlatformDiscovery()
         self.extractor = extractor or ArchiveExtractor(discovery=self.discovery)
         self.preprocessor = preprocessor or ImagePreprocessor(discovery=self.discovery)
         self.builder = builder or KpfBuilder()
+        self._backend_registry = backend_registry
         self.last_batch_errors: list[tuple[Path, Exception]] = []
+
+    def _resolve_registry(
+        self,
+        detector_config: DetectorConfig,
+        registry: BackendRegistry | None = None,
+    ) -> BackendRegistry:
+        if registry is not None:
+            registry.resolve()
+            return registry
+        if self._backend_registry is not None:
+            self._backend_registry.resolve()
+            return self._backend_registry
+        created = BackendRegistry(detector_config)
+        created.resolve()
+        return created
 
     @staticmethod
     def _find_archives(directory: Path) -> list[Path]:
@@ -129,18 +147,17 @@ class ConversionPipeline:
     def _detect_and_sort_pages(
         pages: list[PageAsset],
         *,
-        min_panel_area: float,
-        padding: float,
+        registry: BackendRegistry,
         direction: ReadingDirection,
         workers: int,
     ) -> list[PageAsset]:
-        detector = PanelDetector(min_panel_area=min_panel_area, padding=padding)
         sorter = PanelSorter(direction=direction)
 
         def _process_page(page: PageAsset) -> PageAsset:
             img_path = page.processed_path or page.source_path
-            panels = sorter.sort(
-                detector.detect(img_path),
+            panels = registry.detect_and_sort(
+                img_path,
+                sorter,
                 page_width=page.width,
                 is_spread=page.is_spread,
             )
@@ -157,6 +174,7 @@ class ConversionPipeline:
         *,
         title: str | None = None,
         author: str | None = None,
+        registry: BackendRegistry | None = None,
     ) -> Path:
         """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
         calibre_path = self.discovery.find_calibre(override=config.calibre_path)
@@ -166,6 +184,7 @@ class ConversionPipeline:
                 "or pass --calibre-path."
             )
 
+        active_registry = self._resolve_registry(config.detector, registry)
         input_name = self.resolve_input_name(config.input_path)
         output_kfx = self.resolve_single_output(config.input_path, config.output_path)
         book_title = (title or "").strip() or input_name
@@ -176,8 +195,7 @@ class ConversionPipeline:
             processed = self.preprocessor.process(pages, work_dir, config)
             annotated = self._detect_and_sort_pages(
                 processed,
-                min_panel_area=config.min_panel_area,
-                padding=config.padding,
+                registry=active_registry,
                 direction=config.direction,
                 workers=config.workers,
             )
@@ -245,6 +263,7 @@ class ConversionPipeline:
                 "or pass --calibre-path."
             )
 
+        batch_registry = self._resolve_registry(config.detector)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
@@ -267,6 +286,7 @@ class ConversionPipeline:
                     book_config,
                     title=archive_path.stem,
                     author=author,
+                    registry=batch_registry,
                 )
                 return archive_path, out_kfx, None
             except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
@@ -326,6 +346,7 @@ class ConversionPipeline:
         spread_mode: SpreadMode = SpreadMode.SPLIT,
         padding: float = 0.02,
         min_panel_area: float = 0.03,
+        detector: DetectorConfig | None = None,
         no_kcc: bool = False,
         keep_temp: bool = False,
         workers: int = 4,
@@ -335,6 +356,7 @@ class ConversionPipeline:
         resolved_profile = profile or DeviceProfile.from_name("KPW5")
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        detector_cfg = detector or DetectorConfig(padding=padding, min_panel_area=min_panel_area)
         config = ConversionConfig(
             input_path=input_path,
             output_path=output_dir,
@@ -343,20 +365,21 @@ class ConversionPipeline:
             spread_mode=spread_mode,
             padding=padding,
             min_panel_area=min_panel_area,
+            detector=detector_cfg,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             workers=workers,
             kcc_path=kcc_path,
         )
 
+        active_registry = self._resolve_registry(config.detector)
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_preview_"))
         try:
             pages = self.extractor.extract(input_path, work_dir)
             processed = self.preprocessor.process(pages, work_dir, config)
             annotated = self._detect_and_sort_pages(
                 processed,
-                min_panel_area=min_panel_area,
-                padding=padding,
+                registry=active_registry,
                 direction=direction,
                 workers=workers,
             )
