@@ -859,6 +859,57 @@ class TestConvertCliMocked:
         assert all_skipped.exit_code == 0, all_skipped.output
         assert "0/2 succeeded, 2 skipped, 0 failed." in all_skipped.output
 
+    def test_pipeline_run_skip_existing_invokes_on_skip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+        pipeline = ConversionPipeline()
+
+        cbz_path = _make_cbz(tmp_path / "single_skip.cbz", num_pages=1)
+        out_kfx = tmp_path / "single_skip.kfx"
+        out_kfx.write_bytes(b"EXISTING")
+
+        skipped_calls: list[tuple[Path, Path]] = []
+        single_cfg = ConversionConfig(
+            input_path=cbz_path,
+            output_path=out_kfx,
+            profile=DeviceProfile.from_name("KPW5"),
+            no_kcc=True,
+            skip_existing=True,
+        )
+        assert (
+            pipeline.run(
+                single_cfg,
+                on_skip=lambda src, dst: skipped_calls.append((src, dst)),
+            )
+            == []
+        )
+        assert skipped_calls == [(cbz_path, out_kfx)]
+
+        batch_dir = tmp_path / "batch_api_skip"
+        batch_dir.mkdir()
+        c1 = _make_cbz(batch_dir / "c1.cbz", num_pages=1)
+        _make_cbz(batch_dir / "c2.cbz", num_pages=1)
+        batch_out = tmp_path / "batch_api_skip_out"
+        batch_out.mkdir()
+        c1_kfx = batch_out / "c1.kfx"
+        c1_kfx.write_bytes(b"EXISTING_C1")
+
+        batch_skipped: list[tuple[Path, Path]] = []
+        batch_cfg = ConversionConfig(
+            input_path=batch_dir,
+            output_path=batch_out,
+            profile=DeviceProfile.from_name("KPW5"),
+            no_kcc=True,
+            skip_existing=True,
+        )
+        converted = pipeline.run(
+            batch_cfg,
+            on_skip=lambda src, dst: batch_skipped.append((src, dst)),
+        )
+        assert converted == [batch_out / "c2.kfx"]
+        assert batch_skipped == [(c1, c1_kfx)]
+
 
 class TestConvertCliIntegration:
     """Live E2E test with real calibre-debug + KFX Output when installed."""
