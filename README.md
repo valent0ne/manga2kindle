@@ -174,10 +174,14 @@ uv run manga2kindle convert -i "Chapter 01.cbz" --preview-only
 Evaluate detection accuracy (`P@50`, `R@50`, `P@75`, `R@75`, `mIoU`, nested duplicate rate, exact count match), reading-order metrics (`PairAcc`, `Kendall's tau`), latency (`ms/pg`), and memory (`RAM`/`VRAM`) against **PopManga** (defaults to `rtl`), **CoMix** (defaults to `ltr`), or a local JSON/COCO dataset:
 
 ```bash
-# PopManga (requires [benchmark] extra)
-uv run manga2kindle benchmark --dataset popmanga --limit 50 --backends contour,onnx --out report.json
+# One-command mechanical runner (syncs extras, fetches models, runs benchmark)
+uv run python utils/run_benchmark.py --out benchmark.json
 
-# CoMix (defaults --direction to ltr)
+# Or invoke the CLI directly:
+# PopManga (gated HF dataset: accept terms on Hugging Face & set HF_TOKEN; uses --split unseen)
+uv run manga2kindle benchmark --dataset popmanga --split unseen --limit 50 --backends contour,onnx,magi --allow-remote-code --out report.json
+
+# CoMix (defaults --direction to ltr; gated HF dataset)
 uv run manga2kindle benchmark --dataset comix --limit 50 --backends contour,onnx
 
 # Local custom JSON or COCO JSON dataset
