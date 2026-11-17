@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -121,23 +122,27 @@ class MagiBackend:
 
         torch_dtype = self._torch.float16 if self._device in ("cuda", "mps") else self._torch.float32
         model_cls = getattr(transformers, auto_class_name)
-        model = model_cls.from_pretrained(
-            str(model_dir),
-            trust_remote_code=True,
-            local_files_only=True,
-            torch_dtype=torch_dtype,
-            attn_implementation="eager",
-        )
-        self._model = model.to(self._device).eval()
-
-        if uses_processor:
-            self._processor: Any = transformers.AutoProcessor.from_pretrained(
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
+            warnings.filterwarnings("ignore", message=".*does not directly inherit from.*GenerationMixin.*")
+            warnings.filterwarnings("ignore", message=".*use_reentrant=False.*")
+            model = model_cls.from_pretrained(
                 str(model_dir),
                 trust_remote_code=True,
                 local_files_only=True,
+                torch_dtype=torch_dtype,
+                attn_implementation="eager",
             )
-        else:
-            self._processor = None
+            self._model = model.to(self._device).eval()
+
+            if uses_processor:
+                self._processor: Any = transformers.AutoProcessor.from_pretrained(
+                    str(model_dir),
+                    trust_remote_code=True,
+                    local_files_only=True,
+                )
+            else:
+                self._processor = None
 
     @staticmethod
     def _resolve_local_model_dir(config: DetectorConfig) -> tuple[Path, MagiModelSpec | None]:
