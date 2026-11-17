@@ -222,31 +222,18 @@ class ConversionPipeline:
                 return list(executor.map(_process_page, pages))
         return [_process_page(page) for page in pages]
 
-    def run_single(
+    def _convert_single(
         self,
         config: ConversionConfig,
         *,
+        input_name: str,
+        output_kfx: Path,
+        calibre_path: Path,
+        registry: BackendRegistry,
         title: str | None = None,
         author: str | None = None,
-        registry: BackendRegistry | None = None,
     ) -> Path:
-        """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
-        self.last_single_skipped = False
-        input_name = self.resolve_input_name(config.input_path)
-        output_kfx = self.resolve_single_output(config.input_path, config.output_path)
-        if config.skip_existing and output_kfx.exists():
-            logger.info("Skipping existing output: %s", output_kfx)
-            self.last_single_skipped = True
-            return output_kfx
-
-        calibre_path = self.discovery.find_calibre(override=config.calibre_path)
-        if calibre_path is None:
-            raise KfxCompilationError(
-                "calibre-debug not found. Install Calibre with the KFX Output plugin "
-                "or pass --calibre-path."
-            )
-
-        active_registry = self._resolve_registry(config.detector, registry)
+        """Execute extraction, preprocessing, detection, KPF packaging, and KFX compilation."""
         book_title = (title or "").strip() or input_name
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_"))
 
@@ -255,7 +242,7 @@ class ConversionPipeline:
             processed = self.preprocessor.process(pages, work_dir, config)
             annotated = self._detect_and_sort_pages(
                 processed,
-                registry=active_registry,
+                registry=registry,
                 direction=config.direction,
                 workers=config.workers,
             )
@@ -289,6 +276,41 @@ class ConversionPipeline:
             if not config.keep_temp:
                 shutil.rmtree(work_dir, ignore_errors=True)
 
+    def run_single(
+        self,
+        config: ConversionConfig,
+        *,
+        title: str | None = None,
+        author: str | None = None,
+        registry: BackendRegistry | None = None,
+    ) -> Path:
+        """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
+        self.last_single_skipped = False
+        input_name = self.resolve_input_name(config.input_path)
+        output_kfx = self.resolve_single_output(config.input_path, config.output_path)
+        if config.skip_existing and output_kfx.is_file():
+            logger.info("Skipping existing output: %s", output_kfx)
+            self.last_single_skipped = True
+            return output_kfx
+
+        calibre_path = self.discovery.find_calibre(override=config.calibre_path)
+        if calibre_path is None:
+            raise KfxCompilationError(
+                "calibre-debug not found. Install Calibre with the KFX Output plugin "
+                "or pass --calibre-path."
+            )
+
+        active_registry = self._resolve_registry(config.detector, registry)
+        return self._convert_single(
+            config,
+            input_name=input_name,
+            output_kfx=output_kfx,
+            calibre_path=calibre_path,
+            registry=active_registry,
+            title=title,
+            author=author,
+        )
+
     def run_batch(
         self,
         config: ConversionConfig,
@@ -321,7 +343,7 @@ class ConversionPipeline:
         self.last_batch_skipped = []
         pending_targets: list[tuple[Path, Path]] = []
         for archive_path, out_kfx in targets:
-            if config.skip_existing and out_kfx.exists():
+            if config.skip_existing and out_kfx.is_file():
                 logger.info("Skipping existing output: %s", out_kfx)
                 self.last_batch_skipped.append(out_kfx)
                 if on_skip is not None:
@@ -362,11 +384,14 @@ class ConversionPipeline:
                 }
             )
             try:
-                out_kfx = self.run_single(
+                out_kfx = self._convert_single(
                     book_config,
+                    input_name=archive_path.stem,
+                    output_kfx=target_kfx,
+                    calibre_path=calibre_path,
+                    registry=batch_registry,
                     title=archive_path.stem,
                     author=author,
-                    registry=batch_registry,
                 )
                 return archive_path, out_kfx, None
             except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
@@ -405,6 +430,7 @@ class ConversionPipeline:
         author: str | None = None,
         on_success: Callable[[Path, Path], None] | None = None,
         on_error: Callable[[Path, Exception], None] | None = None,
+        on_skip: Callable[[Path, Path], None] | None = None,
     ) -> list[Path]:
         """Auto-disambiguate single vs batch input and execute conversion."""
         if self.is_batch_input(config.input_path):
@@ -413,8 +439,14 @@ class ConversionPipeline:
                 author=author,
                 on_success=on_success,
                 on_error=on_error,
+                on_skip=on_skip,
             )
-        return [self.run_single(config, title=title, author=author)]
+        out_kfx = self.run_single(config, title=title, author=author)
+        if self.last_single_skipped:
+            if on_skip is not None:
+                on_skip(config.input_path, out_kfx)
+            return []
+        return [out_kfx]
 
     @staticmethod
     def validate_compare_backends(
