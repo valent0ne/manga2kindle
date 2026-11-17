@@ -137,7 +137,7 @@ def test_platform_discovery_override_takes_precedence(tmp_path):
     assert disc.find_kcc(override=custom) == custom
 
 
-def test_platform_discovery_kcc_and_previewer_windows(tmp_path, monkeypatch):
+def test_platform_discovery_kcc_windows(tmp_path, monkeypatch):
     bin_dir = tmp_path / "venv"
     bin_dir.mkdir(parents=True)
     fake_kcc = bin_dir / "kcc-c2e.exe"
@@ -145,17 +145,8 @@ def test_platform_discovery_kcc_and_previewer_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "executable", str(bin_dir / "python.exe"))
     monkeypatch.setattr("shutil.which", lambda _: None)
 
-    local_app = tmp_path / "LocalAppData"
-    fake_kp4 = local_app / "Amazon" / "Kindle Previewer 4" / "lib" / "fc" / "bin" / "KindlePreviewer4CLI.exe"
-    fake_kp4.parent.mkdir(parents=True)
-    fake_kp4.write_text("stub")
-    monkeypatch.setenv("LOCALAPPDATA", str(local_app))
-    monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
-    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "pfx86"))
-
     disc = PlatformDiscovery(system="win32")
     assert disc.find_kcc() == fake_kcc
-    assert disc.find_previewer4() == fake_kp4
 
 
 def test_platform_discovery_unrar_which(tmp_path, monkeypatch):
@@ -172,20 +163,21 @@ def test_platform_discovery_unrar_which(tmp_path, monkeypatch):
 def test_platform_discovery_run_doctor(tmp_path, monkeypatch):
     kcc = tmp_path / "kcc-c2e"
     calibre = tmp_path / "calibre-debug"
-    kp4 = tmp_path / "KindlePreviewer4CLI"
     unrar = tmp_path / "unrar"
-    for p in (kcc, calibre, kp4, unrar):
+    for p in (kcc, calibre, unrar):
         p.write_text("stub")
 
     disc = PlatformDiscovery(system="darwin")
     monkeypatch.setattr(disc, "find_kcc", lambda override=None: kcc)
     monkeypatch.setattr(disc, "find_calibre", lambda override=None: calibre)
-    monkeypatch.setattr(disc, "find_previewer4", lambda override=None: kp4)
     monkeypatch.setattr(disc, "find_unrar", lambda: unrar)
 
     recorded_cmds: list[list[str]] = []
+    real_run = subprocess.run
 
     def fake_run(cmd, **kwargs):
+        if isinstance(cmd, str):
+            return real_run(cmd, **kwargs)
         recorded_cmds.append(cmd)
         assert kwargs.get("encoding") == "utf-8"
         assert kwargs.get("errors") == "replace"
@@ -205,7 +197,6 @@ def test_platform_discovery_run_doctor(tmp_path, monkeypatch):
     assert any(cmd[0] == str(kcc) and cmd[1] == "--help" for cmd in recorded_cmds)
     assert by_name["calibre-debug"].found is True
     assert by_name["KFX Output"].found is True
-    assert by_name["Kindle Previewer 4"].found is True
     assert by_name["unrar/unar/7z"].found is True
 
 
@@ -224,7 +215,6 @@ def test_platform_discovery_run_doctor_missing_tools(monkeypatch):
     disc = PlatformDiscovery(system="darwin")
     monkeypatch.setattr(disc, "find_kcc", lambda override=None: None)
     monkeypatch.setattr(disc, "find_calibre", lambda override=None: None)
-    monkeypatch.setattr(disc, "find_previewer4", lambda override=None: None)
     monkeypatch.setattr(disc, "find_unrar", lambda: None)
 
     statuses = disc.run_doctor()
@@ -233,6 +223,5 @@ def test_platform_discovery_run_doctor_missing_tools(monkeypatch):
     assert by_name["calibre-debug"].found is False
     assert by_name["KFX Output"].found is False
     assert by_name["KFX Output"].details == "calibre-debug not found"
-    assert by_name["Kindle Previewer 4"].found is False
     assert by_name["unrar/unar/7z"].found is False
 

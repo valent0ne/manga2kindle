@@ -77,11 +77,6 @@ def _all_tools_status() -> list[ToolStatus]:
             path=Path("/usr/bin/calibre-debug"),
             version="KFX Output 2.19.0",
         ),
-        ToolStatus(
-            name="Kindle Previewer 4",
-            found=True,
-            path=Path("/usr/bin/KindlePreviewer4CLI"),
-        ),
         ToolStatus(name="unrar/unar/7z", found=True, path=Path("/usr/bin/unrar")),
     ]
 
@@ -103,7 +98,6 @@ class TestDoctorCli:
             "kcc-c2e",
             "calibre-debug",
             "KFX Output",
-            "Kindle Previewer 4",
             "unrar/unar/7z",
         ):
             assert expected in result.output
@@ -129,8 +123,7 @@ class TestDoctorCli:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         statuses = _all_tools_status()
-        statuses[3] = ToolStatus(name="Kindle Previewer 4", found=False, details="Not found")
-        statuses[4] = ToolStatus(name="unrar/unar/7z", found=False, details="Not found")
+        statuses[3] = ToolStatus(name="unrar/unar/7z", found=False, details="Not found")
         monkeypatch.setattr(PlatformDiscovery, "run_doctor", lambda self, **_: statuses)
 
         result = runner.invoke(app, ["doctor"])
@@ -785,6 +778,86 @@ class TestConvertCliMocked:
         assert len(list((out_dir / "ch_01_preview").glob("*.png"))) == 1
         assert len(list((out_dir / "ch_02_preview").glob("*.png"))) == 2
         assert list(tmp_path.rglob("*.kfx")) == []
+
+    def test_convert_skip_existing_single_avoids_detector_and_calibre(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "vol_01.cbz", num_pages=1)
+        out_kfx = tmp_path / "vol_01.kfx"
+        out_kfx.write_bytes(b"EXISTING_KFX")
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("Should not be called when output is skipped")
+
+        monkeypatch.setattr(PlatformDiscovery, "find_calibre", fail_if_called)
+        monkeypatch.setattr(ConversionPipeline, "_resolve_registry", fail_if_called)
+
+        result = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "--no-kcc", "--skip-existing"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Skipped (already exists):" in result.output
+        assert out_kfx.read_bytes() == b"EXISTING_KFX"
+
+    def test_convert_skip_existing_batch_mixed_and_all_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        batch_dir = tmp_path / "batch_skip"
+        batch_dir.mkdir()
+        _make_cbz(batch_dir / "ch_01.cbz", num_pages=1)
+        _make_cbz(batch_dir / "ch_02.cbz", num_pages=1)
+        out_dir = tmp_path / "batch_skip_out"
+        out_dir.mkdir()
+        existing_kfx = out_dir / "ch_01.kfx"
+        existing_kfx.write_bytes(b"EXISTING_CH_01")
+
+        self._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+
+        result = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(batch_dir),
+                "-o",
+                str(out_dir),
+                "--no-kcc",
+                "--skip-existing",
+                "-w",
+                "2",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert existing_kfx.read_bytes() == b"EXISTING_CH_01"
+        assert (out_dir / "ch_02.kfx").is_file()
+        assert "Skipped (already exists):" in result.output
+        assert "1/2 succeeded, 1 skipped, 0 failed." in result.output
+
+        # Re-running when all outputs exist should not initialize detector or calibre
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("Should not be called when all outputs are skipped")
+
+        monkeypatch.setattr(PlatformDiscovery, "find_calibre", fail_if_called)
+        monkeypatch.setattr(ConversionPipeline, "_resolve_registry", fail_if_called)
+
+        all_skipped = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(batch_dir),
+                "-o",
+                str(out_dir),
+                "--no-kcc",
+                "--skip-existing",
+            ],
+        )
+
+        assert all_skipped.exit_code == 0, all_skipped.output
+        assert "0/2 succeeded, 2 skipped, 0 failed." in all_skipped.output
 
 
 class TestConvertCliIntegration:

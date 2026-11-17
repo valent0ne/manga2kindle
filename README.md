@@ -4,7 +4,7 @@ Cross-platform headless CLI for converting `.cbz`, `.cbr`, and image folders int
 
 ## Features
 
-- **Native `.kfx` with `PDOC` tagging:** Compiles fixed-layout `.kpf` packages directly via Calibre's `KFX Output` plugin (`-d` / `PDOC`) so USB-sideloaded manga displays cover thumbnails properly on modern Kindles (including Kindle Paperwhite 12th Gen).
+- **Native `.kfx` with `PDOC` tagging:** Builds fixed-layout `.kpf` packages directly in Python (`KpfBuilder`—SQLite KDF + Amazon Ion 1.0 fragments) and compiles them to `PDOC`-tagged `.kfx` via Calibre's `KFX Output` plugin (`-d`) so USB-sideloaded manga displays cover thumbnails properly on modern Kindles (including Kindle Paperwhite 12th Gen).
 - **Guided View Panel Detection (3-Layer Architecture):** Embeds native Kindle magnification targets using pluggable detection backends with automatic fallback:
   - **Layer 1 (`contour`):** Built-in OpenCV morphological contour extraction, containment pruning, IoU NMS, and recursive XY-cut spatial reading-order sorting (RTL manga, LTR comics, and 4-koma vertical strips).
   - **Layer 2 (`onnx`, optional `[onnx]` extra):** ONNX Runtime YOLO panel detector (`manga109-yolo-s` / `manga109-yolo-n`) with SHA-256-verified weight caching.
@@ -19,8 +19,7 @@ Cross-platform headless CLI for converting `.cbz`, `.cbr`, and image folders int
 
 1. **Python 3.11+** and **[uv](https://docs.astral.sh/uv/)**
 2. **Calibre** + the **KFX Output** plugin *(required)*
-3. **Kindle Previewer 4** *(optional, checked by `doctor`)*
-4. **UnRAR / `unar` / 7-Zip** *(optional, required only for `.cbr` archives)*
+3. **UnRAR / `unar` / 7-Zip** *(optional, required only for `.cbr` archives)*
 
 ### Installing System Dependencies
 
@@ -28,7 +27,6 @@ Cross-platform headless CLI for converting `.cbz`, `.cbr`, and image folders int
 
 ```bash
 brew install --cask calibre
-brew install --cask kindle-previewer   # optional
 brew install unar                     # optional, for .cbr support
 ```
 
@@ -37,7 +35,6 @@ brew install unar                     # optional, for .cbr support
 ```powershell
 # Using winget
 winget install calibre.calibre
-winget install Amazon.KindlePreviewer4   # optional
 winget install 7zip.7zip                 # optional, for .cbr support
 
 # Or using Chocolatey
@@ -90,8 +87,7 @@ Optional binary overrides:
 ```bash
 uv run manga2kindle doctor \
   --calibre-path "/Applications/calibre.app/Contents/MacOS/calibre-debug" \
-  --kcc-path "/path/to/kcc-c2e" \
-  --previewer-path "/Applications/Kindle Previewer 4.app/Contents/MacOS/KindlePreviewer4CLI"
+  --kcc-path "/path/to/kcc-c2e"
 ```
 
 ### 2. Preview Detected Panels (`preview-panels`)
@@ -208,13 +204,14 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `--score-threshold` | `0.25` | Confidence threshold for neural panel detectors (`0.0`–`1.0`) |
 | `--allow-remote-code` | `false` | Allow executing remote model code (required to enable `magi`) |
 | `--preview-only` | `false` | Render panel preview PNGs and exit without compiling `.kpf`/`.kfx` |
+| `--skip-existing` | `false` | Skip conversion if the output `.kfx` file already exists |
 | `--no-kcc` | `false` | Use pure-Pillow E-Ink preprocessing instead of `kcc-c2e` |
 | `--keep-temp` | `false` | Keep temporary staging and intermediate `.kpf` directories |
 | `-w, --workers` | CPU count | Parallel worker threads |
 | `--batch-workers` | `auto` | Concurrent archives in batch mode (`auto` from RAM/KCC) |
 | `--gpu-batch-size` | `auto` | Pages per GPU batch for neural detectors (`auto` from VRAM) |
 | `--title` / `--author` | archive/folder name / `None` | Override KFX book title (single book) and author metadata |
-| `--kcc-path` / `--calibre-path` | auto-discovered | Explicit executable path overrides (`doctor` also accepts `--previewer-path`) |
+| `--kcc-path` / `--calibre-path` | auto-discovered | Explicit executable path overrides |
 
 ## Kindle USB Sideloading (`PDOC`)
 
@@ -233,3 +230,14 @@ Optional neural weights and benchmark datasets are not bundled with `manga2kindl
 - **`manga109-yolo-s` / `manga109-yolo-n` (`deepghs/manga109_yolo`):** Trained on the **Manga109-s** dataset (`hal-utokyo/Manga109-s`); subject to Manga109-s academic/non-commercial dataset terms and the upstream model repository license.
 - **`magiv3` / `magiv2` (`ragavsachdeva/magiv3`, `ragavsachdeva/magiv2`):** Subject to non-commercial / personal / research / not-for-profit use only per the upstream model card; commercial use requires a separate license from the authors.
 - **PopManga & CoMix Benchmark Datasets:** Subject to their upstream academic/non-commercial research terms and attribution requirements.
+
+## Legal Notice
+
+`manga2kindle` is an independent, open-source conversion utility. It does not distribute, host, or provide access to copyrighted manga or other copyrighted content.
+
+Users are responsible for ensuring they have the necessary rights and permissions to process the files they provide.
+
+The project does not implement DRM removal, decryption, or circumvention of technological protection measures.
+
+`manga2kindle` is not affiliated with, endorsed by, or sponsored by Amazon.
+

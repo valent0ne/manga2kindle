@@ -147,11 +147,11 @@ class ConversionConfig(BaseModel):
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     no_kcc: bool = False
     keep_temp: bool = False
+    skip_existing: bool = False
     workers: int = Field(default_factory=lambda: os.cpu_count() or 4, ge=1)
     batch_workers: int | None = Field(default=None, ge=1)
     kcc_path: Path | None = None
     calibre_path: Path | None = None
-    previewer_path: Path | None = None
     cover_size: tuple[int, int] = Field(default=DEFAULT_COVER_SIZE)
 
     @model_validator(mode="after")
