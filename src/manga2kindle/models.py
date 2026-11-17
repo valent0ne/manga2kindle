@@ -6,7 +6,7 @@ import os
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ReadingDirection(str, Enum):
@@ -22,6 +22,24 @@ class SpreadMode(str, Enum):
     SPLIT = "split"
     ROTATE = "rotate"
     KEEP = "keep"
+
+
+class DetectorKind(str, Enum):
+    """Supported panel detection backend identifiers."""
+
+    AUTO = "auto"
+    CONTOUR = "contour"
+    ONNX_YOLO = "onnx"
+    MAGI = "magi"
+
+
+class DevicePreference(str, Enum):
+    """Preferred inference compute device for neural panel detectors."""
+
+    AUTO = "auto"
+    CPU = "cpu"
+    CUDA = "cuda"
+    MPS = "mps"
 
 
 DEFAULT_COVER_SIZE: tuple[int, int] = (1600, 2560)
@@ -99,6 +117,21 @@ class PageAsset(BaseModel):
     panels: list[PanelBox] = Field(default_factory=list)
 
 
+class DetectorConfig(BaseModel):
+    """Configuration for panel detection backends and post-processing."""
+
+    kind: DetectorKind = DetectorKind.AUTO
+    model_path: Path | None = None
+    model_id: str | None = None
+    device: DevicePreference = DevicePreference.AUTO
+    score_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    iou_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    containment_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    padding: float = Field(default=0.02, ge=0.0, le=0.25)
+    min_panel_area: float = Field(default=0.03, ge=0.01, le=0.50)
+    allow_remote_code: bool = False
+
+
 class ConversionConfig(BaseModel):
     """Runtime configuration for converting a CBZ/CBR/image folder into KFX."""
 
@@ -110,6 +143,7 @@ class ConversionConfig(BaseModel):
     zoom_factor: float = Field(default=1.5, ge=1.0)
     padding: float = Field(default=0.02, ge=0.0, le=0.25)
     min_panel_area: float = Field(default=0.03, ge=0.01, le=0.50)
+    detector: DetectorConfig = Field(default_factory=DetectorConfig)
     no_kcc: bool = False
     keep_temp: bool = False
     workers: int = Field(default_factory=lambda: os.cpu_count() or 4, ge=1)
@@ -117,6 +151,18 @@ class ConversionConfig(BaseModel):
     calibre_path: Path | None = None
     previewer_path: Path | None = None
     cover_size: tuple[int, int] = Field(default=DEFAULT_COVER_SIZE)
+
+    @model_validator(mode="after")
+    def _sync_detector_fields(self) -> ConversionConfig:
+        """Keep top-level padding/min_panel_area synchronized with detector config."""
+        for field_name in ("padding", "min_panel_area"):
+            top_explicit = field_name in self.model_fields_set
+            det_explicit = field_name in self.detector.model_fields_set
+            if top_explicit and not det_explicit:
+                setattr(self.detector, field_name, getattr(self, field_name))
+            elif det_explicit and not top_explicit:
+                setattr(self, field_name, getattr(self.detector, field_name))
+        return self
 
     @field_validator("cover_size")
     @classmethod

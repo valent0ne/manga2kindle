@@ -5,9 +5,13 @@ Cross-platform headless CLI for converting `.cbz`, `.cbr`, and image folders int
 ## Features
 
 - **Native `.kfx` with `PDOC` tagging:** Compiles fixed-layout `.kpf` packages directly via Calibre's `KFX Output` plugin (`-d` / `PDOC`) so USB-sideloaded manga displays cover thumbnails properly on modern Kindles (including Kindle Paperwhite 12th Gen).
-- **Guided View Panel Detection:** Uses OpenCV morphological contour detection, NMS pruning, and spatial reading-order sorting (RTL manga, LTR comics, and 4-koma vertical strips) to embed native Kindle magnification targets.
+- **Guided View Panel Detection (3-Layer Architecture):** Embeds native Kindle magnification targets using pluggable detection backends with automatic fallback:
+  - **Layer 1 (`contour`):** Built-in OpenCV morphological contour extraction, containment pruning, IoU NMS, and recursive XY-cut spatial reading-order sorting (RTL manga, LTR comics, and 4-koma vertical strips).
+  - **Layer 2 (`onnx`, optional `[onnx]` extra):** ONNX Runtime YOLO panel detector (`manga109-yolo-s` / `manga109-yolo-n`) with SHA-256-verified weight caching.
+  - **Layer 3 (`magi`, optional `[magi]` extra):** GPU-accelerated Magi (`magiv3` / `magiv2`) for panel detection and native reading-order prediction (opt-in via `--allow-remote-code`).
+  - **`auto` (default):** Resolves `magi` (when GPU, cached weights, and `--allow-remote-code` are present) -> `onnx` (when `onnxruntime` and cached weights are present) -> `contour` fallback.
 - **E-Ink Image Preprocessing:** Uses **Kindle Comic Converter (`kcc-c2e`)** by default for E-Ink-tuned dithering/contrast and spread handling, with a pure-Pillow fallback via `--no-kcc`.
-- **Visual QA & Diagnostics:** Includes `preview-panels` to inspect detected bounding boxes and reading-order arrows before converting, and `doctor` to verify external tools.
+- **Visual QA, Benchmarking & Diagnostics:** Includes `preview-panels` (with `--compare` side-by-side backend grids), `convert --preview-only`, `models list`/`fetch`, `benchmark` (PopManga, CoMix, and local JSON/COCO), and `doctor` to verify dependencies.
 - **Single, Folder, and Batch Modes:** Automatically handles a single `.cbz`/`.cbr`, a directory of images, or a batch directory of archives using parallel worker threads.
 - **Cross-Platform:** Built for macOS and Windows using `pathlib.Path` and automatic executable discovery with explicit `--*-path` overrides.
 
@@ -59,6 +63,14 @@ cd manga2kindle
 uv sync
 ```
 
+Optional extras for neural panel detection and benchmarking:
+
+```bash
+uv sync --extra onnx        # Layer 2: ONNX Runtime YOLO detector
+uv sync --extra magi        # Layer 3: PyTorch/Transformers Magi detector (GPU)
+uv sync --extra benchmark   # PopManga / CoMix dataset evaluation (datasets + psutil)
+```
+
 Verify all dependencies:
 
 ```bash
@@ -97,7 +109,31 @@ uv run manga2kindle preview-panels \
 
 (`preview-panels` defaults `-o, --output-dir` to `<input.parent>/<name>_preview`.)
 
-### 3. Convert to PDOC KFX (`convert`)
+Compare multiple panel detection backends side-by-side:
+
+```bash
+uv run manga2kindle preview-panels \
+  -i "Chapter 01.cbz" \
+  --compare contour,onnx,magi \
+  --allow-remote-code
+```
+
+### 3. Manage Neural Panel Models (`models`)
+
+List registered models, local cache status, and license notices:
+
+```bash
+uv run manga2kindle models list
+```
+
+Download and SHA-256-verify weights into your OS-native user cache:
+
+```bash
+uv run manga2kindle models fetch manga109-yolo-s
+uv run manga2kindle models fetch magiv3
+```
+
+### 4. Convert to PDOC KFX (`convert`)
 
 **Single `.cbz` / `.cbr` archive:**
 
@@ -127,6 +163,31 @@ uv run manga2kindle convert -i ./Chapters -o ./KFX_Output -w 4
 uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 ```
 
+**Rendering panel previews only (without compiling `.kpf`/`.kfx`):**
+
+```bash
+uv run manga2kindle convert -i "Chapter 01.cbz" --preview-only
+```
+
+### 5. Benchmark Panel Detectors (`benchmark`)
+
+Evaluate detection accuracy (`P@50`, `R@50`, `P@75`, `R@75`, `mIoU`, nested duplicate rate, exact count match), reading-order metrics (`PairAcc`, `Kendall's tau`), latency (`ms/pg`), and memory (`RAM`/`VRAM`) against **PopManga** (defaults to `rtl`), **CoMix** (defaults to `ltr`), or a local JSON/COCO dataset:
+
+```bash
+# One-command mechanical runner (syncs extras, fetches models, runs benchmark)
+uv run python utils/run_benchmark.py --out benchmark.json
+
+# Or invoke the CLI directly:
+# PopManga (gated HF dataset: accept terms on Hugging Face & set HF_TOKEN; uses --split unseen)
+uv run manga2kindle benchmark --dataset popmanga --split unseen --limit 50 --backends contour,onnx,magi --allow-remote-code --out report.json
+
+# CoMix (defaults --direction to ltr; gated HF dataset)
+uv run manga2kindle benchmark --dataset comix --limit 50 --backends contour,onnx
+
+# Local custom JSON or COCO JSON dataset
+uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./truth.json --backends contour
+```
+
 ### Key Flags (`convert`)
 
 | Flag | Default | Description |
@@ -141,6 +202,12 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 | `-z, --zoom-factor` | `1.5` | Guided View magnification factor (`>= 1.0`) |
 | `--padding` | `0.02` | Panel bounding-box padding ratio (`0.0`–`0.25`) |
 | `--min-panel-area` | `0.03` | Minimum panel area ratio (`0.01`–`0.50`) |
+| `--detector` | `auto` | Panel detector backend (`auto`, `magi`, `onnx`, or `contour`) |
+| `--detector-model` | `None` | Detector model key, Hugging Face repo ID, or local weights path |
+| `--device` | `auto` | Inference device for neural detectors (`auto`, `cpu`, `cuda`, or `mps`) |
+| `--score-threshold` | `0.25` | Confidence threshold for neural panel detectors (`0.0`–`1.0`) |
+| `--allow-remote-code` | `false` | Allow executing remote model code (required to enable `magi`) |
+| `--preview-only` | `false` | Render panel preview PNGs and exit without compiling `.kpf`/`.kfx` |
 | `--no-kcc` | `false` | Use pure-Pillow E-Ink preprocessing instead of `kcc-c2e` |
 | `--keep-temp` | `false` | Keep temporary staging and intermediate `.kpf` directories |
 | `-w, --workers` | CPU count | Parallel worker threads |
@@ -156,3 +223,11 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 ## License
 
 This project is licensed under the [GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)](LICENSE).
+
+### Model & Dataset Licenses
+
+Optional neural weights and benchmark datasets are not bundled with `manga2kindle` and remain subject to their respective upstream terms:
+
+- **`manga109-yolo-s` / `manga109-yolo-n` (`deepghs/manga109_yolo`):** Trained on the **Manga109-s** dataset (`hal-utokyo/Manga109-s`); subject to Manga109-s academic/non-commercial dataset terms and the upstream model repository license.
+- **`magiv3` / `magiv2` (`ragavsachdeva/magiv3`, `ragavsachdeva/magiv2`):** Subject to non-commercial / personal / research / not-for-profit use only per the upstream model card; commercial use requires a separate license from the authors.
+- **PopManga & CoMix Benchmark Datasets:** Subject to their upstream academic/non-commercial research terms and attribution requirements.

@@ -225,7 +225,17 @@ __marimo__/
 *.cbz
 *.cbr
 preview/
+*_preview/
 debug_inspect/
+benchmarks/
+data/
+*.onnx
+*.safetensors
+*.pt
+*.bin
+*.pth
+*.parquet
+*.arrow
 
 # Tooling & isolated worktrees
 .superpowers/

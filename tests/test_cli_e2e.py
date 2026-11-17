@@ -13,7 +13,16 @@ from typer.testing import CliRunner
 
 from manga2kindle.cli import app
 from manga2kindle.compiler.kfx import KfxCompiler
-from manga2kindle.models import ConversionConfig, DeviceProfile, ReadingDirection, SpreadMode
+from manga2kindle.cv.backends.base import DetectionResult
+from manga2kindle.models import (
+    ConversionConfig,
+    DetectorConfig,
+    DetectorKind,
+    DeviceProfile,
+    PanelBox,
+    ReadingDirection,
+    SpreadMode,
+)
 from manga2kindle.pipeline import ConversionPipeline
 from manga2kindle.platform import PlatformDiscovery, ToolStatus
 
@@ -226,6 +235,96 @@ class TestPreviewPanelsCli:
         assert cfg.spread_mode == SpreadMode.KEEP
         assert cfg.no_kcc is False
         assert cfg.kcc_path == fake_kcc
+
+    def test_preview_panels_compare_contour_and_onnx_with_stub_backends(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "compare_ch.cbz", num_pages=2)
+        out_dir = tmp_path / "compare_out"
+
+        class _StubBackend:
+            def __init__(self, kind: DetectorKind) -> None:
+                self.kind = kind
+
+            def detect(self, image_path: Path) -> DetectionResult:
+                with Image.open(image_path) as img:
+                    w, h = img.size
+                return DetectionResult(
+                    panels=[PanelBox(x=40, y=40, w=w - 80, h=h - 80, ordinal=1)],
+                    ordered=True,
+                    backend=self.kind,
+                    page_width=w,
+                    page_height=h,
+                )
+
+        def fake_resolve_auto_chain(config: DetectorConfig):
+            return [_StubBackend(config.kind)]
+
+        monkeypatch.setattr("manga2kindle.cv.backends.resolve_auto_chain", fake_resolve_auto_chain)
+
+        result = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(out_dir),
+                "--no-kcc",
+                "--compare",
+                "contour,onnx",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        overlays = sorted(out_dir.glob("*.png"))
+        assert len(overlays) == 2
+        expected_widths = [1600 * 2, 1264 * 2]
+        for overlay, expected_w in zip(overlays, expected_widths):
+            with Image.open(overlay) as img:
+                assert img.size[0] == expected_w
+
+    def test_preview_panels_compare_rejects_auto(self, tmp_path: Path) -> None:
+        cbz_path = _make_cbz(tmp_path / "compare_auto.cbz", num_pages=1)
+        out_dir = tmp_path / "compare_auto_out"
+
+        result = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(out_dir),
+                "--no-kcc",
+                "--compare",
+                "contour,auto",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "auto" in result.output.lower()
+
+    def test_preview_panels_compare_magi_requires_allow_remote_code(self, tmp_path: Path) -> None:
+        cbz_path = _make_cbz(tmp_path / "compare_magi.cbz", num_pages=1)
+        out_dir = tmp_path / "compare_magi_out"
+
+        result = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(out_dir),
+                "--no-kcc",
+                "--compare",
+                "contour,magi",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "allow-remote-code" in result.output.lower()
 
 
 class TestConvertCliMocked:
@@ -621,6 +720,71 @@ class TestConvertCliMocked:
         assert res.exit_code == 0, res.output
         assert len(captured) == 1
         assert captured[0].cover_size == (1375, 2200)
+
+    def test_convert_preview_only_single_without_calibre(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "preview_single.cbz", num_pages=2)
+        preview_dir = tmp_path / "preview_single_out"
+        monkeypatch.setattr(PlatformDiscovery, "find_calibre", lambda self, override=None: None)
+
+        result = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "-o",
+                str(preview_dir),
+                "--no-kcc",
+                "--preview-only",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        overlays = sorted(preview_dir.glob("*.png"))
+        assert len(overlays) == 2
+        assert list(tmp_path.rglob("*.kfx")) == []
+
+        # Also works when -o is omitted (defaults to <name>_preview)
+        default_result = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "--no-kcc", "--preview-only"],
+        )
+        assert default_result.exit_code == 0, default_result.output
+        default_dir = tmp_path / "preview_single_preview"
+        assert len(list(default_dir.glob("*.png"))) == 2
+        assert list(tmp_path.rglob("*.kfx")) == []
+
+    def test_convert_preview_only_batch_without_calibre(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        batch_dir = tmp_path / "batch_preview"
+        batch_dir.mkdir()
+        _make_cbz(batch_dir / "ch_01.cbz", num_pages=1)
+        _make_cbz(batch_dir / "ch_02.cbz", num_pages=2)
+        out_dir = tmp_path / "batch_preview_out"
+        monkeypatch.setattr(PlatformDiscovery, "find_calibre", lambda self, override=None: None)
+
+        result = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(batch_dir),
+                "-o",
+                str(out_dir),
+                "--no-kcc",
+                "--preview-only",
+                "-w",
+                "2",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(list((out_dir / "ch_01_preview").glob("*.png"))) == 1
+        assert len(list((out_dir / "ch_02_preview").glob("*.png"))) == 2
+        assert list(tmp_path.rglob("*.kfx")) == []
 
 
 class TestConvertCliIntegration:
