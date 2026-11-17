@@ -308,3 +308,64 @@ def test_panel_detector_pad_and_clamp_edge_safety_margin() -> None:
     box = detector._pad_and_clamp((999, 1199, 1, 1), page_w=1000, page_h=1200)
     assert box.x + box.w <= 998
     assert box.y + box.h <= 1198
+
+
+def test_stacked_panels_next_to_tall_panel_rtl() -> None:
+    """Two stacked panels beside a tall panel sort top-to-bottom after the tall column in RTL."""
+    # Right column: tall panel; Left column: two stacked panels overlapping tall panel's y-range
+    tall_right = PanelBox(x=520, y=20, w=460, h=700)
+    top_left = PanelBox(x=20, y=30, w=460, h=320)
+    bottom_left = PanelBox(x=40, y=380, w=440, h=330)
+
+    ordered = PanelSorter(direction=ReadingDirection.RTL).sort(
+        [bottom_left, top_left, tall_right]
+    )
+    assert [(b.x, b.y, b.ordinal) for b in ordered] == [
+        (520, 20, 1),
+        (20, 30, 2),
+        (40, 380, 3),
+    ]
+
+
+def test_stacked_panels_next_to_tall_panel_with_padding_overlap_ltr() -> None:
+    """Inset XY-cut resolves minor pad_and_clamp gutter overlap in LTR."""
+    # Simulates 2% pad_and_clamp expansion causing ~10px gutter overlap between columns/rows
+    tall_left = PanelBox(x=20, y=20, w=490, h=700)
+    top_right = PanelBox(x=500, y=25, w=460, h=340)
+    bottom_right = PanelBox(x=502, y=358, w=458, h=360)
+
+    ordered = PanelSorter(direction=ReadingDirection.LTR).sort(
+        [bottom_right, top_right, tall_left]
+    )
+    assert [(b.x, b.y, b.ordinal) for b in ordered] == [
+        (20, 20, 1),
+        (500, 25, 2),
+        (502, 358, 3),
+    ]
+
+
+def test_stacked_panels_with_padding_overlap_rtl_and_overlapping_fallback() -> None:
+    """Inset XY-cut resolves padding overlap in RTL; unsplittable overlaps fall back to rows."""
+    tall_right = PanelBox(x=495, y=20, w=485, h=700)
+    top_left = PanelBox(x=20, y=25, w=485, h=340)
+    bottom_left = PanelBox(x=45, y=358, w=460, h=360)
+
+    ordered_rtl = PanelSorter(direction=ReadingDirection.RTL).sort(
+        [bottom_left, top_left, tall_right]
+    )
+    assert [(b.x, b.y, b.ordinal) for b in ordered_rtl] == [
+        (495, 20, 1),
+        (20, 25, 2),
+        (45, 358, 3),
+    ]
+
+    # Deeply overlapping diagonal panels cannot be split by strict or inset XY-cut -> row fallback
+    diag_right = PanelBox(x=300, y=100, w=400, h=400)
+    diag_left = PanelBox(x=100, y=120, w=400, h=400)
+    fallback_rtl = PanelSorter(direction=ReadingDirection.RTL, row_tolerance_px=50).sort(
+        [diag_left, diag_right]
+    )
+    assert [(b.x, b.y, b.ordinal) for b in fallback_rtl] == [
+        (300, 100, 1),
+        (100, 120, 2),
+    ]
