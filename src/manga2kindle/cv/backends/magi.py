@@ -122,27 +122,35 @@ class MagiBackend:
 
         torch_dtype = self._torch.float16 if self._device in ("cuda", "mps") else self._torch.float32
         model_cls = getattr(transformers, auto_class_name)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
-            warnings.filterwarnings("ignore", message=".*does not directly inherit from.*GenerationMixin.*")
-            warnings.filterwarnings("ignore", message=".*use_reentrant=False.*")
-            model = model_cls.from_pretrained(
-                str(model_dir),
-                trust_remote_code=True,
-                local_files_only=True,
-                torch_dtype=torch_dtype,
-                attn_implementation="eager",
-            )
-            self._model = model.to(self._device).eval()
-
-            if uses_processor:
-                self._processor: Any = transformers.AutoProcessor.from_pretrained(
+        hf_logging = getattr(getattr(transformers, "utils", None), "logging", None)
+        prev_verbosity = hf_logging.get_verbosity() if hf_logging is not None else None
+        if hf_logging is not None:
+            hf_logging.set_verbosity_error()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
+                warnings.filterwarnings("ignore", message=".*does not directly inherit from.*GenerationMixin.*")
+                warnings.filterwarnings("ignore", message=".*use_reentrant=False.*")
+                model = model_cls.from_pretrained(
                     str(model_dir),
                     trust_remote_code=True,
                     local_files_only=True,
+                    torch_dtype=torch_dtype,
+                    attn_implementation="eager",
                 )
-            else:
-                self._processor = None
+                self._model = model.to(self._device).eval()
+
+                if uses_processor:
+                    self._processor: Any = transformers.AutoProcessor.from_pretrained(
+                        str(model_dir),
+                        trust_remote_code=True,
+                        local_files_only=True,
+                    )
+                else:
+                    self._processor = None
+        finally:
+            if hf_logging is not None and prev_verbosity is not None:
+                hf_logging.set_verbosity(prev_verbosity)
 
     @staticmethod
     def _resolve_local_model_dir(config: DetectorConfig) -> tuple[Path, MagiModelSpec | None]:
@@ -174,7 +182,9 @@ class MagiBackend:
         orig_h, orig_w = bgr_image.shape[:2]
         rgb_image = to_rgb_array(bgr_image)
 
-        with self._lock, self._torch.inference_mode():
+        with self._lock, self._torch.inference_mode(), warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*requires_grad=True.*")
+            warnings.filterwarnings("ignore", message=".*use_reentrant=False.*")
             if self._processor is not None:
                 raw_results = self._model.predict_detections_and_associations(
                     [rgb_image],
