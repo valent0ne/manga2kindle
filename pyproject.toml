@@ -42,7 +42,8 @@ magi = [
     "matplotlib>=3.7",
 ]
 benchmark = [
-    "datasets>=2.18",
+    "datasets>=2.18,<4.0",
+    "mloader>=1.1",
     "psutil>=5.9",
 ]
 

@@ -883,9 +883,19 @@ def benchmark(
                 raise ValueError("--pages-dir and --truth are required when --dataset local is used.")
             samples = cv_benchmark.load_local_dataset(pages_dir, truth, limit=limit)
         elif dataset == BenchmarkDatasetKind.POPMANGA:
-            samples = cv_benchmark.load_popmanga_split(split, cache_dir=cache_dir, limit=limit)
+            samples = cv_benchmark.load_popmanga_split(
+                split,
+                cache_dir=cache_dir,
+                limit=limit,
+                trust_remote_code=allow_remote_code,
+            )
         else:
-            samples = cv_benchmark.load_comix_split(split, cache_dir=cache_dir, limit=limit)
+            samples = cv_benchmark.load_comix_split(
+                split,
+                cache_dir=cache_dir,
+                limit=limit,
+                trust_remote_code=allow_remote_code,
+            )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc

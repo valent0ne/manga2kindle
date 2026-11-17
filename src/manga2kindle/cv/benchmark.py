@@ -436,8 +436,17 @@ def load_local_dataset(
     return samples
 
 
-def _extract_hf_panels(row: dict[str, Any]) -> list[PanelBox]:
+def _extract_hf_panels(row: dict[str, Any], *, xyxy: bool = False) -> list[PanelBox]:
     raw_panels = row.get("panels") or row.get("bboxes") or row.get("boxes") or []
+    if xyxy:
+        converted: list[Any] = []
+        for item in raw_panels:
+            if isinstance(item, (list, tuple)) and len(item) >= 4:
+                x1, y1, x2, y2 = item[0], item[1], item[2], item[3]
+                converted.append([x1, y1, max(1, x2 - x1), max(1, y2 - y1)])
+            else:
+                converted.append(item)
+        raw_panels = converted
     return _normalize_ground_truth(raw_panels)
 
 
@@ -447,6 +456,8 @@ def _materialize_hf_split(
     *,
     cache_dir: Path | None = None,
     limit: int | None = None,
+    trust_remote_code: bool = False,
+    xyxy: bool = False,
 ) -> list[BenchmarkSample]:
     try:
         from datasets import load_dataset
@@ -460,6 +471,7 @@ def _materialize_hf_split(
         dataset_id,
         split=split,
         cache_dir=str(cache_dir) if cache_dir is not None else None,
+        trust_remote_code=trust_remote_code,
     )
     img_dir = (cache_dir or Path(tempfile.gettempdir()) / "manga2kindle_benchmarks") / (
         dataset_id.replace("/", "_") + f"_{split}"
@@ -488,22 +500,31 @@ def _materialize_hf_split(
             BenchmarkSample(
                 page_id=page_id,
                 image_path=image_path,
-                ground_truth=_extract_hf_panels(row),
+                ground_truth=_extract_hf_panels(row, xyxy=xyxy),
             )
         )
     return samples
 
 
 def load_popmanga_split(
-    split: str = "test",
+    split: str = "unseen",
     *,
     cache_dir: Path | None = None,
     limit: int | None = None,
     dataset_id: str = DEFAULT_POPMANGA_DATASET_ID,
+    trust_remote_code: bool = False,
 ) -> list[BenchmarkSample]:
     """Load PopManga benchmark samples from Hugging Face datasets / local cache."""
     logger.info(POPMANGA_LICENSE_NOTICE)
-    return _materialize_hf_split(dataset_id, split, cache_dir=cache_dir, limit=limit)
+    resolved_split = "unseen" if split == "test" else split
+    return _materialize_hf_split(
+        dataset_id,
+        resolved_split,
+        cache_dir=cache_dir,
+        limit=limit,
+        trust_remote_code=trust_remote_code,
+        xyxy=True,
+    )
 
 
 def load_comix_split(
@@ -512,10 +533,17 @@ def load_comix_split(
     cache_dir: Path | None = None,
     limit: int | None = None,
     dataset_id: str = DEFAULT_COMIX_DATASET_ID,
+    trust_remote_code: bool = False,
 ) -> list[BenchmarkSample]:
     """Load CoMix benchmark samples from Hugging Face datasets / local cache."""
     logger.info(COMIX_LICENSE_NOTICE)
-    return _materialize_hf_split(dataset_id, split, cache_dir=cache_dir, limit=limit)
+    return _materialize_hf_split(
+        dataset_id,
+        split,
+        cache_dir=cache_dir,
+        limit=limit,
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def _current_rss_mb() -> float:
