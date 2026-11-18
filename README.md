@@ -165,6 +165,13 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 uv run manga2kindle convert -i "Chapter 01.cbz" --preview-only
 ```
 
+**Beautifying output filenames and KFX title metadata (and optionally source files):**
+
+```bash
+uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify
+uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify-source
+```
+
 ### 5. Benchmark Panel Detectors (`benchmark`)
 
 Evaluate detection accuracy (`P@50`, `R@50`, `P@75`, `R@75`, `mIoU`, nested duplicate rate, exact count match), reading-order metrics (`PairAcc`, `Kendall's tau`), latency (`ms/pg`), and memory (`RAM`/`VRAM`) against **PopManga** (defaults to `rtl`), **CoMix** (defaults to `ltr`), or a local JSON/COCO dataset:

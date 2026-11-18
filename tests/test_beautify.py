@@ -46,6 +46,10 @@ from manga2kindle.platform import PlatformDiscovery
             "One Piece - c1045 (2022)",
         ),
         (
+            "Berserk v01 (1999) (Digital)",
+            "Berserk v01 (1999)",
+        ),
+        (
             "Series Name - (Digital)",
             "Series Name",
         ),
@@ -252,3 +256,80 @@ def test_pipeline_run_batch_beautify_detects_collision_before_conversion(
     # Neither source file should have been renamed
     assert (in_dir / "Frieren v01 (2021) (Digital) (f).cbz").is_file()
     assert (in_dir / "Frieren v01 (2021) (Digital) (f2).cbz").is_file()
+
+
+def test_pipeline_run_batch_beautify_and_beautify_source_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    in_dir = tmp_path / "batch"
+    out_dir = tmp_path / "out"
+    _make_dummy_cbz(in_dir / "Frieren - Beyond Journey's End v01 (2021) (Digital) (f).cbz")
+    _make_dummy_cbz(in_dir / "Fullmetal Alchemist v01 (Grunbeld).cbz")
+    captured_titles: list[str] = []
+    pipeline = _stub_pipeline(monkeypatch, captured_titles)
+
+    cfg = ConversionConfig(
+        input_path=in_dir,
+        output_path=out_dir,
+        profile=DeviceProfile.from_name("KPW5"),
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        beautify=True,
+        beautify_source=True,
+    )
+    outputs = pipeline.run_batch(cfg)
+
+    assert sorted(p.name for p in outputs) == [
+        "Frieren - Beyond Journey's End v01 (2021).kfx",
+        "Fullmetal Alchemist v01.kfx",
+    ]
+    assert sorted(captured_titles) == [
+        "Frieren - Beyond Journey's End v01 (2021)",
+        "Fullmetal Alchemist v01",
+    ]
+    assert (in_dir / "Frieren - Beyond Journey's End v01 (2021).cbz").is_file()
+    assert (in_dir / "Fullmetal Alchemist v01.cbz").is_file()
+
+
+def test_pipeline_run_batch_beautify_output_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    in_dir = tmp_path / "batch"
+    _make_dummy_cbz(in_dir / "Frieren v01 (2021) (Digital) (f).cbz")
+    _make_dummy_cbz(in_dir / "Frieren v01 (2021) (Digital) (f2).cbz")
+    captured_titles: list[str] = []
+    pipeline = _stub_pipeline(monkeypatch, captured_titles)
+
+    cfg = ConversionConfig(
+        input_path=in_dir,
+        output_path=in_dir,
+        profile=DeviceProfile.from_name("KPW5"),
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        beautify=True,
+    )
+    with pytest.raises(ValueError, match="collision"):
+        pipeline.run_batch(cfg)
+
+
+def test_pipeline_preview_batch_beautify_and_collision(tmp_path: Path) -> None:
+    in_dir = tmp_path / "batch_preview"
+    out_dir = tmp_path / "preview_out"
+    _make_dummy_cbz(in_dir / "Witch Hat Atelier v12 (2024) (Digital) (LuCaZ) (F).cbz")
+    pipeline = ConversionPipeline()
+
+    cfg = ConversionConfig(
+        input_path=in_dir,
+        output_path=out_dir,
+        profile=DeviceProfile.from_name("KPW5"),
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        beautify=True,
+    )
+    preview_dirs = pipeline.preview_batch(cfg)
+    assert preview_dirs == [out_dir / "Witch Hat Atelier v12 (2024)_preview"]
+    assert preview_dirs[0].is_dir()
+
+    _make_dummy_cbz(in_dir / "Witch Hat Atelier v12 (2024) (Digital) (f2).cbz")
+    with pytest.raises(ValueError, match="collision"):
+        pipeline.preview_batch(cfg)
