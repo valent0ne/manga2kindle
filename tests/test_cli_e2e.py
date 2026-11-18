@@ -319,6 +319,38 @@ class TestPreviewPanelsCli:
         assert result.exit_code != 0
         assert "allow-remote-code" in result.output.lower()
 
+    def test_preview_panels_defaults_profile_to_kpw6(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "chapter_default_profile.cbz", num_pages=1)
+        out_dir = tmp_path / "preview_default"
+        captured: dict[str, ConversionConfig] = {}
+
+        def fake_process(self, pages, work_dir, config: ConversionConfig):
+            captured["config"] = config
+            processed_dir = work_dir / "processed"
+            processed_dir.mkdir(parents=True, exist_ok=True)
+            out_img = processed_dir / "0000.png"
+            shutil.copy2(pages[0].source_path, out_img)
+            return [pages[0].model_copy(update={"processed_path": out_img})]
+
+        monkeypatch.setattr("manga2kindle.preprocessor.ImagePreprocessor.process", fake_process)
+
+        result = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(out_dir),
+                "--no-kcc",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert captured["config"].profile == DeviceProfile.from_name("KPW6")
+
 
 class TestConvertCliMocked:
     """Fast unit/E2E tests for `manga2kindle convert` with mocked KfxCompiler."""

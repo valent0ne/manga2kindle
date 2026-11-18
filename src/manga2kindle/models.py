@@ -43,9 +43,11 @@ class DevicePreference(str, Enum):
 
 
 DEFAULT_COVER_SIZE: tuple[int, int] = (1600, 2560)
+DEFAULT_PROFILE_NAME: str = "KPW6"
 
 
 _DEVICE_PRESETS: dict[str, tuple[int, int, str]] = {
+    "KPW6": (1264, 1680, "KPW6"),
     "KPW5": (1264, 1680, "KPW5"),
     "KS": (1860, 2480, "KS"),
     "OASIS": (1264, 1680, "KO"),

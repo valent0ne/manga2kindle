@@ -22,6 +22,7 @@ from manga2kindle.cv.backends import resolve_auto_chain
 from manga2kindle.cv.benchmark import BenchmarkDatasetKind, BenchmarkMetrics
 from manga2kindle.models import (
     DEFAULT_COVER_SIZE,
+    DEFAULT_PROFILE_NAME,
     ConversionConfig,
     DetectorConfig,
     DetectorKind,
@@ -204,8 +205,8 @@ def convert(
     ] = None,
     profile: Annotated[
         str,
-        typer.Option("-p", "--profile", help="Kindle profile: KPW5, KS, OASIS, or CUSTOM."),
-    ] = "KPW5",
+        typer.Option("-p", "--profile", help="Kindle profile: KPW6, KPW5, KS, OASIS, or CUSTOM."),
+    ] = DEFAULT_PROFILE_NAME,
     custom_size: Annotated[
         str | None,
         typer.Option("--custom-size", help="Custom WIDTHxHEIGHT when --profile CUSTOM is set."),
@@ -493,8 +494,8 @@ def preview_panels(
     ] = None,
     profile: Annotated[
         str,
-        typer.Option("-p", "--profile", help="Kindle profile: KPW5, KS, OASIS, or CUSTOM."),
-    ] = "KPW5",
+        typer.Option("-p", "--profile", help="Kindle profile: KPW6, KPW5, KS, OASIS, or CUSTOM."),
+    ] = DEFAULT_PROFILE_NAME,
     custom_size: Annotated[
         str | None,
         typer.Option("--custom-size", help="Custom WIDTHxHEIGHT when --profile CUSTOM is set."),
