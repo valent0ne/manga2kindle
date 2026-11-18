@@ -12,12 +12,15 @@ import cv2
 import numpy as np
 
 from manga2kindle.cv.backends.base import DetectionResult
+from manga2kindle.cv.backends.contour import ContourBackend
 from manga2kindle.cv.boxes import (
     DEFAULT_BLEED_MARGIN,
     Rect,
-    nms_and_prune_indices,
-    pad_and_clamp,
+    compute_containment,
+    finalize_panel_boxes,
+    intersection_area,
 )
+from manga2kindle.cv.bubbles import expand_text_boxes_to_bubbles
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.cv.models_hub import (
     DEFAULT_MAGI_MODEL_KEY,
@@ -31,6 +34,11 @@ from manga2kindle.models import DetectorConfig, DetectorKind, DevicePreference
 
 
 _BYTES_PER_GIB = 1024**3
+_MAGI_PANELS_KEY = "panels"
+_MAGI_TEXTS_KEY = "texts"
+_MAGI_ESSENTIAL_TEXT_KEY = "is_essential_text"
+_CONTOUR_RECOVERY_OVERLAP_THRESHOLD = 0.15
+_ROW_ALIGNMENT_Y_RATIO = 0.5
 
 
 def resolve_magi_batch_size(device: str, torch_mod: Any, configured: int | None) -> int:
@@ -139,6 +147,7 @@ class MagiBackend:
 
         self._config = config
         self._lock = threading.Lock()
+        self._contour_fallback = ContourBackend(min_panel_area=config.min_panel_area)
         self._torch, transformers = _import_magi_deps()
         self._device = select_torch_device(config.device, self._torch)
         self._batch_size = resolve_magi_batch_size(self._device, self._torch, config.batch_size)
@@ -220,14 +229,95 @@ class MagiBackend:
                 )
             return list(self._model.predict_detections_and_associations(rgb_images))
 
-    def _parse_page_result(self, page_result: Any, orig_w: int, orig_h: int) -> DetectionResult:
-        raw_panels = page_result.get("panels", []) if isinstance(page_result, dict) else []
+    def _extract_essential_text_rects(
+        self,
+        page_result: Any,
+        orig_w: int,
+        orig_h: int,
+    ) -> list[Rect]:
+        if not isinstance(page_result, dict):
+            return []
+        raw_texts = page_result.get(_MAGI_TEXTS_KEY)
+        if raw_texts is None:
+            return []
+        text_list = list(raw_texts)
+        if not text_list:
+            return []
+
+        essential_mask = page_result.get(_MAGI_ESSENTIAL_TEXT_KEY)
+        mask_list: list[Any] | None = None
+        if essential_mask is not None:
+            candidate_mask = list(essential_mask)
+            if len(candidate_mask) == len(text_list):
+                mask_list = candidate_mask
+
+        rects: list[Rect] = []
+        for idx, box in enumerate(text_list):
+            if mask_list is not None and not bool(mask_list[idx]):
+                continue
+            rect = _xyxy_to_rect(box, orig_w, orig_h)
+            if rect is not None:
+                rects.append(rect)
+        return rects
+
+    def _recover_uncovered_contour_panels(
+        self,
+        magi_rects: list[Rect],
+        rgb_image: np.ndarray,
+    ) -> list[Rect]:
+        """Recover clear contour-detected panels that Magi missed completely."""
+        contour_rects = self._contour_fallback.detect_raw_rects(rgb_image, is_rgb=True)
+        if not contour_rects:
+            return magi_rects
+
+        merged = list(magi_rects)
+        for c_rect in contour_rects:
+            c_area = c_rect[2] * c_rect[3]
+            if c_area <= 0:
+                continue
+            overlaps_existing = any(
+                compute_containment(c_rect, m_rect) >= _CONTOUR_RECOVERY_OVERLAP_THRESHOLD
+                or (intersection_area(c_rect, m_rect) / c_area) >= _CONTOUR_RECOVERY_OVERLAP_THRESHOLD
+                for m_rect in merged
+            )
+            if overlaps_existing:
+                continue
+
+            # Insert at a natural RTL reading-order position by vertical center, then right-to-left.
+            c_cy = c_rect[1] + c_rect[3] / 2.0
+            c_cx = c_rect[0] + c_rect[2] / 2.0
+            insert_idx = len(merged)
+            for idx, m_rect in enumerate(merged):
+                m_cy = m_rect[1] + m_rect[3] / 2.0
+                m_cx = m_rect[0] + m_rect[2] / 2.0
+                row_tol = _ROW_ALIGNMENT_Y_RATIO * min(c_rect[3], m_rect[3])
+                if c_cy < m_cy - row_tol or (
+                    abs(c_cy - m_cy) <= row_tol and c_cx > m_cx
+                ):
+                    insert_idx = idx
+                    break
+            merged.insert(insert_idx, c_rect)
+        return merged
+
+    def _parse_page_result(
+        self,
+        page_result: Any,
+        orig_w: int,
+        orig_h: int,
+        image: np.ndarray | None = None,
+    ) -> DetectionResult:
+        raw_panels = page_result.get(_MAGI_PANELS_KEY) if isinstance(page_result, dict) else None
+        if raw_panels is None:
+            raw_panels = []
 
         rects: list[Rect] = []
         for box in raw_panels:
             rect = _xyxy_to_rect(box, orig_w, orig_h)
             if rect is not None:
                 rects.append(rect)
+
+        if image is not None and rects and self._config.merge_bridged_panels:
+            rects = self._recover_uncovered_contour_panels(rects, image)
 
         if not rects:
             return DetectionResult(
@@ -239,23 +329,30 @@ class MagiBackend:
                 scores=None,
             )
 
-        surviving = nms_and_prune_indices(
+        text_rects = (
+            self._extract_essential_text_rects(page_result, orig_w, orig_h)
+            if self._config.merge_bridged_panels
+            else []
+        )
+        if image is not None and text_rects:
+            text_rects = expand_text_boxes_to_bubbles(image, text_rects, is_rgb=True)
+
+        panels, _ = finalize_panel_boxes(
             rects,
+            orig_w,
+            orig_h,
+            text_boxes=text_rects,
             iou_threshold=self._config.iou_threshold,
             containment_threshold=self._config.containment_threshold,
+            padding=self._config.padding,
+            bleed_margin=DEFAULT_BLEED_MARGIN,
             preserve_order=True,
+            merge_bridged_panels=self._config.merge_bridged_panels,
+            text_bridge_overlap=self._config.text_bridge_overlap,
+            panel_overlap_threshold=self._config.panel_overlap_threshold,
+            max_merged_area_ratio=self._config.max_merged_area_ratio,
+            min_fill_ratio=self._config.min_fill_ratio,
         )
-
-        panels = [
-            pad_and_clamp(
-                rects[idx],
-                orig_w,
-                orig_h,
-                padding=self._config.padding,
-                bleed_margin=DEFAULT_BLEED_MARGIN,
-            ).model_copy(update={"ordinal": ordinal})
-            for ordinal, idx in enumerate(surviving, start=1)
-        ]
 
         return DetectionResult(
             panels=panels,
@@ -295,6 +392,13 @@ class MagiBackend:
 
             for idx, (orig_w, orig_h) in enumerate(dims):
                 page_result = raw_chunk[idx] if idx < len(raw_chunk) else {}
-                results.append(self._parse_page_result(page_result, orig_w, orig_h))
+                results.append(
+                    self._parse_page_result(
+                        page_result,
+                        orig_w,
+                        orig_h,
+                        image=rgb_images[idx],
+                    )
+                )
 
         return results

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,10 @@ from manga2kindle.cv.backends.base import DetectionResult
 from manga2kindle.cv.boxes import (
     DEFAULT_BLEED_MARGIN,
     Rect,
-    nms_and_prune_indices,
-    pad_and_clamp,
+    finalize_panel_boxes,
+    nms_and_prune,
 )
+from manga2kindle.cv.bubbles import expand_text_boxes_to_bubbles
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.cv.models_hub import (
     DEFAULT_ONNX_MODEL_KEY,
@@ -173,7 +175,27 @@ def _unletterbox_and_clamp(
     return (ix1, iy1, w, h)
 
 
-def decode_yolo_output(
+@dataclass(frozen=True)
+class YoloDetections:
+    """Decoded panel and optional text detections from a YOLO ONNX output tensor."""
+
+    panel_rects: list[Rect]
+    panel_scores: list[float]
+    text_rects: list[Rect]
+    text_scores: list[float]
+
+
+@dataclass(frozen=True)
+class _ResolvedOnnxModel:
+    """Resolved local ONNX model path and class/input metadata."""
+
+    model_path: Path
+    panel_class_id: int
+    text_class_id: int | None
+    input_size: int
+
+
+def decode_yolo_detections(
     raw_output: np.ndarray,
     orig_w: int,
     orig_h: int,
@@ -181,7 +203,8 @@ def decode_yolo_output(
     pad: tuple[int, int],
     score_threshold: float,
     panel_class_id: int = PANEL_CLASS_ID,
-) -> tuple[list[Rect], list[float]]:
+    text_class_id: int | None = None,
+) -> YoloDetections:
     """Decode raw YOLOv8/v11 (1, 4+C, N) or NMS-exported (1, N, 6) ONNX output."""
     if orig_w <= 0 or orig_h <= 0:
         raise ValueError(f"orig_w and orig_h must be positive, got ({orig_w}, {orig_h})")
@@ -189,6 +212,8 @@ def decode_yolo_output(
         raise ValueError(f"scale must be positive, got {scale}")
     if panel_class_id < 0:
         raise ValueError(f"panel_class_id must be non-negative, got {panel_class_id}")
+    if text_class_id is not None and text_class_id < 0:
+        raise ValueError(f"text_class_id must be non-negative, got {text_class_id}")
 
     arr = np.asarray(raw_output, dtype=np.float32)
     if arr.ndim == 3:
@@ -199,25 +224,35 @@ def decode_yolo_output(
         raise ValueError(f"Expected 2D or 3D YOLO output tensor, got shape {arr.shape}")
 
     pad_x, pad_y = pad
-    rects: list[Rect] = []
-    scores: list[float] = []
+    panel_rects: list[Rect] = []
+    panel_scores: list[float] = []
+    text_rects: list[Rect] = []
+    text_scores: list[float] = []
 
     if _is_nms_exported_format(arr):
         for row in arr:
             x1_lb, y1_lb, x2_lb, y2_lb, score, cls_val = row
-            if int(round(float(cls_val))) != panel_class_id:
-                continue
+            cls_id = int(round(float(cls_val)))
             conf = float(score)
             if conf < score_threshold:
                 continue
-            rect = _unletterbox_and_clamp(
-                float(x1_lb), float(y1_lb), float(x2_lb), float(y2_lb),
-                orig_w, orig_h, scale, pad_x, pad_y,
-            )
-            if rect is not None:
-                rects.append(rect)
-                scores.append(conf)
-        return rects, scores
+            if cls_id == panel_class_id:
+                rect = _unletterbox_and_clamp(
+                    float(x1_lb), float(y1_lb), float(x2_lb), float(y2_lb),
+                    orig_w, orig_h, scale, pad_x, pad_y,
+                )
+                if rect is not None:
+                    panel_rects.append(rect)
+                    panel_scores.append(conf)
+            elif text_class_id is not None and cls_id == text_class_id:
+                rect = _unletterbox_and_clamp(
+                    float(x1_lb), float(y1_lb), float(x2_lb), float(y2_lb),
+                    orig_w, orig_h, scale, pad_x, pad_y,
+                )
+                if rect is not None:
+                    text_rects.append(rect)
+                    text_scores.append(conf)
+        return YoloDetections(panel_rects, panel_scores, text_rects, text_scores)
 
     if arr.shape[0] < 5:
         raise ValueError(f"Expected at least 5 channels (4 box + >=1 class), got shape {arr.shape}")
@@ -226,13 +261,16 @@ def decode_yolo_output(
             f"panel_class_id={panel_class_id} out of range for tensor shape {arr.shape}"
         )
 
+    extract_text = text_class_id is not None and (4 + text_class_id) < arr.shape[0]
     predictions = arr.T  # (N, 4 + num_classes)
     for pred in predictions:
         class_scores = pred[4:]
         best_cls = int(np.argmax(class_scores))
-        if best_cls != panel_class_id:
+        is_panel = best_cls == panel_class_id
+        is_text = extract_text and best_cls == text_class_id
+        if not (is_panel or is_text):
             continue
-        conf = float(class_scores[panel_class_id])
+        conf = float(class_scores[best_cls])
         if conf < score_threshold:
             continue
 
@@ -246,11 +284,39 @@ def decode_yolo_output(
             cx - half_w, cy - half_h, cx + half_w, cy + half_h,
             orig_w, orig_h, scale, pad_x, pad_y,
         )
-        if rect is not None:
-            rects.append(rect)
-            scores.append(conf)
+        if rect is None:
+            continue
+        if is_panel:
+            panel_rects.append(rect)
+            panel_scores.append(conf)
+        else:
+            text_rects.append(rect)
+            text_scores.append(conf)
 
-    return rects, scores
+    return YoloDetections(panel_rects, panel_scores, text_rects, text_scores)
+
+
+def decode_yolo_output(
+    raw_output: np.ndarray,
+    orig_w: int,
+    orig_h: int,
+    scale: float,
+    pad: tuple[int, int],
+    score_threshold: float,
+    panel_class_id: int = PANEL_CLASS_ID,
+) -> tuple[list[Rect], list[float]]:
+    """Decode raw YOLOv8/v11 (1, 4+C, N) or NMS-exported (1, N, 6) ONNX output."""
+    det = decode_yolo_detections(
+        raw_output,
+        orig_w=orig_w,
+        orig_h=orig_h,
+        scale=scale,
+        pad=pad,
+        score_threshold=score_threshold,
+        panel_class_id=panel_class_id,
+        text_class_id=None,
+    )
+    return det.panel_rects, det.panel_scores
 
 
 class OnnxYoloBackend:
@@ -261,7 +327,10 @@ class OnnxYoloBackend:
     def __init__(self, config: DetectorConfig) -> None:
         self._config = config
         self._lock = threading.Lock()
-        self._model_path, self._panel_class_id, default_size = self._resolve_local_model(config)
+        resolved = self._resolve_local_model(config)
+        self._model_path = resolved.model_path
+        self._panel_class_id = resolved.panel_class_id
+        self._text_class_id = resolved.text_class_id
 
         ort = _import_onnxruntime()
         providers = select_ort_providers(config.device, ort.get_available_providers())
@@ -269,21 +338,31 @@ class OnnxYoloBackend:
 
         input_meta = self._session.get_inputs()[0]
         self._input_name: str = input_meta.name
-        self._input_size: int = self._resolve_input_size(input_meta.shape, default_size)
+        self._input_size: int = self._resolve_input_size(input_meta.shape, resolved.input_size)
 
     @staticmethod
-    def _resolve_local_model(config: DetectorConfig) -> tuple[Path, int, int]:
+    def _resolve_local_model(config: DetectorConfig) -> _ResolvedOnnxModel:
         if config.model_path is not None:
             if not config.model_path.is_file():
                 raise FileNotFoundError(f"ONNX model file not found: {config.model_path}")
-            return config.model_path, PANEL_CLASS_ID, DEFAULT_INPUT_SIZE
+            return _ResolvedOnnxModel(
+                model_path=config.model_path,
+                panel_class_id=PANEL_CLASS_ID,
+                text_class_id=None,
+                input_size=DEFAULT_INPUT_SIZE,
+            )
 
         raw_spec = config.model_id or DEFAULT_ONNX_MODEL_KEY
         local_path, model_key = resolve_model_spec(raw_spec)
         if local_path is not None:
             if not local_path.is_file():
                 raise FileNotFoundError(f"ONNX model file not found: {local_path}")
-            return local_path, PANEL_CLASS_ID, DEFAULT_INPUT_SIZE
+            return _ResolvedOnnxModel(
+                model_path=local_path,
+                panel_class_id=PANEL_CLASS_ID,
+                text_class_id=None,
+                input_size=DEFAULT_INPUT_SIZE,
+            )
 
         assert model_key is not None
         spec = get_model_spec(model_key)
@@ -293,7 +372,12 @@ class OnnxYoloBackend:
                 f"ONNX model '{spec.key}' is not cached at {cached_path}. "
                 f"Fetch it first with: manga2kindle models fetch {spec.key}"
             )
-        return cached_path, spec.panel_class_id, spec.input_size
+        return _ResolvedOnnxModel(
+            model_path=cached_path,
+            panel_class_id=spec.panel_class_id,
+            text_class_id=spec.text_class_id,
+            input_size=spec.input_size,
+        )
 
     @staticmethod
     def _resolve_input_size(shape: Sequence[Any], fallback: int) -> int:
@@ -311,7 +395,10 @@ class OnnxYoloBackend:
             outputs = self._session.run(None, {self._input_name: tensor})
 
         raw_output = np.asarray(outputs[0])
-        rects, scores = decode_yolo_output(
+        active_text_class_id = (
+            self._text_class_id if self._config.merge_bridged_panels else None
+        )
+        det = decode_yolo_detections(
             raw_output,
             orig_w=orig_w,
             orig_h=orig_h,
@@ -319,26 +406,39 @@ class OnnxYoloBackend:
             pad=pad,
             score_threshold=self._config.score_threshold,
             panel_class_id=self._panel_class_id,
+            text_class_id=active_text_class_id,
         )
 
-        surviving = nms_and_prune_indices(
-            rects,
+        pruned_text_rects = (
+            nms_and_prune(
+                det.text_rects,
+                iou_threshold=self._config.iou_threshold,
+                containment_threshold=self._config.containment_threshold,
+                scores=det.text_scores,
+            )
+            if self._config.merge_bridged_panels and det.text_rects
+            else []
+        )
+        if pruned_text_rects:
+            pruned_text_rects = expand_text_boxes_to_bubbles(image, pruned_text_rects)
+
+        panels, kept_scores = finalize_panel_boxes(
+            det.panel_rects,
+            orig_w,
+            orig_h,
+            text_boxes=pruned_text_rects,
+            scores=det.panel_scores,
             iou_threshold=self._config.iou_threshold,
             containment_threshold=self._config.containment_threshold,
-            scores=scores,
+            padding=self._config.padding,
+            bleed_margin=DEFAULT_BLEED_MARGIN,
+            preserve_order=False,
+            merge_bridged_panels=self._config.merge_bridged_panels,
+            text_bridge_overlap=self._config.text_bridge_overlap,
+            panel_overlap_threshold=self._config.panel_overlap_threshold,
+            max_merged_area_ratio=self._config.max_merged_area_ratio,
+            min_fill_ratio=self._config.min_fill_ratio,
         )
-
-        panels = [
-            pad_and_clamp(
-                rects[idx],
-                orig_w,
-                orig_h,
-                padding=self._config.padding,
-                bleed_margin=DEFAULT_BLEED_MARGIN,
-            )
-            for idx in surviving
-        ]
-        kept_scores = [scores[idx] for idx in surviving]
 
         return DetectionResult(
             panels=panels,

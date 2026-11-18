@@ -16,6 +16,7 @@ DEFAULT_ONNX_MODEL_KEY = "manga109-yolo-s"
 MANGA109_YOLO_REPO_ID = "deepghs/manga109_yolo"
 MANGA109_YOLO_REVISION = "6b5730a9f1f34581b87468f2c609e3269a9faccf"
 MANGA109_FRAME_CLASS_ID = 2  # labels.json: ["body", "face", "frame", "text"]
+MANGA109_TEXT_CLASS_ID = 3
 
 DEFAULT_MAGI_MODEL_KEY = "magiv3"
 MAGIV3_REPO_ID = "ragavsachdeva/magiv3"
@@ -49,6 +50,7 @@ class ModelSpec:
     source_url: str
     license_notice: str
     input_size: int = 640
+    text_class_id: int | None = None
 
 
 def _hf_resolve_url(repo_id: str, revision: str, filename: str) -> str:
@@ -70,6 +72,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         license_notice=_MANGA109_LICENSE_NOTICE,
         input_size=640,
+        text_class_id=MANGA109_TEXT_CLASS_ID,
     ),
     "manga109-yolo-n": ModelSpec(
         key="manga109-yolo-n",
@@ -85,6 +88,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         license_notice=_MANGA109_LICENSE_NOTICE,
         input_size=640,
+        text_class_id=MANGA109_TEXT_CLASS_ID,
     ),
 }
 

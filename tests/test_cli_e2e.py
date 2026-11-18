@@ -1052,3 +1052,78 @@ class TestConvertCliIntegration:
             text=True,
             check=True,
         )
+
+
+def test_cli_convert_and_preview_panels_merge_panels_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cbz_path = _make_cbz(tmp_path / "merge_flag.cbz", num_pages=1)
+    captured_convert: list[ConversionConfig] = []
+    captured_preview: list[DetectorConfig] = []
+
+    def fake_run_single(self, config: ConversionConfig, **_kwargs) -> Path:
+        captured_convert.append(config)
+        return config.output_path
+
+    def fake_preview(self, **kwargs):
+        captured_preview.append(kwargs["detector_config"])
+        return []
+
+    monkeypatch.setattr(ConversionPipeline, "run_single", fake_run_single)
+    monkeypatch.setattr(ConversionPipeline, "preview_panels", fake_preview)
+
+    # convert defaults to merge_bridged_panels=True
+    res1 = runner.invoke(
+        app,
+        ["convert", "-i", str(cbz_path), "-o", str(tmp_path / "out1.kfx"), "--no-kcc"],
+    )
+    assert res1.exit_code == 0, res1.output
+    assert captured_convert[-1].detector.merge_bridged_panels is True
+
+    # convert --preview-only --no-merge-panels sets merge_bridged_panels=False
+    res2 = runner.invoke(
+        app,
+        [
+            "convert",
+            "-i",
+            str(cbz_path),
+            "--preview-only",
+            "--no-kcc",
+            "--no-merge-panels",
+        ],
+    )
+    assert res2.exit_code == 0, res2.output
+    assert captured_preview[-1].merge_bridged_panels is False
+
+    # preview-panels defaults to True and accepts --no-merge-panels with --compare
+    res3 = runner.invoke(
+        app,
+        [
+            "preview-panels",
+            "-i",
+            str(cbz_path),
+            "--output-dir",
+            str(tmp_path / "p1"),
+            "--no-kcc",
+        ],
+    )
+    assert res3.exit_code == 0, res3.output
+    assert captured_preview[-1].merge_bridged_panels is True
+
+    res4 = runner.invoke(
+        app,
+        [
+            "preview-panels",
+            "-i",
+            str(cbz_path),
+            "--output-dir",
+            str(tmp_path / "p2"),
+            "--no-kcc",
+            "--compare",
+            "contour,onnx",
+            "--no-merge-panels",
+        ],
+    )
+    assert res4.exit_code == 0, res4.output
+    assert captured_preview[-1].merge_bridged_panels is False

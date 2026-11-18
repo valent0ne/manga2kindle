@@ -14,10 +14,12 @@ from manga2kindle.cv.boxes import (
     DEFAULT_BLEED_MARGIN,
     DEFAULT_CONTAINMENT_THRESHOLD,
     DEFAULT_IOU_THRESHOLD,
+    DEFAULT_MAX_MERGED_AREA_RATIO,
+    DEFAULT_MIN_FILL_RATIO,
     DEFAULT_PADDING,
+    DEFAULT_PANEL_OVERLAP_THRESHOLD,
     Rect,
-    nms_and_prune,
-    pad_and_clamp,
+    finalize_panel_boxes,
 )
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.models import DetectorKind
@@ -41,6 +43,10 @@ class ContourBackend:
         containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
         min_ink_ratio: float = _MIN_INK_RATIO,
         max_ink_ratio: float = _MAX_INK_RATIO,
+        merge_bridged_panels: bool = True,
+        panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
+        max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
+        min_fill_ratio: float = DEFAULT_MIN_FILL_RATIO,
     ) -> None:
         self.min_panel_area = min_panel_area
         self.padding = padding
@@ -48,37 +54,53 @@ class ContourBackend:
         self.containment_threshold = containment_threshold
         self.min_ink_ratio = min_ink_ratio
         self.max_ink_ratio = max_ink_ratio
+        self.merge_bridged_panels = merge_bridged_panels
+        self.panel_overlap_threshold = panel_overlap_threshold
+        self.max_merged_area_ratio = max_merged_area_ratio
+        self.min_fill_ratio = min_fill_ratio
 
-    def detect(self, image_path: Path) -> DetectionResult:
-        """Detect panels on a single page; returns panels=[] when no contours survive."""
-        image = read_image_bgr(image_path)
+    def detect_raw_rects(
+        self,
+        image: np.ndarray,
+        *,
+        is_rgb: bool = False,
+    ) -> list[Rect]:
+        """Extract filtered (unpadded, pre-NMS) panel rectangles from an in-memory image."""
         page_h, page_w = image.shape[:2]
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.ndim == 2:
+            gray = image
+        else:
+            code = cv2.COLOR_RGB2GRAY if is_rgb else cv2.COLOR_BGR2GRAY
+            gray = cv2.cvtColor(image, code)
         filtered = cv2.bilateralFilter(gray, 9, 75, 75)
         _, binary = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return self._filter_contours(contours, binary, page_w, page_h)
 
-        candidates = self._filter_contours(contours, binary, page_w, page_h)
-        surviving = nms_and_prune(
+    def detect(self, image_path: Path) -> DetectionResult:
+        """Detect panels on a single page; returns panels=[] when no contours survive."""
+        image = read_image_bgr(image_path)
+        page_h, page_w = image.shape[:2]
+        candidates = self.detect_raw_rects(image, is_rgb=False)
+        panels, _ = finalize_panel_boxes(
             candidates,
+            page_w,
+            page_h,
+            text_boxes=(),
+            scores=None,
             iou_threshold=self.iou_threshold,
             containment_threshold=self.containment_threshold,
+            padding=self.padding,
+            bleed_margin=DEFAULT_BLEED_MARGIN,
+            preserve_order=False,
+            merge_bridged_panels=self.merge_bridged_panels,
+            panel_overlap_threshold=self.panel_overlap_threshold,
+            max_merged_area_ratio=self.max_merged_area_ratio,
+            min_fill_ratio=self.min_fill_ratio,
         )
-
-        panels = [
-            pad_and_clamp(
-                rect,
-                page_w,
-                page_h,
-                padding=self.padding,
-                bleed_margin=DEFAULT_BLEED_MARGIN,
-            )
-            for rect in surviving
-        ]
         return DetectionResult(
             panels=panels,
             ordered=False,
