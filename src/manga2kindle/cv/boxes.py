@@ -323,7 +323,7 @@ def merge_bridged_panel_clusters(
 
     # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
     # outside a single panel (or sit immediately adjacent in the white margin).
-    margin_px = max(8, int(round(0.02 * min(page_width, page_height))))
+    margin_px = max(8, int(round(0.04 * min(page_width, page_height))))
     active_roots = list(cluster_rects.keys())
     for t_box in text_boxes:
         t_area = _box_area(t_box)

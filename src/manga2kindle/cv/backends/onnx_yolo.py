@@ -18,6 +18,7 @@ from manga2kindle.cv.boxes import (
     finalize_panel_boxes,
     nms_and_prune,
 )
+from manga2kindle.cv.bubbles import expand_text_boxes_to_bubbles
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.cv.models_hub import (
     DEFAULT_ONNX_MODEL_KEY,
@@ -418,6 +419,8 @@ class OnnxYoloBackend:
             if self._config.merge_bridged_panels and det.text_rects
             else []
         )
+        if pruned_text_rects:
+            pruned_text_rects = expand_text_boxes_to_bubbles(image, pruned_text_rects)
 
         panels, kept_scores = finalize_panel_boxes(
             det.panel_rects,

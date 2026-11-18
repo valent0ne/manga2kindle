@@ -17,6 +17,7 @@ from manga2kindle.cv.boxes import (
     Rect,
     finalize_panel_boxes,
 )
+from manga2kindle.cv.bubbles import expand_text_boxes_to_bubbles
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.cv.models_hub import (
     DEFAULT_MAGI_MODEL_KEY,
@@ -253,7 +254,13 @@ class MagiBackend:
                 rects.append(rect)
         return rects
 
-    def _parse_page_result(self, page_result: Any, orig_w: int, orig_h: int) -> DetectionResult:
+    def _parse_page_result(
+        self,
+        page_result: Any,
+        orig_w: int,
+        orig_h: int,
+        image: np.ndarray | None = None,
+    ) -> DetectionResult:
         raw_panels = page_result.get(_MAGI_PANELS_KEY) if isinstance(page_result, dict) else None
         if raw_panels is None:
             raw_panels = []
@@ -279,6 +286,8 @@ class MagiBackend:
             if self._config.merge_bridged_panels
             else []
         )
+        if image is not None and text_rects:
+            text_rects = expand_text_boxes_to_bubbles(image, text_rects)
 
         panels, _ = finalize_panel_boxes(
             rects,
@@ -335,6 +344,13 @@ class MagiBackend:
 
             for idx, (orig_w, orig_h) in enumerate(dims):
                 page_result = raw_chunk[idx] if idx < len(raw_chunk) else {}
-                results.append(self._parse_page_result(page_result, orig_w, orig_h))
+                results.append(
+                    self._parse_page_result(
+                        page_result,
+                        orig_w,
+                        orig_h,
+                        image=rgb_images[idx],
+                    )
+                )
 
         return results
