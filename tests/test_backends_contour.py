@@ -74,7 +74,7 @@ def test_detector_enums_and_config_defaults() -> None:
     assert cfg.score_threshold == 0.25
     assert cfg.iou_threshold == 0.4
     assert cfg.containment_threshold == 0.85
-    assert cfg.padding == 0.02
+    assert cfg.padding == 0.04
     assert cfg.min_panel_area == 0.03
     assert cfg.allow_remote_code is False
 

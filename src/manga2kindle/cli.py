@@ -233,7 +233,7 @@ def convert(
     padding: Annotated[
         float,
         typer.Option("--padding", min=0.0, max=0.25, help="Panel bounding-box padding ratio."),
-    ] = 0.02,
+    ] = 0.04,
     min_panel_area: Annotated[
         float,
         typer.Option("--min-panel-area", min=0.01, max=0.50, help="Minimum panel area ratio."),
@@ -549,7 +549,7 @@ def preview_panels(
     padding: Annotated[
         float,
         typer.Option("--padding", min=0.0, max=0.25, help="Panel bounding-box padding ratio."),
-    ] = 0.02,
+    ] = 0.04,
     min_panel_area: Annotated[
         float,
         typer.Option("--min-panel-area", min=0.01, max=0.50, help="Minimum panel area ratio."),
