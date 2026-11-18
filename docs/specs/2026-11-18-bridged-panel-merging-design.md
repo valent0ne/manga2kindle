@@ -77,9 +77,9 @@ Implemented as pure, typed helpers in `src/manga2kindle/cv/boxes.py` using `@dat
 - `member_indices: tuple[int, ...]` (sorted ascending)
 
 Constants in `src/manga2kindle/cv/boxes.py`:
-- `DEFAULT_TEXT_BRIDGE_OVERLAP = 0.15`
+- `DEFAULT_TEXT_BRIDGE_OVERLAP = 0.05`
 - `DEFAULT_PANEL_OVERLAP_THRESHOLD = 0.25`
-- `DEFAULT_MAX_MERGED_AREA_RATIO = 0.65`
+- `DEFAULT_MAX_MERGED_AREA_RATIO = 0.70`
 - `DEFAULT_MIN_FILL_RATIO = 0.55`
 - `DEFAULT_MIN_TEXT_AREA_RATIO = 0.0005`
 
@@ -98,7 +98,7 @@ Constants in `src/manga2kindle/cv/boxes.py`:
    - Compute `union_rect` of clusters `root(i)` and `root(j)` and `union_area = union_rect.w * union_rect.h`.
    - **Area-cap guardrail:** Reject if `union_area / page_area > max_merged_area_ratio`.
    - **Dead-space / L-shape guardrail:** Let `sum_member_areas` be the sum of individual `boxes[m]` areas in the combined cluster. Reject if `sum_member_areas / union_area < min_fill_ratio` (prevents diagonal/L-shaped panels from creating a huge empty bounding box).
-   - **Engulfment guardrail:** Reject if `union_rect` would contain any unmerged panel `k` outside the two clusters with `compute_containment(union_rect, boxes[k]) >= containment_threshold`.
+   - **Engulfment absorption:** If `union_rect` contains any unmerged panel `k` outside the two clusters with `compute_containment(union_rect, boxes[k]) >= containment_threshold`, absorb `k`'s cluster into the merge set (expanding `union_rect` iteratively) before checking `max_merged_area_ratio` and `min_fill_ratio`. This preserves bridged L/corner layouts without creating nested duplicate panels.
 3. **Order-Preserving Output:**
    - Each surviving cluster emits `MergedCluster(rect=union_rect, member_indices=tuple(sorted(members)))`.
    - Clusters are sorted by `member_indices[0]` so `MagiBackend` (`ordered=True`) preserves its native reading order seamlessly.

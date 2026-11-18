@@ -284,29 +284,42 @@ def merge_bridged_panel_clusters(
         if root_a == root_b:
             continue
 
+        roots_to_merge = {root_a, root_b}
         union_rect = _union_rect(cluster_rects[root_a], cluster_rects[root_b])
+
+        # Absorb any external cluster engulfed by the merged bounding box so we
+        # preserve bridged layouts without creating nested duplicate panels.
+        while True:
+            engulfed_roots = {
+                _find(k)
+                for k in valid_indices
+                if _find(k) not in roots_to_merge
+                and compute_containment(union_rect, boxes[k]) >= containment_threshold
+            }
+            if not engulfed_roots:
+                break
+            roots_to_merge.update(engulfed_roots)
+            for eroot in engulfed_roots:
+                union_rect = _union_rect(union_rect, cluster_rects[eroot])
+
         union_area = _box_area(union_rect)
         if (union_area / page_area) > max_merged_area_ratio:
             continue
 
-        combined_area = cluster_member_areas[root_a] + cluster_member_areas[root_b]
+        combined_area = sum(cluster_member_areas[r] for r in roots_to_merge)
         if union_area <= 0 or (combined_area / union_area) < min_fill_ratio:
             continue
 
-        merged_set = set(cluster_members[root_a]) | set(cluster_members[root_b])
-        if any(
-            k not in merged_set
-            and compute_containment(union_rect, boxes[k]) >= containment_threshold
-            for k in valid_indices
-        ):
-            continue
+        for other_root in roots_to_merge:
+            if other_root == root_a:
+                continue
+            parent[other_root] = root_a
+            cluster_members[root_a].extend(cluster_members.pop(other_root))
+            cluster_rects.pop(other_root)
+            cluster_member_areas.pop(other_root)
 
-        parent[root_b] = root_a
-        cluster_members[root_a].extend(cluster_members.pop(root_b))
         cluster_rects[root_a] = union_rect
         cluster_member_areas[root_a] = combined_area
-        cluster_rects.pop(root_b)
-        cluster_member_areas.pop(root_b)
 
     clusters = [
         MergedCluster(

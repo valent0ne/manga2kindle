@@ -212,15 +212,10 @@ def test_merge_bridged_panel_clusters_rejects_diagonal_dead_space_and_engulfment
     )
     assert len(clusters) == 2
 
-    # Engulfment: two panels whose union fills >= 0.55 and <= 0.65 of page,
-    # but swallows an unrelated third panel inside the gap/union.
+    # Engulfment: two panels whose union fills >= 0.55 and <= max_merged_area_ratio,
+    # absorbing an unrelated third panel inside the gap/union.
     left = (50, 50, 300, 500)     # 150_000
     right = (450, 50, 300, 500)   # 150_000
-    # Union = (50, 50, 700, 500) = 350_000 (35% of 1000x1000); fill = 300_000 / 350_000 = 0.857 >= 0.55
-    # Unrelated panel sits in the gap (360, 100, 80, 300) -> 100% contained in union!
-    unrelated = (360, 100, 80, 300)
-    bridge = (300, 200, 200, 100)  # bridges left and right (50px/200px=25% each), misses unrelated? Wait:
-    # Put unrelated at y=400..500 so bridge at y=100..200 doesn't touch unrelated!
     unrelated = (360, 350, 80, 150)
     bridge = (300, 100, 200, 100)
     clusters_engulf = merge_bridged_panel_clusters(
@@ -229,7 +224,18 @@ def test_merge_bridged_panel_clusters_rejects_diagonal_dead_space_and_engulfment
         page_height=1000,
         text_boxes=[bridge],
     )
-    assert len(clusters_engulf) == 3
+    assert len(clusters_engulf) == 1
+    assert clusters_engulf[0].member_indices == (0, 1, 2)
+
+    # Absorbing an engulfed panel is rejected if the total union exceeds max_merged_area_ratio.
+    clusters_engulf_capped = merge_bridged_panel_clusters(
+        [left, right, unrelated],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[bridge],
+        max_merged_area_ratio=0.30,
+    )
+    assert len(clusters_engulf_capped) == 3
 
 
 def test_merge_bridged_panel_clusters_ordering_and_validation() -> None:
