@@ -112,7 +112,7 @@ class ArchiveExtractor:
             if rarfile.CURRENT_SETUP is None:
                 try:
                     rarfile.tool_setup()
-                except rarfile.RarCannotExec:
+                except (rarfile.RarCannotExec, OSError):
                     pass
 
     @staticmethod
