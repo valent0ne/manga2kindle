@@ -165,6 +165,13 @@ uv run manga2kindle convert -i "Chapter 01.cbz" -o "Chapter 01.kfx" --no-kcc
 uv run manga2kindle convert -i "Chapter 01.cbz" --preview-only
 ```
 
+**Beautifying output filenames and KFX title metadata (and optionally source files):**
+
+```bash
+uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify
+uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify-source
+```
+
 ### 5. Benchmark Panel Detectors (`benchmark`)
 
 Evaluate detection accuracy (`P@50`, `R@50`, `P@75`, `R@75`, `mIoU`, nested duplicate rate, exact count match), reading-order metrics (`PairAcc`, `Kendall's tau`), latency (`ms/pg`), and memory (`RAM`/`VRAM`) against **PopManga** (defaults to `rtl`), **CoMix** (defaults to `ltr`), or a local JSON/COCO dataset:
@@ -205,6 +212,8 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `--allow-remote-code` | `false` | Allow executing remote model code (required to enable `magi`) |
 | `--preview-only` | `false` | Render panel preview PNGs and exit without compiling `.kpf`/`.kfx` |
 | `--skip-existing` | `false` | Skip conversion if the output `.kfx` file already exists |
+| `--beautify` | `false` | Strip release tags from the output `.kfx` filename and KFX title metadata |
+| `--beautify-source` | `false` | Rename source `.cbz`/`.cbr` file(s) in place and beautify output `.kfx` and metadata |
 | `--no-kcc` | `false` | Use pure-Pillow E-Ink preprocessing instead of `kcc-c2e` |
 | `--keep-temp` | `false` | Keep temporary staging and intermediate `.kpf` directories |
 | `-w, --workers` | CPU count | Parallel worker threads |

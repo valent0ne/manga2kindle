@@ -330,9 +330,8 @@ class TestKfxCompilerIntegration:
                 str(calibre_debug),
                 "-c",
                 (
-                    "import os, sys; from calibre.utils.config import config_dir; "
-                    "sys.path.insert(0, os.path.join(config_dir, 'plugins', 'KFX Output.zip')); "
-                    "from kfxlib.yj_book import YJ_Book; "
+                    "import calibre.customize.ui; "
+                    "from calibre_plugins.kfx_output.kfxlib.yj_book import YJ_Book; "
                     f"b = YJ_Book({str(kfx_path)!r}); b.decode_book(); b.check_consistency(); "
                     "st = [f for f in b.fragments if f.ftype == '$157']; "
                     "sl = [f for f in b.fragments if f.ftype == '$259']; "

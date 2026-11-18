@@ -10,6 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from manga2kindle.beautify import beautify_name, beautify_source_file
 from manga2kindle.compiler.kfx import KfxCompilationError, KfxCompiler
 from manga2kindle.cv.backends import BackendRegistry
 from manga2kindle.cv.preview import PanelPreviewRenderer
@@ -94,12 +95,14 @@ class ConversionPipeline:
         return False
 
     @staticmethod
-    def resolve_input_name(input_path: Path) -> str:
+    def resolve_input_name(input_path: Path, *, beautify: bool = False) -> str:
         """Return a clean human-readable base name for an archive file or directory."""
         resolved = input_path.resolve()
         if input_path.is_dir() or resolved.is_dir():
-            return resolved.name or "manga"
-        return resolved.stem or resolved.name or "manga"
+            raw_name = resolved.name or "manga"
+        else:
+            raw_name = resolved.stem or resolved.name or "manga"
+        return beautify_name(raw_name) if beautify else raw_name
 
     def is_batch_input(self, input_path: Path) -> bool:
         """Return True if input_path is a directory of CBZ/CBR archives, False for single input."""
@@ -151,9 +154,15 @@ class ConversionPipeline:
         return batch_workers, per_book_workers
 
     @classmethod
-    def resolve_single_output(cls, input_path: Path, output_path: Path | None) -> Path:
+    def resolve_single_output(
+        cls,
+        input_path: Path,
+        output_path: Path | None,
+        *,
+        beautify: bool = False,
+    ) -> Path:
         """Resolve exact output .kfx path for a single archive or image folder."""
-        base_name = cls.resolve_input_name(input_path)
+        base_name = cls.resolve_input_name(input_path, beautify=beautify)
         if output_path is None:
             return input_path.resolve().parent / f"{base_name}.kfx"
         if output_path.suffix.lower() == ".kfx":
@@ -287,8 +296,17 @@ class ConversionPipeline:
     ) -> Path:
         """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
         self.last_single_skipped = False
-        input_name = self.resolve_input_name(config.input_path)
-        output_kfx = self.resolve_single_output(config.input_path, config.output_path)
+        if config.beautify_source and config.input_path.is_file():
+            renamed_input = beautify_source_file(config.input_path)
+            config = config.model_copy(update={"input_path": renamed_input})
+
+        effective_beautify = config.effective_beautify
+        input_name = self.resolve_input_name(config.input_path, beautify=effective_beautify)
+        output_kfx = self.resolve_single_output(
+            config.input_path,
+            config.output_path,
+            beautify=effective_beautify,
+        )
         if config.skip_existing and output_kfx.is_file():
             logger.info("Skipping existing output: %s", output_kfx)
             self.last_single_skipped = True
@@ -327,10 +345,13 @@ class ConversionPipeline:
             raise ValueError(f"No .cbz or .cbr archives found in {config.input_path}")
 
         out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
+        effective_beautify = config.effective_beautify
         seen_names: dict[str, Path] = {}
-        targets: list[tuple[Path, Path]] = []
+        seen_source_names: dict[str, Path] = {}
+        planned: list[tuple[Path, str, Path]] = []
         for archive_path in archives:
-            out_kfx = out_dir / f"{archive_path.stem}.kfx"
+            target_stem = beautify_name(archive_path.stem) if effective_beautify else archive_path.stem
+            out_kfx = out_dir / f"{target_stem}.kfx"
             key = out_kfx.name.lower()
             if key in seen_names:
                 raise ValueError(
@@ -338,19 +359,35 @@ class ConversionPipeline:
                     f"'{seen_names[key].name}' and '{archive_path.name}'"
                 )
             seen_names[key] = archive_path
-            targets.append((archive_path, out_kfx))
+            if config.beautify_source:
+                target_src_name = f"{target_stem}{archive_path.suffix}"
+                src_key = target_src_name.lower()
+                if src_key in seen_source_names:
+                    raise ValueError(
+                        f"Batch source filename collision for '{target_src_name}': "
+                        f"'{seen_source_names[src_key].name}' and '{archive_path.name}'"
+                    )
+                seen_source_names[src_key] = archive_path
+            planned.append((archive_path, target_stem, out_kfx))
+
+        targets: list[tuple[Path, str, Path]] = []
+        for archive_path, target_stem, out_kfx in planned:
+            resolved_archive = (
+                beautify_source_file(archive_path) if config.beautify_source else archive_path
+            )
+            targets.append((resolved_archive, target_stem, out_kfx))
 
         self.last_batch_errors = []
         self.last_batch_skipped = []
-        pending_targets: list[tuple[Path, Path]] = []
-        for archive_path, out_kfx in targets:
+        pending_targets: list[tuple[Path, str, Path]] = []
+        for archive_path, target_stem, out_kfx in targets:
             if config.skip_existing and out_kfx.is_file():
                 logger.info("Skipping existing output: %s", out_kfx)
                 self.last_batch_skipped.append(out_kfx)
                 if on_skip is not None:
                     on_skip(archive_path, out_kfx)
             else:
-                pending_targets.append((archive_path, out_kfx))
+                pending_targets.append((archive_path, target_stem, out_kfx))
 
         if not pending_targets:
             return []
@@ -374,7 +411,7 @@ class ConversionPipeline:
         )
 
         def _convert_one(
-            archive_path: Path, target_kfx: Path
+            archive_path: Path, target_stem: str, target_kfx: Path
         ) -> tuple[Path, Path | None, Exception | None]:
             book_config = config.model_copy(
                 update={
@@ -387,11 +424,11 @@ class ConversionPipeline:
             try:
                 out_kfx = self._convert_single(
                     book_config,
-                    input_name=archive_path.stem,
+                    input_name=target_stem,
                     output_kfx=target_kfx,
                     calibre_path=calibre_path,
                     registry=batch_registry,
-                    title=archive_path.stem,
+                    title=target_stem,
                     author=author,
                 )
                 return archive_path, out_kfx, None
@@ -402,10 +439,10 @@ class ConversionPipeline:
         if batch_workers > 1:
             with ThreadPoolExecutor(max_workers=batch_workers) as executor:
                 outcomes = list(
-                    executor.map(lambda item: _convert_one(item[0], item[1]), pending_targets)
+                    executor.map(lambda item: _convert_one(item[0], item[1], item[2]), pending_targets)
                 )
         else:
-            outcomes = [_convert_one(arch, tgt) for arch, tgt in pending_targets]
+            outcomes = [_convert_one(arch, stem, tgt) for arch, stem, tgt in pending_targets]
 
         succeeded: list[Path] = []
         errors: list[tuple[Path, Exception]] = []
@@ -594,20 +631,33 @@ class ConversionPipeline:
             raise ValueError(f"No .cbz or .cbr archives found in {config.input_path}")
 
         out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
+        seen_preview_dirs: dict[str, Path] = {}
+        preview_targets: list[tuple[Path, Path]] = []
+        for archive_path in archives:
+            stem = beautify_name(archive_path.stem) if config.effective_beautify else archive_path.stem
+            preview_dir = out_dir / f"{stem}_preview"
+            key = preview_dir.name.lower()
+            if key in seen_preview_dirs:
+                raise ValueError(
+                    f"Batch preview directory collision for '{preview_dir.name}': "
+                    f"'{seen_preview_dirs[key].name}' and '{archive_path.name}'"
+                )
+            seen_preview_dirs[key] = archive_path
+            preview_targets.append((archive_path, preview_dir))
+
         batch_registry = self._resolve_registry(config.detector)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
         batch_workers, per_book_workers = self._resolve_batch_workers(
             config.workers,
-            len(archives),
+            len(preview_targets),
             no_kcc=config.no_kcc,
             detector_kind=config.detector.kind,
             batch_workers_override=config.batch_workers,
         )
 
-        def _preview_one(archive_path: Path) -> tuple[Path, Path | None, Exception | None]:
-            preview_dir = out_dir / f"{archive_path.stem}_preview"
+        def _preview_one(archive_path: Path, preview_dir: Path) -> tuple[Path, Path | None, Exception | None]:
             try:
                 self.preview_panels(
                     input_path=archive_path,
@@ -631,9 +681,11 @@ class ConversionPipeline:
 
         if batch_workers > 1:
             with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                outcomes = list(executor.map(_preview_one, archives))
+                outcomes = list(
+                    executor.map(lambda item: _preview_one(item[0], item[1]), preview_targets)
+                )
         else:
-            outcomes = [_preview_one(arch) for arch in archives]
+            outcomes = [_preview_one(arch, pdir) for arch, pdir in preview_targets]
 
         succeeded_dirs: list[Path] = []
         errors: list[tuple[Path, Exception]] = []
