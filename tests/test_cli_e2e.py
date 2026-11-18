@@ -947,6 +947,28 @@ class TestConvertCliMocked:
         assert (tmp_path / "Witch Hat Atelier v12 (2024).cbz").is_file()
         assert not cbz_path.exists()
 
+    def test_convert_cli_preview_only_beautify(self, tmp_path: Path) -> None:
+        cbz_path = _make_cbz(
+            tmp_path / "Frieren - Beyond Journey's End v01 (2021) (Digital) (1r0n) (f).cbz",
+            num_pages=1,
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--preview-only",
+                "--no-kcc",
+                "--beautify",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        expected_preview_dir = tmp_path / "Frieren - Beyond Journey's End v01 (2021)_preview"
+        assert expected_preview_dir.is_dir()
+        assert list(expected_preview_dir.glob("*.png"))
+
 
 class TestConvertCliIntegration:
     """Live E2E test with real calibre-debug + KFX Output when installed."""

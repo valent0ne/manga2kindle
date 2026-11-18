@@ -630,21 +630,33 @@ class ConversionPipeline:
             raise ValueError(f"No .cbz or .cbr archives found in {config.input_path}")
 
         out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
+        seen_preview_dirs: dict[str, Path] = {}
+        preview_targets: list[tuple[Path, Path]] = []
+        for archive_path in archives:
+            stem = beautify_name(archive_path.stem) if config.effective_beautify else archive_path.stem
+            preview_dir = out_dir / f"{stem}_preview"
+            key = preview_dir.name.lower()
+            if key in seen_preview_dirs:
+                raise ValueError(
+                    f"Batch preview directory collision for '{preview_dir.name}': "
+                    f"'{seen_preview_dirs[key].name}' and '{archive_path.name}'"
+                )
+            seen_preview_dirs[key] = archive_path
+            preview_targets.append((archive_path, preview_dir))
+
         batch_registry = self._resolve_registry(config.detector)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_batch_errors = []
 
         batch_workers, per_book_workers = self._resolve_batch_workers(
             config.workers,
-            len(archives),
+            len(preview_targets),
             no_kcc=config.no_kcc,
             detector_kind=config.detector.kind,
             batch_workers_override=config.batch_workers,
         )
 
-        def _preview_one(archive_path: Path) -> tuple[Path, Path | None, Exception | None]:
-            stem = beautify_name(archive_path.stem) if config.effective_beautify else archive_path.stem
-            preview_dir = out_dir / f"{stem}_preview"
+        def _preview_one(archive_path: Path, preview_dir: Path) -> tuple[Path, Path | None, Exception | None]:
             try:
                 self.preview_panels(
                     input_path=archive_path,
@@ -668,9 +680,11 @@ class ConversionPipeline:
 
         if batch_workers > 1:
             with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                outcomes = list(executor.map(_preview_one, archives))
+                outcomes = list(
+                    executor.map(lambda item: _preview_one(item[0], item[1]), preview_targets)
+                )
         else:
-            outcomes = [_preview_one(arch) for arch in archives]
+            outcomes = [_preview_one(arch, pdir) for arch, pdir in preview_targets]
 
         succeeded_dirs: list[Path] = []
         errors: list[tuple[Path, Exception]] = []
