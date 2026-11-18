@@ -16,9 +16,9 @@ from manga2kindle.cv.backends.contour import ContourBackend
 from manga2kindle.cv.boxes import (
     DEFAULT_BLEED_MARGIN,
     Rect,
-    _intersection_area,
     compute_containment,
     finalize_panel_boxes,
+    intersection_area,
 )
 from manga2kindle.cv.bubbles import expand_text_boxes_to_bubbles
 from manga2kindle.cv.io import read_image_bgr
@@ -37,6 +37,8 @@ _BYTES_PER_GIB = 1024**3
 _MAGI_PANELS_KEY = "panels"
 _MAGI_TEXTS_KEY = "texts"
 _MAGI_ESSENTIAL_TEXT_KEY = "is_essential_text"
+_CONTOUR_RECOVERY_OVERLAP_THRESHOLD = 0.15
+_ROW_ALIGNMENT_Y_RATIO = 0.5
 
 
 def resolve_magi_batch_size(device: str, torch_mod: Any, configured: int | None) -> int:
@@ -274,8 +276,8 @@ class MagiBackend:
             if c_area <= 0:
                 continue
             overlaps_existing = any(
-                compute_containment(c_rect, m_rect) >= 0.15
-                or (_intersection_area(c_rect, m_rect) / c_area) >= 0.15
+                compute_containment(c_rect, m_rect) >= _CONTOUR_RECOVERY_OVERLAP_THRESHOLD
+                or (intersection_area(c_rect, m_rect) / c_area) >= _CONTOUR_RECOVERY_OVERLAP_THRESHOLD
                 for m_rect in merged
             )
             if overlaps_existing:
@@ -288,8 +290,9 @@ class MagiBackend:
             for idx, m_rect in enumerate(merged):
                 m_cy = m_rect[1] + m_rect[3] / 2.0
                 m_cx = m_rect[0] + m_rect[2] / 2.0
-                if c_cy < m_cy - 0.5 * min(c_rect[3], m_rect[3]) or (
-                    abs(c_cy - m_cy) <= 0.5 * min(c_rect[3], m_rect[3]) and c_cx > m_cx
+                row_tol = _ROW_ALIGNMENT_Y_RATIO * min(c_rect[3], m_rect[3])
+                if c_cy < m_cy - row_tol or (
+                    abs(c_cy - m_cy) <= row_tol and c_cx > m_cx
                 ):
                     insert_idx = idx
                     break
@@ -332,7 +335,7 @@ class MagiBackend:
             else []
         )
         if image is not None and text_rects:
-            text_rects = expand_text_boxes_to_bubbles(image, text_rects)
+            text_rects = expand_text_boxes_to_bubbles(image, text_rects, is_rgb=True)
 
         panels, _ = finalize_panel_boxes(
             rects,

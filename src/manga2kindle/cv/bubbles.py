@@ -19,6 +19,8 @@ _BORDER_PAD_PX = 2
 def expand_text_boxes_to_bubbles(
     image: np.ndarray,
     text_boxes: Sequence[Rect],
+    *,
+    is_rgb: bool = False,
 ) -> list[Rect]:
     """Expand tight text bounding boxes to their enclosing white bubble/narration box.
 
@@ -33,7 +35,11 @@ def expand_text_boxes_to_bubbles(
 
     page_h, page_w = image.shape[:2]
     page_area = page_w * page_h
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    if image.ndim == 3:
+        code = cv2.COLOR_RGB2GRAY if is_rgb else cv2.COLOR_BGR2GRAY
+        gray = cv2.cvtColor(image, code)
+    else:
+        gray = image
     white_mask = (gray >= _WHITE_THRESHOLD).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=4)
     if num_labels <= 1:

@@ -306,6 +306,50 @@ class TestMagiBackendInference:
         assert len(results[0].panels) == 1
         assert results[1].panels == []
 
+    def test_detect_recovers_uncovered_contour_panel(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        page_path = tmp_path / "missed_panel.png"
+        # White page with a clear bordered panel in the middle-left (y=420..620)
+        # that Magi misses completely.
+        img = np.full((1000, 800, 3), 255, dtype=np.uint8)
+        cv2.rectangle(img, (50, 420), (350, 620), (0, 0, 0), thickness=6)
+        cv2.circle(img, (200, 520), 40, (0, 0, 0), thickness=4)
+        assert cv2.imwrite(str(page_path), img)
+
+        mock_result = {
+            "panels": [
+                [50.0, 50.0, 750.0, 380.0],    # top panel
+                [50.0, 660.0, 750.0, 950.0],   # bottom panel
+            ],
+            "texts": [],
+        }
+        fake_torch, fake_transformers, _, _, _ = _build_mock_torch_and_transformers(
+            cuda_available=False,
+            results_per_call=[mock_result],
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                allow_remote_code=True,
+                merge_bridged_panels=True,
+            )
+        )
+        result = backend.detect(page_path)
+        assert len(result.panels) == 3
+        assert result.panels[0].y < result.panels[1].y < result.panels[2].y
+        assert 40 <= result.panels[1].x <= 60
+        assert 410 <= result.panels[1].y <= 430
+
     def test_detect_merges_text_bridged_panels_and_preserves_reading_order(
         self,
         tmp_path: Path,

@@ -21,6 +21,16 @@ DEFAULT_CONTAINMENT_THRESHOLD = 0.85
 DEFAULT_PADDING = 0.04
 DEFAULT_BLEED_MARGIN = 2
 
+_TINY_PANEL_MAX_AREA_RATIO = 0.04
+_TINY_PANEL_WIDTH_RATIO = 3.0
+_SAME_ROW_MIN_Y_OVERLAP = 0.70
+_SAME_ROW_MAX_X_GAP_RATIO = 0.02
+_SAME_ROW_ADJACENCY_WEIGHT = 0.20
+
+_MARGIN_HALO_MIN_PX = 8
+_MARGIN_HALO_PAGE_RATIO = 0.04
+_DOMINANT_CLUSTER_MIN_TEXT_FRAC = 0.65
+
 
 @dataclass(frozen=True)
 class MergedCluster:
@@ -35,7 +45,7 @@ def _box_area(box: Rect) -> int:
     return max(0, box[2]) * max(0, box[3])
 
 
-def _intersection_area(box_a: Rect, box_b: Rect) -> int:
+def intersection_area(box_a: Rect, box_b: Rect) -> int:
     """Return pixel area of the overlap between two (x, y, w, h) rectangles."""
     ax, ay, aw, ah = box_a
     bx, by, bw, bh = box_b
@@ -50,6 +60,9 @@ def _intersection_area(box_a: Rect, box_b: Rect) -> int:
     inter_w = max(0, inter_x2 - inter_x1)
     inter_h = max(0, inter_y2 - inter_y1)
     return inter_w * inter_h
+
+
+_intersection_area = intersection_area
 
 
 def compute_iou(box_a: Rect, box_b: Rect) -> float:
@@ -271,16 +284,16 @@ def merge_bridged_panel_clusters(
             idx_b = valid_indices[pos_b]
             bx, by, bw, bh = boxes[idx_b]
             area_b = bw * bh
-            if (min(area_a, area_b) / page_area) >= 0.04:
+            if (min(area_a, area_b) / page_area) >= _TINY_PANEL_MAX_AREA_RATIO:
                 continue
-            if max(aw, bw) < 3.0 * min(aw, bw):
+            if max(aw, bw) < _TINY_PANEL_WIDTH_RATIO * min(aw, bw):
                 continue
             y_inter = max(0, min(ay + ah, by + bh) - max(ay, by))
-            if y_inter / max(ah, bh) < 0.70:
+            if y_inter / max(ah, bh) < _SAME_ROW_MIN_Y_OVERLAP:
                 continue
             x_gap = max(0, max(ax, bx) - min(ax + aw, bx + bw))
-            if x_gap <= 0.02 * page_width:
-                _record_edge(idx_a, idx_b, 0.20)
+            if x_gap <= _SAME_ROW_MAX_X_GAP_RATIO * page_width:
+                _record_edge(idx_a, idx_b, _SAME_ROW_ADJACENCY_WEIGHT)
 
     sorted_edges = sorted(
         edge_weights.items(),
@@ -344,7 +357,7 @@ def merge_bridged_panel_clusters(
 
     # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
     # outside a single panel (or sit immediately adjacent in the white margin).
-    margin_px = max(8, int(round(0.04 * min(page_width, page_height))))
+    margin_px = max(_MARGIN_HALO_MIN_PX, int(round(_MARGIN_HALO_PAGE_RATIO * min(page_width, page_height))))
     active_roots = list(cluster_rects.keys())
     for t_box in text_boxes:
         t_area = _box_area(t_box)
@@ -363,7 +376,7 @@ def merge_bridged_panel_clusters(
                 target_root = only_root
         elif len(direct_matches) >= 2:
             best_root, best_frac = max(direct_matches, key=lambda item: item[1])
-            if 0.65 <= best_frac < 1.0:
+            if _DOMINANT_CLUSTER_MIN_TEXT_FRAC <= best_frac < 1.0:
                 target_root = best_root
         elif not direct_matches:
             prox_matches: list[int] = []
@@ -384,6 +397,8 @@ def merge_bridged_panel_clusters(
             continue
 
         candidate_rect = _union_rect(cluster_rects[target_root], t_box)
+        if (_box_area(candidate_rect) / page_area) > max_merged_area_ratio:
+            continue
         if any(
             other != target_root
             and compute_containment(candidate_rect, cluster_rects[other]) >= containment_threshold

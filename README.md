@@ -209,7 +209,7 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `--detector-model` | `None` | Detector model key, Hugging Face repo ID, or local weights path |
 | `--device` | `auto` | Inference device for neural detectors (`auto`, `cpu`, `cuda`, or `mps`) |
 | `--score-threshold` | `0.25` | Confidence threshold for neural panel detectors (`0.0`–`1.0`) |
-| `--merge-panels / --no-merge-panels` | `true` | Merge adjacent panels bridged by shared dialogue bubbles or substantial overlap (also on `preview-panels`) |
+| `--merge-panels / --no-merge-panels` | `true` | Merge bridged/overlapping panels, expand bubbles & margin text, and recover missed contour panels (also on `preview-panels`) |
 | `--allow-remote-code` | `false` | Allow executing remote model code (required to enable `magi`) |
 | `--preview-only` | `false` | Render panel preview PNGs and exit without compiling `.kpf`/`.kfx` |
 | `--skip-existing` | `false` | Skip conversion if the output `.kfx` file already exists |
