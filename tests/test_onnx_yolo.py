@@ -17,14 +17,18 @@ from manga2kindle.cv.backends.base import DetectionResult, PanelDetectorBackend
 from manga2kindle.cv.backends.onnx_yolo import (
     PANEL_CLASS_ID,
     OnnxYoloBackend,
+    YoloDetections,
+    decode_yolo_detections,
     decode_yolo_output,
     letterbox_image,
     select_ort_providers,
 )
 from manga2kindle.cv.models_hub import (
     DEFAULT_ONNX_MODEL_KEY,
+    MANGA109_TEXT_CLASS_ID,
     ModelSpec,
     fetch_model,
+    get_model_spec,
     is_model_cached,
     list_registered_models,
     resolve_model_spec,
@@ -172,6 +176,93 @@ class TestDecodeYoloOutput:
         assert rects[0][0] == pytest.approx(50, abs=3)
         assert rects[1][0] == pytest.approx(600, abs=3)
 
+    def test_decode_yolo_detections_extracts_panel_and_text_classes(self) -> None:
+        orig_w, orig_h = 1000, 1000
+        image = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+        _, scale, pad = letterbox_image(image, target_size=640)
+
+        p0 = _to_letterbox_coords(50, 50, 450, 450, scale, pad)
+        t0 = _to_letterbox_coords(350, 150, 550, 250, scale, pad)
+
+        # Raw (1, 8, 2)
+        raw = np.zeros((1, 8, 2), dtype=np.float32)
+        for idx, ((x1, y1, x2, y2), cls_id, score) in enumerate(
+            [(p0, PANEL_CLASS_ID, 0.90), (t0, MANGA109_TEXT_CLASS_ID, 0.85)]
+        ):
+            raw[0, 0, idx] = (x1 + x2) / 2.0
+            raw[0, 1, idx] = (y1 + y2) / 2.0
+            raw[0, 2, idx] = x2 - x1
+            raw[0, 3, idx] = y2 - y1
+            raw[0, 4 + cls_id, idx] = score
+
+        det = decode_yolo_detections(
+            raw,
+            orig_w=orig_w,
+            orig_h=orig_h,
+            scale=scale,
+            pad=pad,
+            score_threshold=0.25,
+            panel_class_id=PANEL_CLASS_ID,
+            text_class_id=MANGA109_TEXT_CLASS_ID,
+        )
+        assert isinstance(det, YoloDetections)
+        assert len(det.panel_rects) == 1
+        assert det.panel_scores == pytest.approx([0.90], abs=1e-5)
+        assert len(det.text_rects) == 1
+        assert det.text_scores == pytest.approx([0.85], abs=1e-5)
+
+        # NMS-exported (1, N, 6)
+        nms_raw = np.array(
+            [[[*p0, 0.88, float(PANEL_CLASS_ID)], [*t0, 0.77, float(MANGA109_TEXT_CLASS_ID)]]],
+            dtype=np.float32,
+        )
+        det_nms = decode_yolo_detections(
+            nms_raw,
+            orig_w=orig_w,
+            orig_h=orig_h,
+            scale=scale,
+            pad=pad,
+            score_threshold=0.25,
+            panel_class_id=PANEL_CLASS_ID,
+            text_class_id=MANGA109_TEXT_CLASS_ID,
+        )
+        assert len(det_nms.panel_rects) == 1
+        assert len(det_nms.text_rects) == 1
+        assert det_nms.text_scores == pytest.approx([0.77], abs=1e-5)
+
+        # Exact-boundary 3-class (1, 7, 1) with text_class_id=3 skips text extraction safely
+        raw_3cls = np.zeros((1, 7, 1), dtype=np.float32)
+        raw_3cls[0, 0, 0] = (p0[0] + p0[2]) / 2.0
+        raw_3cls[0, 1, 0] = (p0[1] + p0[3]) / 2.0
+        raw_3cls[0, 2, 0] = p0[2] - p0[0]
+        raw_3cls[0, 3, 0] = p0[3] - p0[1]
+        raw_3cls[0, 4 + PANEL_CLASS_ID, 0] = 0.80
+        det_3cls = decode_yolo_detections(
+            raw_3cls,
+            orig_w=orig_w,
+            orig_h=orig_h,
+            scale=scale,
+            pad=pad,
+            score_threshold=0.25,
+            panel_class_id=PANEL_CLASS_ID,
+            text_class_id=MANGA109_TEXT_CLASS_ID,
+        )
+        assert len(det_3cls.panel_rects) == 1
+        assert det_3cls.text_rects == []
+        assert det_3cls.text_scores == []
+
+        with pytest.raises(ValueError, match="text_class_id"):
+            decode_yolo_detections(
+                raw,
+                orig_w=orig_w,
+                orig_h=orig_h,
+                scale=scale,
+                pad=pad,
+                score_threshold=0.25,
+                panel_class_id=PANEL_CLASS_ID,
+                text_class_id=-1,
+            )
+
 
 class TestSelectOrtProviders:
     def test_auto_priority_order(self) -> None:
@@ -301,6 +392,133 @@ class TestOnnxYoloBackend:
         with pytest.raises(FileNotFoundError):
             OnnxYoloBackend(config)
 
+    def test_registry_model_merges_text_bridged_panels_and_aggregates_max_score(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        orig_w, orig_h = 1000, 1000
+        page_path = _write_blank_page(tmp_path / "bridged.png", orig_w, orig_h)
+        cached_model = tmp_path / "manga109.onnx"
+        cached_model.write_bytes(b"fake-onnx")
+        monkeypatch.setattr(
+            "manga2kindle.cv.backends.onnx_yolo.get_cached_model_path",
+            lambda key: cached_model,
+        )
+
+        _, scale, pad = letterbox_image(
+            np.zeros((orig_h, orig_w, 3), dtype=np.uint8),
+            target_size=640,
+        )
+        left = _to_letterbox_coords(50, 50, 450, 450, scale, pad)
+        right = _to_letterbox_coords(470, 50, 870, 450, scale, pad)
+        text_a = _to_letterbox_coords(350, 150, 550, 250, scale, pad)
+        text_dup = _to_letterbox_coords(352, 152, 548, 248, scale, pad)
+
+        raw = np.zeros((1, 8, 4), dtype=np.float32)
+        entries = [
+            (left, PANEL_CLASS_ID, 0.65),
+            (right, PANEL_CLASS_ID, 0.91),
+            (text_a, MANGA109_TEXT_CLASS_ID, 0.88),
+            (text_dup, MANGA109_TEXT_CLASS_ID, 0.72),
+        ]
+        for idx, ((x1, y1, x2, y2), cls_id, score) in enumerate(entries):
+            raw[0, 0, idx] = (x1 + x2) / 2.0
+            raw[0, 1, idx] = (y1 + y2) / 2.0
+            raw[0, 2, idx] = x2 - x1
+            raw[0, 3, idx] = y2 - y1
+            raw[0, 4 + cls_id, idx] = score
+
+        fake_session = MagicMock()
+        fake_session.get_inputs.return_value = [SimpleNamespace(name="images", shape=[1, 3, 640, 640])]
+        fake_session.run.return_value = [raw]
+        fake_ort = SimpleNamespace(
+            get_available_providers=lambda: ["CPUExecutionProvider"],
+            InferenceSession=MagicMock(return_value=fake_session),
+        )
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+        backend = OnnxYoloBackend(
+            DetectorConfig(
+                kind=DetectorKind.ONNX_YOLO,
+                model_id="manga109-yolo-s",
+                device=DevicePreference.CPU,
+                padding=0.0,
+                merge_bridged_panels=True,
+            )
+        )
+        res = backend.detect(page_path)
+        assert len(res.panels) == 1
+        assert res.scores is not None
+        assert len(res.scores) == 1
+        assert res.scores == pytest.approx([0.91], abs=1e-5)
+
+        # merge_bridged_panels=False keeps panels unmerged
+        backend_unmerged = OnnxYoloBackend(
+            DetectorConfig(
+                kind=DetectorKind.ONNX_YOLO,
+                model_id="manga109-yolo-s",
+                device=DevicePreference.CPU,
+                padding=0.0,
+                merge_bridged_panels=False,
+            )
+        )
+        res_unmerged = backend_unmerged.detect(page_path)
+        assert len(res_unmerged.panels) == 2
+        assert len(res_unmerged.scores or []) == 2
+
+    def test_custom_model_path_skips_text_extraction(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        orig_w, orig_h = 1000, 1000
+        page_path = _write_blank_page(tmp_path / "custom.png", orig_w, orig_h)
+        custom_model = tmp_path / "custom.onnx"
+        custom_model.write_bytes(b"custom-onnx")
+
+        _, scale, pad = letterbox_image(
+            np.zeros((orig_h, orig_w, 3), dtype=np.uint8),
+            target_size=640,
+        )
+        left = _to_letterbox_coords(50, 50, 450, 450, scale, pad)
+        right = _to_letterbox_coords(470, 50, 870, 450, scale, pad)
+        text_box = _to_letterbox_coords(350, 150, 550, 250, scale, pad)
+
+        raw = np.zeros((1, 8, 3), dtype=np.float32)
+        for idx, ((x1, y1, x2, y2), cls_id, score) in enumerate(
+            [
+                (left, PANEL_CLASS_ID, 0.80),
+                (right, PANEL_CLASS_ID, 0.85),
+                (text_box, MANGA109_TEXT_CLASS_ID, 0.90),
+            ]
+        ):
+            raw[0, 0, idx] = (x1 + x2) / 2.0
+            raw[0, 1, idx] = (y1 + y2) / 2.0
+            raw[0, 2, idx] = x2 - x1
+            raw[0, 3, idx] = y2 - y1
+            raw[0, 4 + cls_id, idx] = score
+
+        fake_session = MagicMock()
+        fake_session.get_inputs.return_value = [SimpleNamespace(name="images", shape=[1, 3, 640, 640])]
+        fake_session.run.return_value = [raw]
+        fake_ort = SimpleNamespace(
+            get_available_providers=lambda: ["CPUExecutionProvider"],
+            InferenceSession=MagicMock(return_value=fake_session),
+        )
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+        backend = OnnxYoloBackend(
+            DetectorConfig(
+                kind=DetectorKind.ONNX_YOLO,
+                model_path=custom_model,
+                device=DevicePreference.CPU,
+                padding=0.0,
+            )
+        )
+        res = backend.detect(page_path)
+        assert len(res.panels) == 2
+
 
 class TestModelsHub:
     def test_registered_models_include_license_and_pinned_revision(self) -> None:
@@ -313,6 +531,8 @@ class TestModelsHub:
         assert default_spec.panel_class_id == PANEL_CLASS_ID
         assert "Manga109" in default_spec.license_notice
         assert default_spec.source_url.startswith("https://huggingface.co/")
+        assert default_spec.text_class_id == MANGA109_TEXT_CLASS_ID == 3
+        assert get_model_spec("manga109-yolo-n").text_class_id == MANGA109_TEXT_CLASS_ID
 
     def test_resolve_model_spec_distinguishes_paths_and_repo_ids(self, tmp_path: Path) -> None:
         onnx_file = tmp_path / "custom.onnx"
