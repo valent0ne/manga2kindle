@@ -256,6 +256,24 @@ def test_merge_bridged_panel_clusters_expands_for_gutter_and_margin_text() -> No
     assert clusters[1].rect == p1
 
 
+def test_merge_bridged_panel_clusters_expands_dominant_panel_when_merge_capped() -> None:
+    # Two large panels whose merge is blocked by max_merged_area_ratio,
+    # with a text box 80% in top panel and 20% in bottom panel.
+    top = (50, 50, 900, 600)      # 540_000
+    bottom = (50, 660, 900, 290)  # 261_000; union = 900x900 = 810_000 (> 0.70)
+    protruding = (700, 570, 100, 100)  # y=570..670 -> 80% in top, 10% in bottom
+
+    clusters = merge_bridged_panel_clusters(
+        [top, bottom],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[protruding],
+    )
+    assert len(clusters) == 2
+    assert clusters[0].rect == (50, 50, 900, 620)  # top expanded to y=670
+    assert clusters[1].rect == bottom
+
+
 def test_merge_bridged_panel_clusters_ordering_and_validation() -> None:
     p0 = (500, 50, 400, 400)
     p1 = (50, 50, 300, 300)

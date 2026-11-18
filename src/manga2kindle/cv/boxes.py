@@ -340,6 +340,10 @@ def merge_bridged_panel_clusters(
             only_root, frac = direct_matches[0]
             if frac < 1.0:
                 target_root = only_root
+        elif len(direct_matches) >= 2:
+            best_root, best_frac = max(direct_matches, key=lambda item: item[1])
+            if 0.65 <= best_frac < 1.0:
+                target_root = best_root
         elif not direct_matches:
             prox_matches: list[int] = []
             for r in active_roots:
