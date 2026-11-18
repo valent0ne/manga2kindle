@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from manga2kindle.models import (
+    DEFAULT_PROFILE_NAME,
     ConversionConfig,
     DeviceProfile,
     PageAsset,
@@ -18,6 +19,9 @@ from manga2kindle.platform import PlatformDiscovery, ToolStatus
 
 
 def test_device_profile_presets():
+    assert DEFAULT_PROFILE_NAME == "KPW6"
+    kpw6 = DeviceProfile.from_name("KPW6")
+    assert (kpw6.width, kpw6.height, kpw6.kcc_code) == (1264, 1680, "KPW6")
     kpw5 = DeviceProfile.from_name("KPW5")
     assert (kpw5.width, kpw5.height, kpw5.kcc_code) == (1264, 1680, "KPW5")
     ks = DeviceProfile.from_name("KS")

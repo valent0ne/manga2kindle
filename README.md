@@ -98,7 +98,7 @@ Generate numbered PNG overlays with green panel boxes, `[1]`/`[2]` ordinals, and
 uv run manga2kindle preview-panels \
   -i "Chapter 01.cbz" \
   --output-dir ./preview \
-  -p KPW5 \
+  -p KPW6 \
   -d rtl \
   -s split
 ```
@@ -190,7 +190,7 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | --- | --- | --- |
 | `-i, --input` | *(required)* | Input `.cbz`/`.cbr`, image directory, or batch archive directory |
 | `-o, --output` | `<input.parent>/<name>.kfx` (single) / `<input>` (batch) | Output `.kfx` file or output directory |
-| `-p, --profile` | `KPW5` | Device preset: `KPW5` (1264x1680), `KS` (1860x2480), `OASIS`, or `CUSTOM` |
+| `-p, --profile` | `KPW6` | Device preset: `KPW6` (1264x1680), `KPW5` (1264x1680), `KS` (1860x2480), `OASIS`, or `CUSTOM` |
 | `--custom-size` | `None` | Custom `WIDTHxHEIGHT` (requires `-p CUSTOM`) |
 | `--cover-size` | `1600x2560` | Cover `WIDTHxHEIGHT` (stretched to fill without borders) |
 | `-d, --direction` | `rtl` | Reading direction (`rtl` or `ltr`) |
