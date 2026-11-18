@@ -910,6 +910,43 @@ class TestConvertCliMocked:
         assert converted == [batch_out / "c2.kfx"]
         assert batch_skipped == [(c1, c1_kfx)]
 
+    def test_convert_cli_beautify_and_beautify_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+        cbz_path = _make_cbz(
+            tmp_path / "Witch Hat Atelier v12 (2024) (Digital) (LuCaZ) (F).cbz",
+            num_pages=1,
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--no-kcc",
+                "--beautify",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "Witch Hat Atelier v12 (2024).kfx").is_file()
+        assert cbz_path.is_file()
+
+        result_src = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--no-kcc",
+                "--beautify-source",
+            ],
+        )
+        assert result_src.exit_code == 0, result_src.output
+        assert (tmp_path / "Witch Hat Atelier v12 (2024).cbz").is_file()
+        assert not cbz_path.exists()
+
 
 class TestConvertCliIntegration:
     """Live E2E test with real calibre-debug + KFX Output when installed."""

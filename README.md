@@ -205,6 +205,8 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `--allow-remote-code` | `false` | Allow executing remote model code (required to enable `magi`) |
 | `--preview-only` | `false` | Render panel preview PNGs and exit without compiling `.kpf`/`.kfx` |
 | `--skip-existing` | `false` | Skip conversion if the output `.kfx` file already exists |
+| `--beautify` | `false` | Strip release tags from the output `.kfx` filename and KFX title metadata |
+| `--beautify-source` | `false` | Rename source `.cbz`/`.cbr` file(s) in place and beautify output `.kfx` and metadata |
 | `--no-kcc` | `false` | Use pure-Pillow E-Ink preprocessing instead of `kcc-c2e` |
 | `--keep-temp` | `false` | Keep temporary staging and intermediate `.kpf` directories |
 | `-w, --workers` | CPU count | Parallel worker threads |
