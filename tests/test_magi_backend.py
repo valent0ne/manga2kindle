@@ -53,6 +53,7 @@ def _build_mock_torch_and_transformers(
     cuda_available: bool = True,
     mps_available: bool = False,
     panels_per_call: list[list[list[float]]] | None = None,
+    results_per_call: list[dict[str, object]] | None = None,
 ) -> tuple[SimpleNamespace, SimpleNamespace, MagicMock, MagicMock, list[str]]:
     events: list[str] = []
 
@@ -84,6 +85,8 @@ def _build_mock_torch_and_transformers(
         captured_images.extend(images)
         idx = call_idx["i"]
         call_idx["i"] += 1
+        if results_per_call is not None:
+            return [results_per_call[idx + i] for i in range(len(images))]
         panels = panels_per_call[idx] if panels_per_call and idx < len(panels_per_call) else []
         return [{"panels": panels, "texts": [], "characters": [], "tails": []}]
 
@@ -302,6 +305,144 @@ class TestMagiBackendInference:
         assert len(results) == 2
         assert len(results[0].panels) == 1
         assert results[1].panels == []
+
+    def test_detect_merges_text_bridged_panels_and_preserves_reading_order(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        page_path = _write_bgr_page(tmp_path / "bridged.png", 1000, 1400)
+
+        # Panel 0 (bottom) stays first, Panels 1 & 2 (top-right, top-left) are bridged by text
+        mock_result = {
+            "panels": [
+                [50.0, 750.0, 950.0, 1300.0],
+                [520.0, 50.0, 950.0, 650.0],
+                [50.0, 50.0, 480.0, 650.0],
+            ],
+            "texts": [
+                [400.0, 200.0, 600.0, 350.0],
+            ],
+            "is_essential_text": [True],
+        }
+        fake_torch, fake_transformers, _, _, _ = _build_mock_torch_and_transformers(
+            cuda_available=False,
+            results_per_call=[mock_result],
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                allow_remote_code=True,
+                merge_bridged_panels=True,
+            )
+        )
+        result = backend.detect(page_path)
+        assert len(result.panels) == 2
+        assert [p.ordinal for p in result.panels] == [1, 2]
+        assert result.panels[0].y == 750
+        assert result.panels[1].x == 50
+        assert result.panels[1].w == 900
+
+    def test_detect_respects_is_essential_text_and_handles_anomalies(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        p1 = _write_bgr_page(tmp_path / "sfx.png", 1000, 1000)
+        p2 = _write_bgr_page(tmp_path / "none_texts.png", 1000, 1000)
+        p3 = _write_bgr_page(tmp_path / "numpy_mismatch.png", 1000, 1000)
+
+        two_panels = [
+            [50.0, 50.0, 450.0, 450.0],
+            [470.0, 50.0, 870.0, 450.0],
+        ]
+        results = [
+            # Non-essential SFX bridging both panels -> must NOT merge
+            {
+                "panels": two_panels,
+                "texts": [[350.0, 150.0, 550.0, 250.0]],
+                "is_essential_text": [False],
+            },
+            # texts=None -> must NOT crash
+            {
+                "panels": two_panels,
+                "texts": None,
+            },
+            # NumPy arrays + mismatched is_essential_text length -> falls back to all texts, no crash
+            {
+                "panels": np.array(two_panels, dtype=np.float32),
+                "texts": np.array([[350.0, 150.0, 550.0, 250.0]], dtype=np.float32),
+                "is_essential_text": np.array([True, False], dtype=bool),
+            },
+        ]
+        fake_torch, fake_transformers, _, _, _ = _build_mock_torch_and_transformers(
+            cuda_available=False,
+            results_per_call=results,
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                allow_remote_code=True,
+                batch_size=1,
+            )
+        )
+        out = backend.detect_batch([p1, p2, p3])
+        assert len(out[0].panels) == 2
+        assert len(out[1].panels) == 2
+        assert len(out[2].panels) == 1
+
+    def test_detect_batch_merges_per_page_and_respects_disable_flag(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        p1 = _write_bgr_page(tmp_path / "b1.png", 1000, 1000)
+        p2 = _write_bgr_page(tmp_path / "b2.png", 1000, 1000)
+
+        two_panels = [
+            [50.0, 50.0, 450.0, 450.0],
+            [470.0, 50.0, 870.0, 450.0],
+        ]
+        results = [
+            {"panels": two_panels, "texts": [[350.0, 150.0, 550.0, 250.0]]},
+            {"panels": two_panels, "texts": [[350.0, 150.0, 550.0, 250.0]]},
+        ]
+        fake_torch, fake_transformers, _, _, _ = _build_mock_torch_and_transformers(
+            cuda_available=False,
+            results_per_call=results,
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                allow_remote_code=True,
+                merge_bridged_panels=False,
+                batch_size=2,
+            )
+        )
+        out = backend.detect_batch([p1, p2])
+        assert len(out[0].panels) == 2
+        assert len(out[1].panels) == 2
 
 
 class TestMagiModelsHub:

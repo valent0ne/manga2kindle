@@ -15,8 +15,7 @@ from manga2kindle.cv.backends.base import DetectionResult
 from manga2kindle.cv.boxes import (
     DEFAULT_BLEED_MARGIN,
     Rect,
-    nms_and_prune_indices,
-    pad_and_clamp,
+    finalize_panel_boxes,
 )
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.cv.models_hub import (
@@ -31,6 +30,9 @@ from manga2kindle.models import DetectorConfig, DetectorKind, DevicePreference
 
 
 _BYTES_PER_GIB = 1024**3
+_MAGI_PANELS_KEY = "panels"
+_MAGI_TEXTS_KEY = "texts"
+_MAGI_ESSENTIAL_TEXT_KEY = "is_essential_text"
 
 
 def resolve_magi_batch_size(device: str, torch_mod: Any, configured: int | None) -> int:
@@ -220,8 +222,41 @@ class MagiBackend:
                 )
             return list(self._model.predict_detections_and_associations(rgb_images))
 
+    def _extract_essential_text_rects(
+        self,
+        page_result: Any,
+        orig_w: int,
+        orig_h: int,
+    ) -> list[Rect]:
+        if not isinstance(page_result, dict):
+            return []
+        raw_texts = page_result.get(_MAGI_TEXTS_KEY)
+        if raw_texts is None:
+            return []
+        text_list = list(raw_texts)
+        if not text_list:
+            return []
+
+        essential_mask = page_result.get(_MAGI_ESSENTIAL_TEXT_KEY)
+        mask_list: list[Any] | None = None
+        if essential_mask is not None:
+            candidate_mask = list(essential_mask)
+            if len(candidate_mask) == len(text_list):
+                mask_list = candidate_mask
+
+        rects: list[Rect] = []
+        for idx, box in enumerate(text_list):
+            if mask_list is not None and not bool(mask_list[idx]):
+                continue
+            rect = _xyxy_to_rect(box, orig_w, orig_h)
+            if rect is not None:
+                rects.append(rect)
+        return rects
+
     def _parse_page_result(self, page_result: Any, orig_w: int, orig_h: int) -> DetectionResult:
-        raw_panels = page_result.get("panels", []) if isinstance(page_result, dict) else []
+        raw_panels = page_result.get(_MAGI_PANELS_KEY) if isinstance(page_result, dict) else None
+        if raw_panels is None:
+            raw_panels = []
 
         rects: list[Rect] = []
         for box in raw_panels:
@@ -239,23 +274,28 @@ class MagiBackend:
                 scores=None,
             )
 
-        surviving = nms_and_prune_indices(
-            rects,
-            iou_threshold=self._config.iou_threshold,
-            containment_threshold=self._config.containment_threshold,
-            preserve_order=True,
+        text_rects = (
+            self._extract_essential_text_rects(page_result, orig_w, orig_h)
+            if self._config.merge_bridged_panels
+            else []
         )
 
-        panels = [
-            pad_and_clamp(
-                rects[idx],
-                orig_w,
-                orig_h,
-                padding=self._config.padding,
-                bleed_margin=DEFAULT_BLEED_MARGIN,
-            ).model_copy(update={"ordinal": ordinal})
-            for ordinal, idx in enumerate(surviving, start=1)
-        ]
+        panels, _ = finalize_panel_boxes(
+            rects,
+            orig_w,
+            orig_h,
+            text_boxes=text_rects,
+            iou_threshold=self._config.iou_threshold,
+            containment_threshold=self._config.containment_threshold,
+            padding=self._config.padding,
+            bleed_margin=DEFAULT_BLEED_MARGIN,
+            preserve_order=True,
+            merge_bridged_panels=self._config.merge_bridged_panels,
+            text_bridge_overlap=self._config.text_bridge_overlap,
+            panel_overlap_threshold=self._config.panel_overlap_threshold,
+            max_merged_area_ratio=self._config.max_merged_area_ratio,
+            min_fill_ratio=self._config.min_fill_ratio,
+        )
 
         return DetectionResult(
             panels=panels,
