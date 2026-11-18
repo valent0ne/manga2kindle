@@ -46,7 +46,7 @@ def test_conversion_config_defaults_and_validators(tmp_path):
     assert cfg.direction == ReadingDirection.RTL
     assert cfg.spread_mode == SpreadMode.SPLIT
     assert cfg.zoom_factor == 1.5
-    assert cfg.padding == 0.02
+    assert cfg.padding == 0.04
     assert cfg.min_panel_area == 0.03
     assert cfg.no_kcc is False
     assert cfg.keep_temp is False

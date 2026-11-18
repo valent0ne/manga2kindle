@@ -451,3 +451,29 @@ class TestModelsAndDoctorCli:
         assert ConversionPipeline._resolve_batch_workers(
             4, 10, no_kcc=True, detector_kind=DetectorKind.CONTOUR
         ) == (4, 1)
+
+    def test_build_contour_backend_and_registry_forward_merge_config(self) -> None:
+        from manga2kindle.cv.backends import ContourBackend, _build_contour_backend
+
+        cfg = DetectorConfig(
+            kind=DetectorKind.CONTOUR,
+            merge_bridged_panels=False,
+            panel_overlap_threshold=0.40,
+            max_merged_area_ratio=0.50,
+            min_fill_ratio=0.70,
+        )
+        built = _build_contour_backend(cfg)
+        assert isinstance(built, ContourBackend)
+        assert built.merge_bridged_panels is False
+        assert built.panel_overlap_threshold == 0.40
+        assert built.max_merged_area_ratio == 0.50
+        assert built.min_fill_ratio == 0.70
+
+        resolved_chain = BackendRegistry(cfg).resolve()
+        assert len(resolved_chain) == 1
+        resolved = resolved_chain[0]
+        assert isinstance(resolved, ContourBackend)
+        assert resolved.merge_bridged_panels is False
+        assert resolved.panel_overlap_threshold == 0.40
+        assert resolved.max_merged_area_ratio == 0.50
+        assert resolved.min_fill_ratio == 0.70

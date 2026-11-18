@@ -513,7 +513,7 @@ class ConversionPipeline:
         profile: DeviceProfile | None = None,
         direction: ReadingDirection = ReadingDirection.RTL,
         spread_mode: SpreadMode = SpreadMode.SPLIT,
-        padding: float = 0.02,
+        padding: float = 0.04,
         min_panel_area: float = 0.03,
         detector: DetectorConfig | None = None,
         detector_config: DetectorConfig | None = None,

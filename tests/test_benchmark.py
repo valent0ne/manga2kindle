@@ -414,3 +414,54 @@ class TestRunBenchmarkAndCli:
     def test_cli_benchmark_local_requires_pages_dir_and_truth(self) -> None:
         result = runner.invoke(app, ["benchmark", "--dataset", "local"])
         assert result.exit_code != 0
+
+    def test_cli_benchmark_forces_merge_bridged_panels_false(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pages_dir = tmp_path / "pages"
+        pages_dir.mkdir()
+        Image.new("RGB", (800, 1200), (255, 255, 255)).save(pages_dir / "page_001.png")
+        truth_file = tmp_path / "truth.json"
+        truth_file.write_text(
+            json.dumps(
+                {
+                    "pages": [
+                        {
+                            "page_id": "page_001",
+                            "file_name": "page_001.png",
+                            "panels": [{"x": 50, "y": 50, "w": 300, "h": 400, "ordinal": 1}],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        seen_configs: list[object] = []
+        from manga2kindle.cv.backends import resolve_auto_chain as real_resolve
+
+        def spy_resolve(cfg):
+            seen_configs.append(cfg)
+            return real_resolve(cfg)
+
+        monkeypatch.setattr("manga2kindle.cli.resolve_auto_chain", spy_resolve)
+
+        result = runner.invoke(
+            app,
+            [
+                "benchmark",
+                "--dataset",
+                BenchmarkDatasetKind.LOCAL.value,
+                "--pages-dir",
+                str(pages_dir),
+                "--truth",
+                str(truth_file),
+                "--backends",
+                "contour",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert len(seen_configs) == 1
+        assert seen_configs[0].merge_bridged_panels is False

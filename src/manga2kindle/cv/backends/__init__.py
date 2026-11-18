@@ -45,6 +45,10 @@ def _build_contour_backend(config: DetectorConfig) -> ContourBackend:
         padding=config.padding,
         iou_threshold=config.iou_threshold,
         containment_threshold=config.containment_threshold,
+        merge_bridged_panels=config.merge_bridged_panels,
+        panel_overlap_threshold=config.panel_overlap_threshold,
+        max_merged_area_ratio=config.max_merged_area_ratio,
+        min_fill_ratio=config.min_fill_ratio,
     )
 
 

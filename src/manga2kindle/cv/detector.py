@@ -23,7 +23,7 @@ class PanelDetector:
     def __init__(
         self,
         min_panel_area: float = 0.03,
-        padding: float = 0.02,
+        padding: float = 0.04,
         iou_threshold: float = 0.4,
         min_ink_ratio: float = 0.02,
         max_ink_ratio: float = 0.98,

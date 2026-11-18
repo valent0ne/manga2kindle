@@ -203,12 +203,13 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `-d, --direction` | `rtl` | Reading direction (`rtl` or `ltr`) |
 | `-s, --spread-mode` | `split` | Double-page spread handling (`split`, `rotate`, or `keep`) |
 | `-z, --zoom-factor` | `1.5` | Guided View magnification factor (`>= 1.0`) |
-| `--padding` | `0.02` | Panel bounding-box padding ratio (`0.0`–`0.25`) |
+| `--padding` | `0.04` | Panel bounding-box padding ratio (`0.0`–`0.25`) |
 | `--min-panel-area` | `0.03` | Minimum panel area ratio (`0.01`–`0.50`) |
 | `--detector` | `auto` | Panel detector backend (`auto`, `magi`, `onnx`, or `contour`) |
 | `--detector-model` | `None` | Detector model key, Hugging Face repo ID, or local weights path |
 | `--device` | `auto` | Inference device for neural detectors (`auto`, `cpu`, `cuda`, or `mps`) |
 | `--score-threshold` | `0.25` | Confidence threshold for neural panel detectors (`0.0`–`1.0`) |
+| `--merge-panels / --no-merge-panels` | `true` | Merge bridged/overlapping panels, expand bubbles & margin text, and recover missed contour panels (also on `preview-panels`) |
 | `--allow-remote-code` | `false` | Allow executing remote model code (required to enable `magi`) |
 | `--preview-only` | `false` | Render panel preview PNGs and exit without compiling `.kpf`/`.kfx` |
 | `--skip-existing` | `false` | Skip conversion if the output `.kfx` file already exists |

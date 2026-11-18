@@ -118,6 +118,7 @@ def _build_detector_config(
     padding: float,
     min_panel_area: float,
     batch_size: int | None = None,
+    merge_bridged_panels: bool = True,
 ) -> DetectorConfig:
     """Build a DetectorConfig from shared CLI detector options."""
     model_path: Path | None = None
@@ -138,6 +139,7 @@ def _build_detector_config(
         padding=padding,
         min_panel_area=min_panel_area,
         batch_size=batch_size,
+        merge_bridged_panels=merge_bridged_panels,
     )
 
 
@@ -231,7 +233,7 @@ def convert(
     padding: Annotated[
         float,
         typer.Option("--padding", min=0.0, max=0.25, help="Panel bounding-box padding ratio."),
-    ] = 0.02,
+    ] = 0.04,
     min_panel_area: Annotated[
         float,
         typer.Option("--min-panel-area", min=0.01, max=0.50, help="Minimum panel area ratio."),
@@ -355,6 +357,13 @@ def convert(
             help="Rename source .cbz/.cbr file(s) in place and beautify output .kfx and metadata.",
         ),
     ] = False,
+    merge_panels: Annotated[
+        bool,
+        typer.Option(
+            "--merge-panels/--no-merge-panels",
+            help="Merge adjacent panels bridged by shared dialogue bubbles or substantial overlap.",
+        ),
+    ] = True,
 ) -> None:
     """Convert CBZ, CBR, image folder, or batch directory into PDOC-tagged KFX."""
     device_profile = _resolve_profile(profile, custom_size)
@@ -398,6 +407,7 @@ def convert(
             padding=padding,
             min_panel_area=min_panel_area,
             batch_size=gpu_batch_size,
+            merge_bridged_panels=merge_panels,
         )
         config = ConversionConfig(
             input_path=input_path,
@@ -539,7 +549,7 @@ def preview_panels(
     padding: Annotated[
         float,
         typer.Option("--padding", min=0.0, max=0.25, help="Panel bounding-box padding ratio."),
-    ] = 0.02,
+    ] = 0.04,
     min_panel_area: Annotated[
         float,
         typer.Option("--min-panel-area", min=0.01, max=0.50, help="Minimum panel area ratio."),
@@ -615,6 +625,13 @@ def preview_panels(
             help="Comma-separated backends to compare side-by-side (e.g. contour,onnx,magi).",
         ),
     ] = None,
+    merge_panels: Annotated[
+        bool,
+        typer.Option(
+            "--merge-panels/--no-merge-panels",
+            help="Merge adjacent panels bridged by shared dialogue bubbles or substantial overlap.",
+        ),
+    ] = True,
 ) -> None:
     """Render debug overlays showing detected panels and reading-order arrows."""
     device_profile = _resolve_profile(profile, custom_size)
@@ -636,6 +653,7 @@ def preview_panels(
             padding=padding,
             min_panel_area=min_panel_area,
             batch_size=gpu_batch_size,
+            merge_bridged_panels=merge_panels,
         )
         rendered = pipeline.preview_panels(
             input_path=input_path,
@@ -985,6 +1003,7 @@ def benchmark(
                 allow_remote_code=allow_remote_code,
                 padding=0.02,
                 min_panel_area=0.03,
+                merge_bridged_panels=False,
             )
             backend = resolve_auto_chain(cfg)[0]
             metrics = cv_benchmark.run_benchmark(
