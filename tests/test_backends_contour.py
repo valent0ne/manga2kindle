@@ -174,3 +174,34 @@ def test_panel_detector_wrapper_preserves_full_page_fallback(tmp_path: Path) -> 
     detector = PanelDetector()
     boxes = detector.detect(blank_path)
     assert boxes == [PanelBox(x=0, y=0, w=600, h=800)]
+
+
+def test_contour_backend_merges_overlapping_contours_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlapping contours below iou_threshold merge when merge_bridged_panels=True."""
+    page_path = tmp_path / "overlap.png"
+    write_image(page_path, np.full((1000, 1000, 3), 255, dtype=np.uint8))
+
+    # Two overlapping boxes:
+    # (100, 100, 300, 300) area=90_000 and (250, 100, 200, 200) area=40_000
+    # intersection=150x200=30_000 -> IoU=30_000/100_000=0.30 <= 0.40, containment=30_000/40_000=0.75 >= 0.25
+    overlapping_candidates = [(100, 100, 300, 300), (250, 100, 200, 200)]
+
+    backend_merged = ContourBackend(
+        padding=0.0,
+        merge_bridged_panels=True,
+        panel_overlap_threshold=0.25,
+        max_merged_area_ratio=0.65,
+        min_fill_ratio=0.55,
+    )
+    monkeypatch.setattr(backend_merged, "_filter_contours", lambda *a, **kw: overlapping_candidates)
+    res_merged = backend_merged.detect(page_path)
+    assert len(res_merged.panels) == 1
+    assert res_merged.panels[0] == PanelBox(x=100, y=100, w=350, h=300)
+
+    backend_unmerged = ContourBackend(padding=0.0, merge_bridged_panels=False)
+    monkeypatch.setattr(backend_unmerged, "_filter_contours", lambda *a, **kw: overlapping_candidates)
+    res_unmerged = backend_unmerged.detect(page_path)
+    assert len(res_unmerged.panels) == 2
