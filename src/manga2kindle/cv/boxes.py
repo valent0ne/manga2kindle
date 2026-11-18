@@ -261,6 +261,27 @@ def merge_bridged_panel_clusters(
             if overlap >= panel_overlap_threshold:
                 _record_edge(idx_a, idx_b, overlap)
 
+    # 1c. Same-row tiny-panel adjacency (e.g., standalone narrow narration box
+    # sitting beside a much wider borderless strip of matching height).
+    for pos_a in range(len(valid_indices)):
+        idx_a = valid_indices[pos_a]
+        ax, ay, aw, ah = boxes[idx_a]
+        area_a = aw * ah
+        for pos_b in range(pos_a + 1, len(valid_indices)):
+            idx_b = valid_indices[pos_b]
+            bx, by, bw, bh = boxes[idx_b]
+            area_b = bw * bh
+            if (min(area_a, area_b) / page_area) >= 0.04:
+                continue
+            if max(aw, bw) < 3.0 * min(aw, bw):
+                continue
+            y_inter = max(0, min(ay + ah, by + bh) - max(ay, by))
+            if y_inter / max(ah, bh) < 0.70:
+                continue
+            x_gap = max(0, max(ax, bx) - min(ax + aw, bx + bw))
+            if x_gap <= 0.02 * page_width:
+                _record_edge(idx_a, idx_b, 0.20)
+
     sorted_edges = sorted(
         edge_weights.items(),
         key=lambda item: (-item[1], item[0][0], item[0][1]),

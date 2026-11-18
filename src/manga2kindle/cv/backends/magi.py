@@ -12,9 +12,12 @@ import cv2
 import numpy as np
 
 from manga2kindle.cv.backends.base import DetectionResult
+from manga2kindle.cv.backends.contour import ContourBackend
 from manga2kindle.cv.boxes import (
     DEFAULT_BLEED_MARGIN,
     Rect,
+    _intersection_area,
+    compute_containment,
     finalize_panel_boxes,
 )
 from manga2kindle.cv.bubbles import expand_text_boxes_to_bubbles
@@ -142,6 +145,7 @@ class MagiBackend:
 
         self._config = config
         self._lock = threading.Lock()
+        self._contour_fallback = ContourBackend(min_panel_area=config.min_panel_area)
         self._torch, transformers = _import_magi_deps()
         self._device = select_torch_device(config.device, self._torch)
         self._batch_size = resolve_magi_batch_size(self._device, self._torch, config.batch_size)
@@ -254,6 +258,44 @@ class MagiBackend:
                 rects.append(rect)
         return rects
 
+    def _recover_uncovered_contour_panels(
+        self,
+        magi_rects: list[Rect],
+        rgb_image: np.ndarray,
+    ) -> list[Rect]:
+        """Recover clear contour-detected panels that Magi missed completely."""
+        contour_rects = self._contour_fallback.detect_raw_rects(rgb_image, is_rgb=True)
+        if not contour_rects:
+            return magi_rects
+
+        merged = list(magi_rects)
+        for c_rect in contour_rects:
+            c_area = c_rect[2] * c_rect[3]
+            if c_area <= 0:
+                continue
+            overlaps_existing = any(
+                compute_containment(c_rect, m_rect) >= 0.15
+                or (_intersection_area(c_rect, m_rect) / c_area) >= 0.15
+                for m_rect in merged
+            )
+            if overlaps_existing:
+                continue
+
+            # Insert at a natural RTL reading-order position by vertical center, then right-to-left.
+            c_cy = c_rect[1] + c_rect[3] / 2.0
+            c_cx = c_rect[0] + c_rect[2] / 2.0
+            insert_idx = len(merged)
+            for idx, m_rect in enumerate(merged):
+                m_cy = m_rect[1] + m_rect[3] / 2.0
+                m_cx = m_rect[0] + m_rect[2] / 2.0
+                if c_cy < m_cy - 0.5 * min(c_rect[3], m_rect[3]) or (
+                    abs(c_cy - m_cy) <= 0.5 * min(c_rect[3], m_rect[3]) and c_cx > m_cx
+                ):
+                    insert_idx = idx
+                    break
+            merged.insert(insert_idx, c_rect)
+        return merged
+
     def _parse_page_result(
         self,
         page_result: Any,
@@ -270,6 +312,9 @@ class MagiBackend:
             rect = _xyxy_to_rect(box, orig_w, orig_h)
             if rect is not None:
                 rects.append(rect)
+
+        if image is not None and rects and self._config.merge_bridged_panels:
+            rects = self._recover_uncovered_contour_panels(rects, image)
 
         if not rects:
             return DetectionResult(

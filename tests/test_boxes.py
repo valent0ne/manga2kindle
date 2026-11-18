@@ -274,6 +274,21 @@ def test_merge_bridged_panel_clusters_expands_dominant_panel_when_merge_capped()
     assert clusters[1].rect == bottom
 
 
+def test_merge_bridged_panel_clusters_merges_same_row_tiny_adjacent_panel() -> None:
+    # Wide strip (650x220 = 143_000) + tiny adjacent box (120x220 = 26_400 < 0.04 * 1_000_000)
+    wide = (50, 720, 650, 220)
+    tiny = (715, 720, 120, 220)  # 15px gap <= 0.02 * 1000 (= 20px), >= 3x width ratio
+
+    clusters = merge_bridged_panel_clusters(
+        [wide, tiny],
+        page_width=1000,
+        page_height=1000,
+    )
+    assert len(clusters) == 1
+    assert clusters[0].rect == (50, 720, 785, 220)
+    assert clusters[0].member_indices == (0, 1)
+
+
 def test_merge_bridged_panel_clusters_ordering_and_validation() -> None:
     p0 = (500, 50, 400, 400)
     p1 = (50, 50, 300, 300)

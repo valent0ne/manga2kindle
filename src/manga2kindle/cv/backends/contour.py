@@ -59,20 +59,32 @@ class ContourBackend:
         self.max_merged_area_ratio = max_merged_area_ratio
         self.min_fill_ratio = min_fill_ratio
 
-    def detect(self, image_path: Path) -> DetectionResult:
-        """Detect panels on a single page; returns panels=[] when no contours survive."""
-        image = read_image_bgr(image_path)
+    def detect_raw_rects(
+        self,
+        image: np.ndarray,
+        *,
+        is_rgb: bool = False,
+    ) -> list[Rect]:
+        """Extract filtered (unpadded, pre-NMS) panel rectangles from an in-memory image."""
         page_h, page_w = image.shape[:2]
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.ndim == 2:
+            gray = image
+        else:
+            code = cv2.COLOR_RGB2GRAY if is_rgb else cv2.COLOR_BGR2GRAY
+            gray = cv2.cvtColor(image, code)
         filtered = cv2.bilateralFilter(gray, 9, 75, 75)
         _, binary = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return self._filter_contours(contours, binary, page_w, page_h)
 
-        candidates = self._filter_contours(contours, binary, page_w, page_h)
+    def detect(self, image_path: Path) -> DetectionResult:
+        """Detect panels on a single page; returns panels=[] when no contours survive."""
+        image = read_image_bgr(image_path)
+        page_h, page_w = image.shape[:2]
+        candidates = self.detect_raw_rects(image, is_rgb=False)
         panels, _ = finalize_panel_boxes(
             candidates,
             page_w,
