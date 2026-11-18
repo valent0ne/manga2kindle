@@ -148,11 +148,18 @@ class ConversionConfig(BaseModel):
     no_kcc: bool = False
     keep_temp: bool = False
     skip_existing: bool = False
+    beautify: bool = False
+    beautify_source: bool = False
     workers: int = Field(default_factory=lambda: os.cpu_count() or 4, ge=1)
     batch_workers: int | None = Field(default=None, ge=1)
     kcc_path: Path | None = None
     calibre_path: Path | None = None
     cover_size: tuple[int, int] = Field(default=DEFAULT_COVER_SIZE)
+
+    @property
+    def effective_beautify(self) -> bool:
+        """Return True when output filenames and metadata should be beautified."""
+        return self.beautify or self.beautify_source
 
     @model_validator(mode="after")
     def _sync_detector_fields(self) -> ConversionConfig:
