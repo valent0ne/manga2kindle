@@ -16,6 +16,7 @@ from manga2kindle.cv.preview import PanelPreviewRenderer
 from manga2kindle.cv.sorter import PanelSorter
 from manga2kindle.extractor import ArchiveExtractor, natural_sort_key
 from manga2kindle.models import (
+    DEFAULT_PROFILE_NAME,
     ConversionConfig,
     DetectorConfig,
     DetectorKind,
@@ -487,7 +488,7 @@ class ConversionPipeline:
         registry: BackendRegistry | None = None,
     ) -> list[Path]:
         """Extract, preprocess, detect/sort panels, and render numbered PNG debug overlays."""
-        resolved_profile = profile or DeviceProfile.from_name("KPW5")
+        resolved_profile = profile or DeviceProfile.from_name(DEFAULT_PROFILE_NAME)
         detector_cfg = (
             detector_config
             or detector
