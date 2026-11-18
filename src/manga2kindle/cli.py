@@ -159,9 +159,14 @@ def _parse_compare_backends(raw: str | None) -> list[DetectorKind] | None:
     return kinds
 
 
-def _resolve_preview_only_dir(input_path: Path, output: Path | None) -> Path:
+def _resolve_preview_only_dir(
+    input_path: Path,
+    output: Path | None,
+    *,
+    beautify: bool = False,
+) -> Path:
     """Resolve the preview output directory for `convert --preview-only` on a single input."""
-    default_name = ConversionPipeline.resolve_input_name(input_path)
+    default_name = ConversionPipeline.resolve_input_name(input_path, beautify=beautify)
     if output is None:
         return input_path.resolve().parent / f"{default_name}_preview"
     if output.suffix.lower() == ".kfx":
@@ -335,10 +340,25 @@ def convert(
             help="Skip conversion if the output .kfx file already exists.",
         ),
     ] = False,
+    beautify: Annotated[
+        bool,
+        typer.Option(
+            "--beautify",
+            help="Strip release tags from the output .kfx filename and KFX title metadata.",
+        ),
+    ] = False,
+    beautify_source: Annotated[
+        bool,
+        typer.Option(
+            "--beautify-source",
+            help="Rename source .cbz/.cbr file(s) in place and beautify output .kfx and metadata.",
+        ),
+    ] = False,
 ) -> None:
     """Convert CBZ, CBR, image folder, or batch directory into PDOC-tagged KFX."""
     device_profile = _resolve_profile(profile, custom_size)
     resolved_cover_size = _resolve_cover_size(cover_size)
+    effective_beautify = beautify or beautify_source
     pipeline = ConversionPipeline()
 
     try:
@@ -350,17 +370,23 @@ def convert(
                 input_path
                 if is_batch
                 else (
-                    _resolve_preview_only_dir(input_path, None)
+                    _resolve_preview_only_dir(input_path, None, beautify=effective_beautify)
                     if preview_only
-                    else ConversionPipeline.resolve_single_output(input_path, None)
+                    else ConversionPipeline.resolve_single_output(
+                        input_path, None, beautify=effective_beautify
+                    )
                 )
             )
         elif is_batch:
             resolved_output = ConversionPipeline.resolve_batch_output_dir(input_path, output)
         elif preview_only:
-            resolved_output = _resolve_preview_only_dir(input_path, output)
+            resolved_output = _resolve_preview_only_dir(
+                input_path, output, beautify=effective_beautify
+            )
         else:
-            resolved_output = ConversionPipeline.resolve_single_output(input_path, output)
+            resolved_output = ConversionPipeline.resolve_single_output(
+                input_path, output, beautify=effective_beautify
+            )
 
         detector_cfg = _build_detector_config(
             detector=detector,
@@ -385,6 +411,8 @@ def convert(
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             skip_existing=skip_existing,
+            beautify=beautify,
+            beautify_source=beautify_source,
             workers=workers,
             batch_workers=batch_workers,
             kcc_path=kcc_path,
