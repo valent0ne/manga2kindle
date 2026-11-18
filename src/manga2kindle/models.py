@@ -119,6 +119,13 @@ class PageAsset(BaseModel):
     panels: list[PanelBox] = Field(default_factory=list)
 
 
+DEFAULT_TEXT_BRIDGE_OVERLAP = 0.15
+DEFAULT_PANEL_OVERLAP_THRESHOLD = 0.25
+DEFAULT_MAX_MERGED_AREA_RATIO = 0.65
+DEFAULT_MIN_FILL_RATIO = 0.55
+DEFAULT_MIN_TEXT_AREA_RATIO = 0.0005
+
+
 class DetectorConfig(BaseModel):
     """Configuration for panel detection backends and post-processing."""
 
@@ -133,6 +140,11 @@ class DetectorConfig(BaseModel):
     min_panel_area: float = Field(default=0.03, ge=0.01, le=0.50)
     batch_size: int | None = Field(default=None, ge=1, le=64)
     allow_remote_code: bool = False
+    merge_bridged_panels: bool = True
+    text_bridge_overlap: float = Field(default=DEFAULT_TEXT_BRIDGE_OVERLAP, gt=0.0, le=1.0)
+    panel_overlap_threshold: float = Field(default=DEFAULT_PANEL_OVERLAP_THRESHOLD, gt=0.0, le=1.0)
+    max_merged_area_ratio: float = Field(default=DEFAULT_MAX_MERGED_AREA_RATIO, gt=0.0, le=1.0)
+    min_fill_ratio: float = Field(default=DEFAULT_MIN_FILL_RATIO, gt=0.0, le=1.0)
 
 
 class ConversionConfig(BaseModel):

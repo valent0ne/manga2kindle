@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
-from manga2kindle.models import PanelBox
+from manga2kindle.models import (
+    DEFAULT_MAX_MERGED_AREA_RATIO,
+    DEFAULT_MIN_FILL_RATIO,
+    DEFAULT_MIN_TEXT_AREA_RATIO,
+    DEFAULT_PANEL_OVERLAP_THRESHOLD,
+    DEFAULT_TEXT_BRIDGE_OVERLAP,
+    PanelBox,
+)
 
 Rect = tuple[int, int, int, int]
 
@@ -12,6 +20,14 @@ DEFAULT_IOU_THRESHOLD = 0.4
 DEFAULT_CONTAINMENT_THRESHOLD = 0.85
 DEFAULT_PADDING = 0.02
 DEFAULT_BLEED_MARGIN = 2
+
+
+@dataclass(frozen=True)
+class MergedCluster:
+    """A merged panel bounding box and the sorted indices of its member panels."""
+
+    rect: Rect
+    member_indices: tuple[int, ...]
 
 
 def _box_area(box: Rect) -> int:
@@ -171,3 +187,235 @@ def pad_and_clamp(
         w=max(1, x2 - x1),
         h=max(1, y2 - y1),
     )
+
+
+def _union_rect(box_a: Rect, box_b: Rect) -> Rect:
+    """Return the axis-aligned bounding rectangle enclosing both boxes."""
+    x1 = min(box_a[0], box_b[0])
+    y1 = min(box_a[1], box_b[1])
+    x2 = max(box_a[0] + box_a[2], box_b[0] + box_b[2])
+    y2 = max(box_a[1] + box_a[3], box_b[1] + box_b[3])
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def merge_bridged_panel_clusters(
+    boxes: Sequence[Rect],
+    page_width: int,
+    page_height: int,
+    *,
+    text_boxes: Sequence[Rect] = (),
+    text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
+    panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
+    max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
+    min_fill_ratio: float = DEFAULT_MIN_FILL_RATIO,
+    min_text_area_ratio: float = DEFAULT_MIN_TEXT_AREA_RATIO,
+    containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
+) -> list[MergedCluster]:
+    """Merge panel boxes bridged by shared text/dialogue boxes or substantial overlap.
+
+    Enforces readability guardrails (``max_merged_area_ratio``, ``min_fill_ratio``,
+    and third-panel engulfment) so merges never collapse a page into an unreadable crop.
+    Returned clusters are ordered by each cluster's earliest member index.
+    """
+    if page_width <= 0 or page_height <= 0:
+        raise ValueError(
+            f"Page dimensions must be positive, got ({page_width}, {page_height})"
+        )
+
+    valid_indices = [i for i, b in enumerate(boxes) if b[2] > 0 and b[3] > 0]
+    if not valid_indices:
+        return []
+
+    page_area = page_width * page_height
+    edge_weights: dict[tuple[int, int], float] = {}
+
+    def _record_edge(a: int, b: int, weight: float) -> None:
+        key = (a, b) if a < b else (b, a)
+        prev = edge_weights.get(key)
+        if prev is None or weight > prev:
+            edge_weights[key] = weight
+
+    # 1a. Text-bridge candidate edges.
+    for t_box in text_boxes:
+        t_area = _box_area(t_box)
+        if t_area <= 0 or (t_area / page_area) < min_text_area_ratio:
+            continue
+        matched: list[tuple[int, float]] = []
+        for idx in valid_indices:
+            frac = _intersection_area(t_box, boxes[idx]) / t_area
+            if frac >= text_bridge_overlap:
+                matched.append((idx, frac))
+        if len(matched) >= 2:
+            for p_pos in range(len(matched)):
+                idx_a, frac_a = matched[p_pos]
+                for q_pos in range(p_pos + 1, len(matched)):
+                    idx_b, frac_b = matched[q_pos]
+                    _record_edge(idx_a, idx_b, min(frac_a, frac_b))
+
+    # 1b. Direct panel-overlap candidate edges.
+    for pos_a in range(len(valid_indices)):
+        idx_a = valid_indices[pos_a]
+        for pos_b in range(pos_a + 1, len(valid_indices)):
+            idx_b = valid_indices[pos_b]
+            overlap = compute_containment(boxes[idx_a], boxes[idx_b])
+            if overlap >= panel_overlap_threshold:
+                _record_edge(idx_a, idx_b, overlap)
+
+    sorted_edges = sorted(
+        edge_weights.items(),
+        key=lambda item: (-item[1], item[0][0], item[0][1]),
+    )
+
+    # 2. Guarded Union-Find.
+    parent = {i: i for i in valid_indices}
+    cluster_members = {i: [i] for i in valid_indices}
+    cluster_rects = {i: boxes[i] for i in valid_indices}
+    cluster_member_areas = {i: _box_area(boxes[i]) for i in valid_indices}
+
+    def _find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for (idx_a, idx_b), _weight in sorted_edges:
+        root_a = _find(idx_a)
+        root_b = _find(idx_b)
+        if root_a == root_b:
+            continue
+
+        union_rect = _union_rect(cluster_rects[root_a], cluster_rects[root_b])
+        union_area = _box_area(union_rect)
+        if (union_area / page_area) > max_merged_area_ratio:
+            continue
+
+        combined_area = cluster_member_areas[root_a] + cluster_member_areas[root_b]
+        if union_area <= 0 or (combined_area / union_area) < min_fill_ratio:
+            continue
+
+        merged_set = set(cluster_members[root_a]) | set(cluster_members[root_b])
+        if any(
+            k not in merged_set
+            and compute_containment(union_rect, boxes[k]) >= containment_threshold
+            for k in valid_indices
+        ):
+            continue
+
+        parent[root_b] = root_a
+        cluster_members[root_a].extend(cluster_members.pop(root_b))
+        cluster_rects[root_a] = union_rect
+        cluster_member_areas[root_a] = combined_area
+        cluster_rects.pop(root_b)
+        cluster_member_areas.pop(root_b)
+
+    clusters = [
+        MergedCluster(
+            rect=cluster_rects[root],
+            member_indices=tuple(sorted(members)),
+        )
+        for root, members in cluster_members.items()
+    ]
+    clusters.sort(key=lambda c: c.member_indices[0])
+    return clusters
+
+
+def merge_bridged_panels(
+    boxes: Sequence[Rect],
+    page_width: int,
+    page_height: int,
+    *,
+    text_boxes: Sequence[Rect] = (),
+    text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
+    panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
+    max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
+    min_fill_ratio: float = DEFAULT_MIN_FILL_RATIO,
+    min_text_area_ratio: float = DEFAULT_MIN_TEXT_AREA_RATIO,
+    containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
+) -> list[Rect]:
+    """Convenience wrapper returning only merged ``Rect``s in cluster order."""
+    clusters = merge_bridged_panel_clusters(
+        boxes,
+        page_width,
+        page_height,
+        text_boxes=text_boxes,
+        text_bridge_overlap=text_bridge_overlap,
+        panel_overlap_threshold=panel_overlap_threshold,
+        max_merged_area_ratio=max_merged_area_ratio,
+        min_fill_ratio=min_fill_ratio,
+        min_text_area_ratio=min_text_area_ratio,
+        containment_threshold=containment_threshold,
+    )
+    return [cluster.rect for cluster in clusters]
+
+
+def finalize_panel_boxes(
+    boxes: Sequence[Rect],
+    page_w: int,
+    page_h: int,
+    *,
+    text_boxes: Sequence[Rect] = (),
+    scores: Sequence[float] | None = None,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
+    padding: float = DEFAULT_PADDING,
+    bleed_margin: int = DEFAULT_BLEED_MARGIN,
+    preserve_order: bool = False,
+    merge_bridged_panels: bool = True,
+    text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
+    panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
+    max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
+    min_fill_ratio: float = DEFAULT_MIN_FILL_RATIO,
+) -> tuple[list[PanelBox], list[float] | None]:
+    """Run NMS/containment pruning, optional bridged-panel merging, and pad/clamp."""
+    if page_w <= 0 or page_h <= 0:
+        raise ValueError(f"Page dimensions must be positive, got ({page_w}, {page_h})")
+
+    surviving = nms_and_prune_indices(
+        boxes,
+        iou_threshold=iou_threshold,
+        containment_threshold=containment_threshold,
+        scores=scores,
+        preserve_order=preserve_order,
+    )
+    kept_rects = [boxes[i] for i in surviving]
+    kept_scores = [float(scores[i]) for i in surviving] if scores is not None else None
+
+    if not kept_rects:
+        return [], ([] if kept_scores is not None else None)
+
+    if merge_bridged_panels:
+        clusters = merge_bridged_panel_clusters(
+            kept_rects,
+            page_w,
+            page_h,
+            text_boxes=text_boxes,
+            text_bridge_overlap=text_bridge_overlap,
+            panel_overlap_threshold=panel_overlap_threshold,
+            max_merged_area_ratio=max_merged_area_ratio,
+            min_fill_ratio=min_fill_ratio,
+            containment_threshold=containment_threshold,
+        )
+        final_rects = [cluster.rect for cluster in clusters]
+        out_scores = (
+            [max(kept_scores[m] for m in cluster.member_indices) for cluster in clusters]
+            if kept_scores is not None
+            else None
+        )
+    else:
+        final_rects = kept_rects
+        out_scores = kept_scores
+
+    panels: list[PanelBox] = []
+    for idx, rect in enumerate(final_rects, start=1):
+        panel = pad_and_clamp(
+            rect,
+            page_w,
+            page_h,
+            padding=padding,
+            bleed_margin=bleed_margin,
+        )
+        if preserve_order:
+            panel = panel.model_copy(update={"ordinal": idx})
+        panels.append(panel)
+
+    return panels, out_scores
