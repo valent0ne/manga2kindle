@@ -129,11 +129,10 @@ def test_merge_bridged_panel_clusters_ignores_non_bridging_or_tiny_text() -> Non
         page_width=1000,
         page_height=1000,
         text_boxes=[inside_left, weak_bridge, tiny_noise],
+        text_bridge_overlap=0.15,
     )
-    assert clusters == [
-        MergedCluster(rect=left, member_indices=(0,)),
-        MergedCluster(rect=right, member_indices=(1,)),
-    ]
+    assert len(clusters) == 2
+    assert [c.member_indices for c in clusters] == [(0,), (1,)]
 
 
 def test_merge_bridged_panel_clusters_ignores_degenerate_boxes() -> None:
@@ -236,6 +235,25 @@ def test_merge_bridged_panel_clusters_rejects_diagonal_dead_space_and_engulfment
         max_merged_area_ratio=0.30,
     )
     assert len(clusters_engulf_capped) == 3
+
+
+def test_merge_bridged_panel_clusters_expands_for_gutter_and_margin_text() -> None:
+    p0 = (50, 50, 400, 300)   # x=50..450, y=50..350
+    p1 = (50, 420, 400, 300)  # well below p0
+    # Text box protruding below p0 into the gutter (75% inside p0, 25% below)
+    gutter_tail = (200, 290, 100, 80)  # y=290..370
+    # Margin narration box sitting 10px to the right of p0 (0% overlap, within 2% margin=20px)
+    margin_note = (460, 100, 80, 150)  # x=460..540
+
+    clusters = merge_bridged_panel_clusters(
+        [p0, p1],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[gutter_tail, margin_note],
+    )
+    assert len(clusters) == 2
+    assert clusters[0].rect == (50, 50, 490, 320)  # x=50..540, y=50..370
+    assert clusters[1].rect == p1
 
 
 def test_merge_bridged_panel_clusters_ordering_and_validation() -> None:

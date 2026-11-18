@@ -321,6 +321,52 @@ def merge_bridged_panel_clusters(
         cluster_rects[root_a] = union_rect
         cluster_member_areas[root_a] = combined_area
 
+    # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
+    # outside a single panel (or sit immediately adjacent in the white margin).
+    margin_px = max(8, int(round(0.02 * min(page_width, page_height))))
+    active_roots = list(cluster_rects.keys())
+    for t_box in text_boxes:
+        t_area = _box_area(t_box)
+        if t_area <= 0 or (t_area / page_area) < min_text_area_ratio:
+            continue
+
+        direct_matches = [
+            (r, _intersection_area(t_box, cluster_rects[r]) / t_area)
+            for r in active_roots
+            if _intersection_area(t_box, cluster_rects[r]) / t_area >= text_bridge_overlap
+        ]
+        target_root: int | None = None
+        if len(direct_matches) == 1:
+            only_root, frac = direct_matches[0]
+            if frac < 1.0:
+                target_root = only_root
+        elif not direct_matches:
+            prox_matches: list[int] = []
+            for r in active_roots:
+                rx, ry, rw, rh = cluster_rects[r]
+                expanded_r = (
+                    max(0, rx - margin_px),
+                    max(0, ry - margin_px),
+                    min(page_width, rx + rw + margin_px) - max(0, rx - margin_px),
+                    min(page_height, ry + rh + margin_px) - max(0, ry - margin_px),
+                )
+                if _intersection_area(t_box, expanded_r) > 0:
+                    prox_matches.append(r)
+            if len(prox_matches) == 1:
+                target_root = prox_matches[0]
+
+        if target_root is None:
+            continue
+
+        candidate_rect = _union_rect(cluster_rects[target_root], t_box)
+        if any(
+            other != target_root
+            and compute_containment(candidate_rect, cluster_rects[other]) >= containment_threshold
+            for other in active_roots
+        ):
+            continue
+        cluster_rects[target_root] = candidate_rect
+
     clusters = [
         MergedCluster(
             rect=cluster_rects[root],

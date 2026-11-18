@@ -99,7 +99,8 @@ Constants in `src/manga2kindle/cv/boxes.py`:
    - **Area-cap guardrail:** Reject if `union_area / page_area > max_merged_area_ratio`.
    - **Dead-space / L-shape guardrail:** Let `sum_member_areas` be the sum of individual `boxes[m]` areas in the combined cluster. Reject if `sum_member_areas / union_area < min_fill_ratio` (prevents diagonal/L-shaped panels from creating a huge empty bounding box).
    - **Engulfment absorption:** If `union_rect` contains any unmerged panel `k` outside the two clusters with `compute_containment(union_rect, boxes[k]) >= containment_threshold`, absorb `k`'s cluster into the merge set (expanding `union_rect` iteratively) before checking `max_merged_area_ratio` and `min_fill_ratio`. This preserves bridged L/corner layouts without creating nested duplicate panels.
-3. **Order-Preserving Output:**
+3. **Margin/Gutter Text Expansion & Order-Preserving Output:**
+   - For any essential `text_box` that overlaps a single cluster (or sits immediately adjacent in the white margin within `2%` of page size) and protrudes outside that cluster's bounding box, expand the cluster's `Rect` to enclose it (provided it does not engulf another cluster).
    - Each surviving cluster emits `MergedCluster(rect=union_rect, member_indices=tuple(sorted(members)))`.
    - Clusters are sorted by `member_indices[0]` so `MagiBackend` (`ordered=True`) preserves its native reading order seamlessly.
    - `merge_bridged_panels(...) -> list[Rect]` wraps `merge_bridged_panel_clusters(...)` for callers that only need rectangles.
