@@ -9,8 +9,12 @@ from manga2kindle.cv.boxes import (
     DEFAULT_MIN_FILL_RATIO,
     DEFAULT_MIN_TEXT_AREA_RATIO,
     DEFAULT_PANEL_OVERLAP_THRESHOLD,
+    DEFAULT_PADDING,
     DEFAULT_TEXT_BRIDGE_OVERLAP,
+    GUTTER_INSET_MAX_PX,
+    CutAxis,
     MergedCluster,
+    axis_interval,
     compute_containment,
     compute_iou,
     finalize_panel_boxes,
@@ -19,6 +23,10 @@ from manga2kindle.cv.boxes import (
     nms_and_prune,
     nms_and_prune_indices,
     pad_and_clamp,
+    panel_to_rect,
+    split_by_gutter,
+    union_rect,
+    unpad_rect,
 )
 from manga2kindle.models import DetectorConfig, PanelBox
 
@@ -372,3 +380,57 @@ def test_detector_config_merge_fields_validation() -> None:
         DetectorConfig(max_merged_area_ratio=0.0)
     with pytest.raises(ValueError):
         DetectorConfig(min_fill_ratio=1.1)
+
+
+def test_panel_to_rect_and_union_rect() -> None:
+    b1 = PanelBox(x=100, y=50, w=200, h=300)
+    b2 = PanelBox(x=250, y=100, w=150, h=350)
+    assert panel_to_rect(b1) == (100, 50, 200, 300)
+    assert union_rect([b1, b2]) == (100, 50, 300, 400)
+    with pytest.raises(ValueError):
+        union_rect([])
+
+
+def test_unpad_rect_inverts_padding_and_preserves_zero() -> None:
+    raw = (200, 300, 500, 800)
+    assert unpad_rect(raw, 0.0) == raw
+    padded = pad_and_clamp(raw, page_w=2000, page_h=2600, padding=DEFAULT_PADDING, bleed_margin=0)
+    unpadded = unpad_rect(panel_to_rect(padded), DEFAULT_PADDING)
+    assert unpadded == raw
+    # Tiny box still preserves at least 1x1 dimensions
+    assert unpad_rect((10, 10, 2, 2), 0.1) == (10, 10, 2, 2)
+
+
+def test_axis_interval_and_split_by_gutter() -> None:
+    # Wide box exceeds GUTTER_INSET_MAX_PX when uncapped
+    wide = PanelBox(x=100, y=200, w=1000, h=400)
+    assert axis_interval(wide, CutAxis.VERTICAL, inset=False) == (100, 1100)
+    assert axis_interval(wide, CutAxis.VERTICAL, inset=True) == (
+        100 + GUTTER_INSET_MAX_PX,
+        1100 - GUTTER_INSET_MAX_PX,
+    )
+    assert axis_interval(wide, CutAxis.VERTICAL, inset=True, inset_max_px=None) == (150, 1050)
+
+    # High-res panels padded with 0.04 overlap > 24px across a 10px vertical gutter
+    raw_hero = (700, 100, 1100, 800)
+    raw_sub = (100, 100, 590, 380)
+    p_hero = pad_and_clamp(raw_hero, page_w=1908, page_h=2544, padding=0.04, bleed_margin=0)
+    p_sub = pad_and_clamp(raw_sub, page_w=1908, page_h=2544, padding=0.04, bleed_margin=0)
+    # Capped inset (24px) fails to split across 10px gutter, uncapped 6% splits cleanly
+    assert len(split_by_gutter([p_hero, p_sub], CutAxis.VERTICAL, inset=True)) == 1
+    cols = split_by_gutter(
+        [p_hero, p_sub],
+        CutAxis.VERTICAL,
+        inset=True,
+        reverse=True,
+        inset_ratio=0.06,
+        inset_max_px=None,
+    )
+    assert len(cols) == 2
+    assert cols[0] == [p_hero]
+    assert cols[1] == [p_sub]
+
+    # Horizontal strict gutter split
+    top = PanelBox(x=50, y=40, w=900, h=300)
+    bot = PanelBox(x=50, y=360, w=900, h=400)
+    assert split_by_gutter([bot, top], CutAxis.HORIZONTAL) == [[top], [bot]]

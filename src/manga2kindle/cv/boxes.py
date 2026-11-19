@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 
 from manga2kindle.models import (
     DEFAULT_MAX_MERGED_AREA_RATIO,
@@ -20,6 +21,114 @@ DEFAULT_IOU_THRESHOLD = 0.4
 DEFAULT_CONTAINMENT_THRESHOLD = 0.85
 DEFAULT_PADDING = 0.04
 DEFAULT_BLEED_MARGIN = 2
+GUTTER_INSET_MAX_PX = 24
+GUTTER_INSET_RATIO = 0.05
+
+
+class CutAxis(str, Enum):
+    """Axis along which panel intervals are projected for gutter splitting."""
+
+    HORIZONTAL = "y"
+    VERTICAL = "x"
+
+
+def panel_to_rect(box: PanelBox) -> Rect:
+    """Convert a PanelBox to an (x, y, w, h) rectangle tuple."""
+    return (box.x, box.y, box.w, box.h)
+
+
+def union_rect(boxes: Sequence[PanelBox]) -> Rect:
+    """Return the exact enclosing (x, y, w, h) bounding box of non-empty PanelBoxes."""
+    if not boxes:
+        raise ValueError("Cannot compute union of empty box sequence")
+    min_x = min(box.x for box in boxes)
+    min_y = min(box.y for box in boxes)
+    max_x = max(box.x + box.w for box in boxes)
+    max_y = max(box.y + box.h for box in boxes)
+    return (min_x, min_y, max_x - min_x, max_y - min_y)
+
+
+def unpad_rect(rect: Rect, padding: float) -> Rect:
+    """Approximate the pre-padding rectangle from a padded (x, y, w, h) rectangle."""
+    if padding <= 0.0:
+        return rect
+    frac = padding / (1.0 + 2.0 * padding)
+    dx = min(int(round(rect[2] * frac)), max(0, (rect[2] - 1) // 2))
+    dy = min(int(round(rect[3] * frac)), max(0, (rect[3] - 1) // 2))
+    return (
+        rect[0] + dx,
+        rect[1] + dy,
+        max(1, rect[2] - 2 * dx),
+        max(1, rect[3] - 2 * dy),
+    )
+
+
+def axis_interval(
+    box: PanelBox,
+    axis: CutAxis,
+    *,
+    inset: bool = False,
+    inset_ratio: float = GUTTER_INSET_RATIO,
+    inset_max_px: int | None = GUTTER_INSET_MAX_PX,
+) -> tuple[int, int]:
+    """Return [start, end) along ``axis``, optionally inset to clear minor padding overlap."""
+    start, dim = (box.y, box.h) if axis is CutAxis.HORIZONTAL else (box.x, box.w)
+    if not inset:
+        return (start, start + dim)
+    margin = int(inset_ratio * dim)
+    if inset_max_px is not None:
+        margin = min(inset_max_px, margin)
+    margin = min(margin, max(0, (dim - 1) // 2))
+    return (start + margin, start + dim - margin)
+
+
+def split_by_gutter(
+    boxes: Sequence[PanelBox],
+    axis: CutAxis,
+    *,
+    inset: bool = False,
+    reverse: bool = False,
+    inset_ratio: float = GUTTER_INSET_RATIO,
+    inset_max_px: int | None = GUTTER_INSET_MAX_PX,
+) -> list[list[PanelBox]]:
+    """Sweep 1D panel intervals to split into non-overlapping bands or columns."""
+    if not boxes:
+        return []
+
+    items = sorted(
+        (
+            (
+                axis_interval(
+                    box,
+                    axis,
+                    inset=inset,
+                    inset_ratio=inset_ratio,
+                    inset_max_px=inset_max_px,
+                ),
+                box,
+            )
+            for box in boxes
+        ),
+        key=lambda item: (item[0][0], item[0][1]),
+    )
+    groups: list[list[PanelBox]] = []
+    current_group: list[PanelBox] = [items[0][1]]
+    current_end = items[0][0][1]
+
+    for (start, end), box in items[1:]:
+        if start >= current_end:
+            groups.append(current_group)
+            current_group = [box]
+            current_end = end
+        else:
+            current_group.append(box)
+            if end > current_end:
+                current_end = end
+    groups.append(current_group)
+
+    if reverse:
+        groups.reverse()
+    return groups
 
 _TINY_PANEL_MAX_AREA_RATIO = 0.04
 _TINY_PANEL_WIDTH_RATIO = 3.0

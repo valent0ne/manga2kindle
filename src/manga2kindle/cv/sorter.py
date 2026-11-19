@@ -2,17 +2,8 @@
 
 from __future__ import annotations
 
-from enum import Enum
-
+from manga2kindle.cv.boxes import CutAxis, axis_interval, split_by_gutter
 from manga2kindle.models import PanelBox, ReadingDirection
-
-_INSET_MAX_PX = 24
-_INSET_RATIO = 0.05
-
-
-class _CutAxis(str, Enum):
-    HORIZONTAL = "y"
-    VERTICAL = "x"
 
 
 class PanelSorter:
@@ -63,7 +54,7 @@ class PanelSorter:
             return list(boxes)
 
         for inset in (False, True):
-            for axis in (_CutAxis.HORIZONTAL, _CutAxis.VERTICAL):
+            for axis in (CutAxis.HORIZONTAL, CutAxis.VERTICAL):
                 groups = self._split_by_axis(boxes, axis, inset=inset)
                 if len(groups) >= 2:
                     ordered: list[PanelBox] = []
@@ -77,42 +68,22 @@ class PanelSorter:
     def _split_by_axis(
         self,
         boxes: list[PanelBox],
-        axis: _CutAxis,
+        axis: CutAxis,
         *,
         inset: bool,
     ) -> list[list[PanelBox]]:
         """Sweep 1D panel intervals to split into non-overlapping bands or columns."""
-        items = sorted(
-            ((self._axis_interval(box, axis, inset=inset), box) for box in boxes),
-            key=lambda item: (item[0][0], item[0][1]),
+        return split_by_gutter(
+            boxes,
+            axis,
+            inset=inset,
+            reverse=(axis is CutAxis.VERTICAL and self.direction == ReadingDirection.RTL),
         )
-        groups: list[list[PanelBox]] = []
-        current_group: list[PanelBox] = [items[0][1]]
-        current_end = items[0][0][1]
-
-        for (start, end), box in items[1:]:
-            if start >= current_end:
-                groups.append(current_group)
-                current_group = [box]
-                current_end = end
-            else:
-                current_group.append(box)
-                if end > current_end:
-                    current_end = end
-        groups.append(current_group)
-
-        if axis is _CutAxis.VERTICAL and self.direction == ReadingDirection.RTL:
-            groups.reverse()
-        return groups
 
     @staticmethod
-    def _axis_interval(box: PanelBox, axis: _CutAxis, *, inset: bool) -> tuple[int, int]:
+    def _axis_interval(box: PanelBox, axis: CutAxis, *, inset: bool) -> tuple[int, int]:
         """Return [start, end) along the cut axis, optionally inset to clear minor padding overlap."""
-        start, dim = (box.y, box.h) if axis is _CutAxis.HORIZONTAL else (box.x, box.w)
-        if not inset:
-            return start, start + dim
-        margin = min(_INSET_MAX_PX, int(_INSET_RATIO * dim), max(0, (dim - 1) // 2))
-        return start + margin, start + dim - margin
+        return axis_interval(box, axis, inset=inset)
 
     def _sort_spread_halves(self, boxes: list[PanelBox], page_width: int) -> list[PanelBox]:
         """Partition an unsplit two-page spread across the center gutter before sorting."""
