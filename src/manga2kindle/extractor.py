@@ -21,6 +21,9 @@ IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 )
 _IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
+_ZIP_ARCHIVE_EXTENSIONS = frozenset({".cbz", ".zip"})
+_RAR_ARCHIVE_EXTENSIONS = frozenset({".cbr", ".rar"})
+SUPPORTED_ARCHIVE_EXTENSIONS = _ZIP_ARCHIVE_EXTENSIONS | _RAR_ARCHIVE_EXTENSIONS
 _IGNORED_FILENAMES = frozenset({"thumbs.db", "comicinfo.xml"})
 _IGNORED_DIRS = frozenset({"__macosx"})
 _NATURAL_SPLIT_RE = re.compile(r"(\d+)")
@@ -79,13 +82,13 @@ class ArchiveExtractor:
             return self._verify_and_stage(candidates, extracted_dir, input_path)
 
         suffix = input_path.suffix.lower()
-        if suffix in {".cbz", ".zip"}:
+        if suffix in _ZIP_ARCHIVE_EXTENSIONS:
             with tempfile.TemporaryDirectory(dir=work_dir, prefix="raw_") as tmp_dir:
                 with zipfile.ZipFile(input_path, "r") as zf:
                     candidates = self._extract_archive(zf, Path(tmp_dir))
                 return self._verify_and_stage(candidates, extracted_dir, input_path)
 
-        if suffix in {".cbr", ".rar"}:
+        if suffix in _RAR_ARCHIVE_EXTENSIONS:
             self._configure_rar_tool()
             with tempfile.TemporaryDirectory(dir=work_dir, prefix="raw_") as tmp_dir:
                 with rarfile.RarFile(input_path) as rf:

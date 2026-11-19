@@ -10,11 +10,14 @@ from pathlib import Path
 from manga2kindle.cv.backends.base import DetectionResult, PanelDetectorBackend
 from manga2kindle.cv.backends.contour import ContourBackend
 from manga2kindle.cv.backends.magi import MagiBackend
-from manga2kindle.cv.backends.onnx_yolo import OnnxYoloBackend
+from manga2kindle.cv.backends.onnx_yolo import OnnxYoloBackend, select_ort_providers
 from manga2kindle.cv.io import read_image_bgr
 from manga2kindle.cv.models_hub import (
     DEFAULT_MAGI_MODEL_KEY,
+    DEFAULT_ONNX_MODEL_KEY,
     is_magi_cached,
+    is_model_cached,
+    resolve_detector_model_target,
     resolve_magi_model_spec,
 )
 from manga2kindle.cv.sorter import PanelSorter
@@ -34,7 +37,9 @@ __all__ = [
     "MagiBackend",
     "OnnxYoloBackend",
     "PanelDetectorBackend",
+    "describe_auto_chain",
     "detect_with_fallback",
+    "infer_config_model_target",
     "resolve_auto_chain",
 ]
 
@@ -97,6 +102,43 @@ def _probe_magi_readiness(config: DetectorConfig) -> tuple[bool, str]:
     return True, "ready"
 
 
+def infer_config_model_target(config: DetectorConfig) -> DetectorKind | None:
+    """Infer the explicit backend targeted by config.model_path or config.model_id, if any."""
+    if config.model_path is not None:
+        if not config.model_path.exists():
+            raise FileNotFoundError(f"Detector model path not found: {config.model_path}")
+        return DetectorKind.MAGI if config.model_path.is_dir() else DetectorKind.ONNX_YOLO
+    if config.model_id is not None:
+        return resolve_detector_model_target(config.model_id).backend
+    return None
+
+
+def describe_auto_chain(config: DetectorConfig | None = None) -> tuple[list[DetectorKind], str]:
+    """Describe the AUTO fallback chain and any readiness note without side-effect warnings or model loads."""
+    cfg = config or DetectorConfig()
+    chain: list[DetectorKind] = []
+    note = ""
+
+    magi_ready, _reason = _probe_magi_readiness(cfg)
+    if magi_ready:
+        if cfg.allow_remote_code:
+            chain.append(DetectorKind.MAGI)
+        else:
+            note = "magi ready with --allow-remote-code"
+
+    try:
+        import onnxruntime as ort
+
+        select_ort_providers(cfg.device, ort.get_available_providers())
+        if is_model_cached(cfg.model_id or DEFAULT_ONNX_MODEL_KEY):
+            chain.append(DetectorKind.ONNX_YOLO)
+    except (ImportError, RuntimeError, ValueError):
+        pass
+
+    chain.append(DetectorKind.CONTOUR)
+    return chain, note
+
+
 def resolve_auto_chain(config: DetectorConfig) -> list[PanelDetectorBackend]:
     """Resolve an ordered list of instantiated panel detector backends for config.kind."""
     if config.kind == DetectorKind.CONTOUR:
@@ -107,6 +149,23 @@ def resolve_auto_chain(config: DetectorConfig) -> list[PanelDetectorBackend]:
         return [MagiBackend(config)]
 
     backends: list[PanelDetectorBackend] = []
+    explicit_target = infer_config_model_target(config)
+    if explicit_target == DetectorKind.MAGI:
+        backends = [MagiBackend(config), _build_contour_backend(config)]
+        logger.info(
+            "Resolved AUTO panel detector chain (active=%s): %s",
+            backends[0].kind.value,
+            [backend.kind.value for backend in backends],
+        )
+        return backends
+    if explicit_target == DetectorKind.ONNX_YOLO:
+        backends = [OnnxYoloBackend(config), _build_contour_backend(config)]
+        logger.info(
+            "Resolved AUTO panel detector chain (active=%s): %s",
+            backends[0].kind.value,
+            [backend.kind.value for backend in backends],
+        )
+        return backends
 
     magi_ready, _reason = _probe_magi_readiness(config)
     if magi_ready:

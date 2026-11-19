@@ -97,15 +97,6 @@ class PanelBox(BaseModel):
     ordinal: int = Field(default=0, ge=0)
 
 
-class ZoomRect(BaseModel):
-    """KPF magnification target rectangle computed from a PanelBox and zoom factor."""
-
-    x: int = Field(ge=0)
-    y: int = Field(ge=0)
-    w: int = Field(gt=0)
-    h: int = Field(gt=0)
-
-
 class PageAsset(BaseModel):
     """Represents a single manga page across extraction, preprocessing, and detection."""
 
@@ -155,7 +146,6 @@ class ConversionConfig(BaseModel):
     profile: DeviceProfile
     direction: ReadingDirection = ReadingDirection.RTL
     spread_mode: SpreadMode = SpreadMode.SPLIT
-    zoom_factor: float = Field(default=1.5, ge=1.0)
     padding: float = Field(default=0.04, ge=0.0, le=0.25)
     min_panel_area: float = Field(default=0.03, ge=0.01, le=0.50)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)

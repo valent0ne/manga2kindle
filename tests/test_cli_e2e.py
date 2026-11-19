@@ -416,8 +416,6 @@ class TestConvertCliMocked:
                 "Sample Manga Vol 1",
                 "--author",
                 "Sample Author",
-                "-z",
-                "1.6",
                 "--padding",
                 "0.03",
                 "--min-panel-area",
@@ -679,7 +677,7 @@ class TestConvertCliMocked:
         )
         assert bad_dims.exit_code != 0
 
-        bad_zoom = runner.invoke(app, ["convert", "-i", str(cbz_path), "-z", "0.5"])
+        bad_zoom = runner.invoke(app, ["convert", "-i", str(cbz_path), "-z", "1.5"])
         assert bad_zoom.exit_code != 0
 
         bad_workers = runner.invoke(app, ["convert", "-i", str(cbz_path), "-w", "0"])
@@ -1127,3 +1125,266 @@ def test_cli_convert_and_preview_panels_merge_panels_flag(
     )
     assert res4.exit_code == 0, res4.output
     assert captured_preview[-1].merge_bridged_panels is False
+
+
+class TestCliReviewRegressionFixes:
+    """Regression tests for CLI markup escaping, validation, preview-only, and detector output."""
+
+    def test_doctor_preserves_extras_brackets_without_rich_stripping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        statuses = [
+            ToolStatus(name="kcc-c2e", found=True, path=Path("/usr/bin/kcc-c2e")),
+            ToolStatus(name="calibre-debug", found=True, path=Path("/usr/bin/calibre-debug")),
+            ToolStatus(name="KFX Output", found=True, path=Path("/usr/bin/calibre-debug")),
+            ToolStatus(
+                name="onnxruntime",
+                found=False,
+                details="Optional (pip install manga2kindle[onnx])",
+            ),
+            ToolStatus(
+                name="torch",
+                found=False,
+                details="Optional (pip install manga2kindle[magi])",
+            ),
+        ]
+        monkeypatch.setattr(PlatformDiscovery, "run_doctor", lambda self, **_: statuses)
+
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+
+        assert result.exit_code == 0, result.output
+        assert "pip install manga2kindle[onnx]" in result.output
+        assert "pip install manga2kindle[magi]" in result.output
+
+    def test_convert_preserves_lowercase_brackets_and_survives_closing_tag_errors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "[scans] Manga [b].cbz", num_pages=1)
+        out_kfx = tmp_path / "out" / "[scans] Manga [b].kfx"
+        TestConvertCliMocked._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+
+        ok_res = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "-o", str(out_kfx), "--no-kcc"],
+            env={"COLUMNS": "240"},
+        )
+        assert ok_res.exit_code == 0, ok_res.output
+        assert "[scans] Manga [b].kfx" in ok_res.output
+        assert "Panel detector:" in ok_res.output
+
+        def boom(*_args, **_kwargs) -> Path:
+            raise RuntimeError("bad xml [/tag] and [/]")
+
+        monkeypatch.setattr(ConversionPipeline, "run_single", boom)
+        err_res = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "-o", str(out_kfx), "--no-kcc"],
+            env={"COLUMNS": "240"},
+        )
+        assert err_res.exit_code == 1
+        assert "[/tag]" in err_res.output
+        assert "[/]" in err_res.output
+
+    def test_convert_rejects_removed_zoom_factor_long_flag(self, tmp_path: Path) -> None:
+        cbz_path = _make_cbz(tmp_path / "no_zoom.cbz", num_pages=1)
+        res = runner.invoke(app, ["convert", "-i", str(cbz_path), "--zoom-factor", "1.5"])
+        assert res.exit_code != 0
+
+    def test_convert_auto_fails_fast_on_missing_or_unknown_detector_model(
+        self, tmp_path: Path
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "bad_model.cbz", num_pages=1)
+
+        missing_onnx = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--no-kcc",
+                "--detector-model",
+                str(tmp_path / "missing.onnx"),
+            ],
+        )
+        assert missing_onnx.exit_code == 1
+        assert "not found" in missing_onnx.output.lower()
+
+        unknown_key = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--no-kcc",
+                "--detector-model",
+                "totally-unknown-model",
+            ],
+        )
+        assert unknown_key.exit_code == 1
+        assert "unknown detector model" in unknown_key.output.lower()
+
+        contour_mismatch = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--no-kcc",
+                "--detector",
+                "contour",
+                "--detector-model",
+                "manga109-yolo-s",
+            ],
+        )
+        assert contour_mismatch.exit_code == 1
+        assert "contour" in contour_mismatch.output.lower()
+
+    def test_preview_panels_compare_scopes_detector_model_and_announces_single_detector(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "compare_scoped.cbz", num_pages=1)
+
+        # Single mode announces active panel detector
+        single_res = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(tmp_path / "single_prev"),
+                "--no-kcc",
+                "--detector",
+                "contour",
+            ],
+        )
+        assert single_res.exit_code == 0, single_res.output
+        assert "Panel detector: contour" in single_res.output
+
+        # --detector-model targeting a backend outside --compare fails fast
+        mismatch = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(tmp_path / "mismatch_prev"),
+                "--no-kcc",
+                "--compare",
+                "contour,onnx",
+                "--detector-model",
+                "magiv2",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert mismatch.exit_code == 1
+        assert "not in --compare" in " ".join(mismatch.output.split())
+
+        seen_configs: dict[DetectorKind, DetectorConfig] = {}
+
+        class _StubBackend:
+            def __init__(self, kind: DetectorKind) -> None:
+                self.kind = kind
+
+            def detect(self, image_path: Path) -> DetectionResult:
+                with Image.open(image_path) as img:
+                    w, h = img.size
+                return DetectionResult(
+                    panels=[PanelBox(x=20, y=20, w=w - 40, h=h - 40, ordinal=1)],
+                    ordered=True,
+                    backend=self.kind,
+                    page_width=w,
+                    page_height=h,
+                )
+
+            def detect_batch(self, image_paths):
+                return [self.detect(p) for p in image_paths]
+
+        def fake_resolve_auto_chain(cfg: DetectorConfig):
+            seen_configs[cfg.kind] = cfg
+            return [_StubBackend(cfg.kind)]
+
+        monkeypatch.setattr("manga2kindle.cv.backends.resolve_auto_chain", fake_resolve_auto_chain)
+
+        scoped_res = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(tmp_path / "scoped_prev"),
+                "--no-kcc",
+                "--compare",
+                "contour,onnx,magi",
+                "--allow-remote-code",
+                "--detector-model",
+                "magiv2",
+            ],
+        )
+        assert scoped_res.exit_code == 0, scoped_res.output
+        assert seen_configs[DetectorKind.MAGI].model_id == "magiv2"
+        assert seen_configs[DetectorKind.ONNX_YOLO].model_id is None
+        assert seen_configs[DetectorKind.ONNX_YOLO].model_path is None
+
+    def test_convert_preview_only_rejects_beautify_source_and_honors_cover_size(
+        self, tmp_path: Path
+    ) -> None:
+        cbz_path = _make_cbz(tmp_path / "Series v01 (Digital).cbz", num_pages=2)
+
+        bad_combo = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "--preview-only",
+                "--beautify-source",
+                "--no-kcc",
+            ],
+        )
+        assert bad_combo.exit_code == 1
+        assert "--beautify-source" in bad_combo.output
+        assert cbz_path.is_file()
+
+        single_out = tmp_path / "single_cover_preview"
+        single_ok = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "-o",
+                str(single_out),
+                "--preview-only",
+                "--no-kcc",
+                "--cover-size",
+                "800x1200",
+            ],
+        )
+        assert single_ok.exit_code == 0, single_ok.output
+        with Image.open(single_out / "page_0001.png") as cover_img:
+            assert cover_img.size == (800, 1200)
+
+        batch_dir = tmp_path / "batch_cover_preview"
+        batch_dir.mkdir()
+        _make_cbz(batch_dir / "ch_01.cbz", num_pages=2)
+        batch_out = tmp_path / "batch_cover_preview_out"
+        batch_ok = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(batch_dir),
+                "-o",
+                str(batch_out),
+                "--preview-only",
+                "--no-kcc",
+                "--cover-size",
+                "800x1200",
+            ],
+        )
+        assert batch_ok.exit_code == 0, batch_ok.output
+        with Image.open(batch_out / "ch_01_preview" / "page_0001.png") as batch_cover:
+            assert batch_cover.size == (800, 1200)

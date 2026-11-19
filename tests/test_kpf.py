@@ -16,7 +16,6 @@ from manga2kindle.models import (
     PageAsset,
     PanelBox,
     ReadingDirection,
-    ZoomRect,
 )
 from manga2kindle.packaging.ion import (
     ION_BVM,
@@ -146,48 +145,6 @@ class TestIonBinaryWriter:
         assert b"yj.authoring.source_file_name" in sym_tab
 
 
-class TestComputeZoomRect:
-    """Unit tests for KpfBuilder.compute_zoom_rect."""
-
-    def test_zooming_and_centering(self) -> None:
-        """Panel centered on page should scale up and maintain center."""
-        panel = PanelBox(x=400, y=500, w=200, h=200, ordinal=1)
-        zoom = KpfBuilder.compute_zoom_rect(panel, page_w=1000, page_h=1200, zoom_factor=1.5)
-        # Scaled size: 200 * 1.5 = 300
-        assert zoom.w == 300
-        assert zoom.h == 300
-        # Original center: (500, 600) -> new top-left: 500 - 150 = 350, 600 - 150 = 450
-        assert zoom.x == 350
-        assert zoom.y == 450
-
-    def test_clamping_top_left(self) -> None:
-        """Panel near (0, 0) should be clamped so x >= 0 and y >= 0."""
-        panel = PanelBox(x=10, y=10, w=200, h=200, ordinal=1)
-        zoom = KpfBuilder.compute_zoom_rect(panel, page_w=1000, page_h=1200, zoom_factor=1.5)
-        assert zoom.w == 300
-        assert zoom.h == 300
-        assert zoom.x == 0
-        assert zoom.y == 0
-
-    def test_clamping_bottom_right(self) -> None:
-        """Panel near bottom-right edge should be clamped within page dimensions."""
-        panel = PanelBox(x=850, y=1050, w=140, h=140, ordinal=1)
-        zoom = KpfBuilder.compute_zoom_rect(panel, page_w=1000, page_h=1200, zoom_factor=1.5)
-        assert zoom.x + zoom.w <= 1000
-        assert zoom.y + zoom.h <= 1200
-        assert zoom.x >= 0
-        assert zoom.y >= 0
-
-    def test_clamping_exceeding_page(self) -> None:
-        """If scaled dimension exceeds page size, clamp to page bounds."""
-        panel = PanelBox(x=50, y=50, w=800, h=1000, ordinal=1)
-        zoom = KpfBuilder.compute_zoom_rect(panel, page_w=1000, page_h=1200, zoom_factor=2.0)
-        assert zoom.w <= 1000
-        assert zoom.h <= 1200
-        assert zoom.x == 0
-        assert zoom.y == 0
-
-
 class TestComputePanelZoomLayout:
     """Unit tests for Kindle Create screen-fit magnification geometry."""
 
@@ -277,7 +234,6 @@ class TestKpfBuilderIntegration:
             output_path=tmp_path / "output.kfx",
             profile=DeviceProfile.from_name("KPW5"),
             direction=ReadingDirection.RTL,
-            zoom_factor=1.5,
         )
 
     def test_build_kpf_zip_structure_and_sqlite(
