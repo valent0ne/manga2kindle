@@ -8,9 +8,12 @@ from pydantic import ValidationError
 from manga2kindle.models import (
     DEFAULT_PROFILE_NAME,
     ConversionConfig,
+    DetectorConfig,
     DeviceProfile,
+    DeviceSizeTier,
     PageAsset,
     PanelBox,
+    PanelMergeConfig,
     ReadingDirection,
     SpreadMode,
 )
@@ -217,4 +220,56 @@ def test_platform_discovery_run_doctor_missing_tools(monkeypatch):
     assert by_name["KFX Output"].found is False
     assert by_name["KFX Output"].details == "calibre-debug not found"
     assert by_name["unrar/unar/7z"].found is False
+
+
+def test_device_profile_size_tier_and_panel_merge_calibration(tmp_path: Path) -> None:
+    assert DeviceProfile.from_name("KPW6").size_tier == DeviceSizeTier.STANDARD
+    assert DeviceProfile.from_name("KPW5").size_tier == DeviceSizeTier.STANDARD
+    assert DeviceProfile.from_name("OASIS").size_tier == DeviceSizeTier.STANDARD
+    assert DeviceProfile.from_name("KS").size_tier == DeviceSizeTier.LARGE
+    assert DeviceProfile.from_name("CUSTOM", custom_size=(1072, 1448)).size_tier == DeviceSizeTier.COMPACT
+    # Landscape custom screen still classifies by short edge
+    assert DeviceProfile.from_name("CUSTOM", custom_size=(1680, 1264)).size_tier == DeviceSizeTier.STANDARD
+    assert DeviceProfile.from_name("CUSTOM", custom_size=(2400, 1700)).size_tier == DeviceSizeTier.LARGE
+
+    compact_cfg = PanelMergeConfig.for_tier(DeviceSizeTier.COMPACT)
+    standard_cfg = PanelMergeConfig.for_profile(DeviceProfile.from_name("KPW6"))
+    large_cfg = PanelMergeConfig.for_profile(DeviceProfile.from_name("KS"))
+    assert compact_cfg.max_tier_height_ratio < standard_cfg.max_tier_height_ratio < large_cfg.max_tier_height_ratio
+    assert PanelMergeConfig.for_tier(DeviceSizeTier.LARGE, enabled=False).enabled is False
+
+    # ConversionConfig auto-calibrates panel_merge from profile while respecting explicit overrides
+    cfg_ks = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("KS"),
+    )
+    assert cfg_ks.panel_merge == large_cfg
+
+    cfg_override = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("KS"),
+        panel_merge=PanelMergeConfig(max_tier_height_ratio=0.41),
+    )
+    assert cfg_override.panel_merge.max_tier_height_ratio == 0.41
+    assert cfg_override.panel_merge.max_subcol_height_ratio == large_cfg.max_subcol_height_ratio
+
+    # detector.merge_bridged_panels=False disables panel_merge.enabled unless explicitly overridden
+    cfg_det_disabled = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("KPW6"),
+        detector=DetectorConfig(merge_bridged_panels=False),
+    )
+    assert cfg_det_disabled.panel_merge.enabled is False
+
+    cfg_merge_explicit = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("KPW6"),
+        detector=DetectorConfig(merge_bridged_panels=False),
+        panel_merge=PanelMergeConfig(enabled=True),
+    )
+    assert cfg_merge_explicit.panel_merge.enabled is True
 
