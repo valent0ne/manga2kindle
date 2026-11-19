@@ -13,12 +13,14 @@ import cv2
 import typer
 from pydantic import ValidationError
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from manga2kindle import __version__
 from manga2kindle.cv import benchmark as cv_benchmark
 from manga2kindle.cv import models_hub
 from manga2kindle.cv.backends import resolve_auto_chain
+from manga2kindle.cv.backends.base import PanelDetectorBackend
 from manga2kindle.cv.benchmark import BenchmarkDatasetKind, BenchmarkMetrics
 from manga2kindle.models import (
     DEFAULT_COVER_SIZE,
@@ -108,6 +110,17 @@ def _resolve_profile(profile: str, custom_size: str | None) -> DeviceProfile:
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _announce_detector(active: DetectorKind, chain: list[DetectorKind]) -> None:
+    chain_str = " -> ".join(kind.value for kind in chain)
+    if len(chain) > 1:
+        console.print(
+            f"[dim]Panel detector: {rich_escape(active.value)} "
+            f"(fallback: {rich_escape(chain_str)})[/dim]"
+        )
+    else:
+        console.print(f"[dim]Panel detector: {rich_escape(active.value)}[/dim]")
+
+
 def _build_detector_config(
     *,
     detector: DetectorKind,
@@ -124,10 +137,16 @@ def _build_detector_config(
     model_path: Path | None = None
     model_id: str | None = None
     if detector_model is not None:
-        if detector == DetectorKind.MAGI:
-            model_path, model_id = models_hub.resolve_magi_model_spec(detector_model)
-        else:
-            model_path, model_id = models_hub.resolve_model_spec(detector_model)
+        if detector == DetectorKind.CONTOUR:
+            raise ValueError("--detector-model cannot be used with --detector contour.")
+        target = models_hub.resolve_detector_model_target(detector_model)
+        if detector != DetectorKind.AUTO and target.backend != detector:
+            raise ValueError(
+                f"--detector-model '{detector_model}' targets backend "
+                f"'{target.backend.value}', not '{detector.value}'."
+            )
+        model_path = target.model_path
+        model_id = target.model_id
 
     return DetectorConfig(
         kind=detector,
@@ -143,13 +162,17 @@ def _build_detector_config(
     )
 
 
-def _parse_compare_backends(raw: str | None) -> list[DetectorKind] | None:
-    """Parse a comma-separated --compare backend list into DetectorKind enums."""
+def _parse_backend_list(
+    raw: str | None,
+    *,
+    option_name: str = "--compare",
+) -> list[DetectorKind] | None:
+    """Parse a comma-separated backend list into deduplicated DetectorKind enums."""
     if raw is None:
         return None
     parts = [part.strip().lower() for part in raw.split(",") if part.strip()]
     if not parts:
-        raise typer.BadParameter("--compare requires at least one backend (e.g. contour,onnx).")
+        raise typer.BadParameter(f"{option_name} requires at least one backend (e.g. contour,onnx).")
     kinds: list[DetectorKind] = []
     for part in parts:
         try:
@@ -157,9 +180,9 @@ def _parse_compare_backends(raw: str | None) -> list[DetectorKind] | None:
         except ValueError as exc:
             valid = ", ".join(k.value for k in DetectorKind if k != DetectorKind.AUTO)
             raise typer.BadParameter(
-                f"Unknown detector backend '{part}' in --compare. Choose from: {valid}"
+                f"Unknown detector backend '{part}' in {option_name}. Choose from: {valid}"
             ) from exc
-    return kinds
+    return list(dict.fromkeys(kinds))
 
 
 def _resolve_preview_only_dir(
@@ -181,7 +204,7 @@ def _resolve_preview_only_dir(
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(f"manga2kindle {__version__}")
+        console.print(f"manga2kindle {rich_escape(__version__)}")
         raise typer.Exit()
 
 
@@ -226,10 +249,6 @@ def convert(
         SpreadMode,
         typer.Option("-s", "--spread-mode", case_sensitive=False, help="Spread handling: split, rotate, or keep."),
     ] = SpreadMode.SPLIT,
-    zoom_factor: Annotated[
-        float,
-        typer.Option("-z", "--zoom-factor", min=1.0, help="Guided View magnification zoom factor."),
-    ] = 1.5,
     padding: Annotated[
         float,
         typer.Option("--padding", min=0.0, max=0.25, help="Panel bounding-box padding ratio."),
@@ -369,9 +388,13 @@ def convert(
     device_profile = _resolve_profile(profile, custom_size)
     resolved_cover_size = _resolve_cover_size(cover_size)
     effective_beautify = beautify or beautify_source
-    pipeline = ConversionPipeline()
+    pipeline = ConversionPipeline(on_detector_resolved=_announce_detector)
 
     try:
+        if preview_only and beautify_source:
+            raise ValueError(
+                "--beautify-source cannot be used with --preview-only; use --beautify instead."
+            )
         is_batch = pipeline.is_batch_input(input_path)
         if is_batch and title is not None:
             raise ValueError("--title cannot be used with a batch archive directory.")
@@ -415,7 +438,6 @@ def convert(
             profile=device_profile,
             direction=direction,
             spread_mode=spread_mode,
-            zoom_factor=zoom_factor,
             padding=padding,
             min_panel_area=min_panel_area,
             detector=detector_cfg,
@@ -431,7 +453,7 @@ def convert(
             cover_size=resolved_cover_size,
         )
     except (FileNotFoundError, ValueError, ValidationError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     if preview_only:
@@ -439,13 +461,15 @@ def convert(
             try:
                 preview_dirs = pipeline.preview_batch(config)
             except Exception as exc:  # noqa: BLE001
-                console.print(f"[red]Batch preview failed:[/red] {exc}")
+                console.print(f"[red]Batch preview failed:[/red] {rich_escape(str(exc))}")
                 raise typer.Exit(code=1) from exc
 
             for preview_dir in preview_dirs:
-                console.print(f"[green]Rendered preview(s):[/green] {preview_dir}")
+                console.print(f"[green]Rendered preview(s):[/green] {rich_escape(str(preview_dir))}")
             for failed_archive, err in pipeline.last_batch_errors:
-                console.print(f"[red]Failed:[/red] {failed_archive.name} - {err}")
+                console.print(
+                    f"[red]Failed:[/red] {rich_escape(failed_archive.name)} - {rich_escape(str(err))}"
+                )
 
             total = len(preview_dirs) + len(pipeline.last_batch_errors)
             console.print(
@@ -470,27 +494,35 @@ def convert(
                 keep_temp=keep_temp,
                 workers=workers,
                 kcc_path=kcc_path,
+                cover_size=resolved_cover_size,
             )
         except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Preview failed:[/red] {exc}")
+            console.print(f"[red]Preview failed:[/red] {rich_escape(str(exc))}")
             raise typer.Exit(code=1) from exc
 
-        console.print(f"[green]Rendered {len(rendered)} panel preview(s) to:[/green] {resolved_output}")
+        console.print(
+            f"[green]Rendered {len(rendered)} panel preview(s) to:[/green] "
+            f"{rich_escape(str(resolved_output))}"
+        )
         return
 
     if is_batch:
         try:
             outputs = pipeline.run_batch(config, author=author)
         except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Batch conversion failed:[/red] {exc}")
+            console.print(f"[red]Batch conversion failed:[/red] {rich_escape(str(exc))}")
             raise typer.Exit(code=1) from exc
 
         for out_kfx in outputs:
-            console.print(f"[green]Converted:[/green] {out_kfx}")
+            console.print(f"[green]Converted:[/green] {rich_escape(str(out_kfx))}")
         for skipped_kfx in pipeline.last_batch_skipped:
-            console.print(f"[yellow]Skipped (already exists):[/yellow] {skipped_kfx}")
+            console.print(
+                f"[yellow]Skipped (already exists):[/yellow] {rich_escape(str(skipped_kfx))}"
+            )
         for failed_archive, err in pipeline.last_batch_errors:
-            console.print(f"[red]Failed:[/red] {failed_archive.name} - {err}")
+            console.print(
+                f"[red]Failed:[/red] {rich_escape(failed_archive.name)} - {rich_escape(str(err))}"
+            )
 
         total = len(outputs) + len(pipeline.last_batch_skipped) + len(pipeline.last_batch_errors)
         if pipeline.last_batch_skipped:
@@ -511,13 +543,13 @@ def convert(
     try:
         out_kfx = pipeline.run_single(config, title=title, author=author)
     except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Conversion failed:[/red] {exc}")
+        console.print(f"[red]Conversion failed:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     if pipeline.last_single_skipped:
-        console.print(f"[yellow]Skipped (already exists):[/yellow] {out_kfx}")
+        console.print(f"[yellow]Skipped (already exists):[/yellow] {rich_escape(str(out_kfx))}")
     else:
-        console.print(f"[green]Converted (PDOC verified):[/green] {out_kfx}")
+        console.print(f"[green]Converted (PDOC verified):[/green] {rich_escape(str(out_kfx))}")
 
 
 @app.command("preview-panels")
@@ -635,17 +667,31 @@ def preview_panels(
 ) -> None:
     """Render debug overlays showing detected panels and reading-order arrows."""
     device_profile = _resolve_profile(profile, custom_size)
-    compare_kinds = _parse_compare_backends(compare)
+    compare_kinds = _parse_backend_list(compare, option_name="--compare")
     default_name = ConversionPipeline.resolve_input_name(input_path)
     target_dir = output_dir or (input_path.resolve().parent / f"{default_name}_preview")
     if target_dir.exists() and not target_dir.is_dir():
-        console.print(f"[red]Error:[/red] Output path exists and is not a directory: {target_dir}")
+        console.print(
+            f"[red]Error:[/red] Output path exists and is not a directory: "
+            f"{rich_escape(str(target_dir))}"
+        )
         raise typer.Exit(code=1)
-    pipeline = ConversionPipeline()
+    pipeline = ConversionPipeline(
+        on_detector_resolved=None if compare_kinds else _announce_detector
+    )
 
     try:
+        effective_detector = detector
+        if compare_kinds is not None and detector_model is not None:
+            target = models_hub.resolve_detector_model_target(detector_model)
+            if target.backend not in compare_kinds:
+                raise ValueError(
+                    f"--detector-model '{detector_model}' targets backend '{target.backend.value}', "
+                    f"which is not in --compare ({', '.join(k.value for k in compare_kinds)})."
+                )
+            effective_detector = target.backend
         detector_cfg = _build_detector_config(
-            detector=detector,
+            detector=effective_detector,
             detector_model=detector_model,
             device=device,
             score_threshold=score_threshold,
@@ -671,10 +717,13 @@ def preview_panels(
             kcc_path=kcc_path,
         )
     except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Preview failed:[/red] {exc}")
+        console.print(f"[red]Preview failed:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[green]Rendered {len(rendered)} panel preview(s) to:[/green] {target_dir}")
+    console.print(
+        f"[green]Rendered {len(rendered)} panel preview(s) to:[/green] "
+        f"{rich_escape(str(target_dir))}"
+    )
 
 
 @app.command()
@@ -703,8 +752,20 @@ def doctor(
     table.add_column("Location / Details", overflow="fold")
 
     py_version = sys.version.split()[0]
-    table.add_row("Python", "Required", "[green]Found[/green]", py_version, sys.executable)
-    table.add_row("OpenCV", "Required", "[green]Found[/green]", cv2.__version__, cv2.__file__ or "-")
+    table.add_row(
+        "Python",
+        "Required",
+        "[green]Found[/green]",
+        rich_escape(py_version),
+        rich_escape(sys.executable),
+    )
+    table.add_row(
+        "OpenCV",
+        "Required",
+        "[green]Found[/green]",
+        rich_escape(cv2.__version__),
+        rich_escape(cv2.__file__ or "-"),
+    )
 
     missing_required = False
     for status in statuses:
@@ -720,11 +781,11 @@ def doctor(
 
         location = str(status.path) if status.path is not None else (status.details or "Not found")
         table.add_row(
-            status.name,
-            requirement,
+            rich_escape(status.name),
+            rich_escape(requirement),
             status_cell,
-            status.version or "-",
-            location,
+            rich_escape(status.version or "-"),
+            rich_escape(location),
         )
 
     console.print(table)
@@ -756,20 +817,20 @@ def models_list() -> None:
 
     for spec in models_hub.list_registered_models():
         table.add_row(
-            spec.key,
-            DetectorKind.ONNX_YOLO.value,
+            rich_escape(spec.key),
+            rich_escape(DetectorKind.ONNX_YOLO.value),
             _safe_is_cached(models_hub.is_model_cached, spec.key),
-            f"{spec.repo_id}@{spec.revision[:8]}",
-            spec.license_notice,
+            rich_escape(f"{spec.repo_id}@{spec.revision[:8]}"),
+            rich_escape(spec.license_notice),
         )
 
     for magi_spec in models_hub.list_registered_magi_models():
         table.add_row(
-            magi_spec.key,
-            DetectorKind.MAGI.value,
+            rich_escape(magi_spec.key),
+            rich_escape(DetectorKind.MAGI.value),
             _safe_is_cached(models_hub.is_magi_cached, magi_spec.key),
-            f"{magi_spec.repo_id}@{magi_spec.revision[:8]}",
-            magi_spec.license_notice,
+            rich_escape(f"{magi_spec.repo_id}@{magi_spec.revision[:8]}"),
+            rich_escape(magi_spec.license_notice),
         )
 
     console.print(table)
@@ -787,58 +848,79 @@ def models_fetch(
     ] = False,
 ) -> None:
     """Download and verify a registered panel detection model into the local cache."""
+    onnx_spec: models_hub.ModelSpec | None = None
+    magi_spec: models_hub.MagiModelSpec | None = None
     try:
+        onnx_spec = models_hub.get_model_spec(name)
+    except ValueError:
         try:
-            spec = models_hub.get_model_spec(name)
-            dest = models_hub.fetch_model(spec.key, force=force)
-            notice = spec.license_notice
-        except ValueError:
             magi_spec = models_hub.get_magi_model_spec(name)
+        except ValueError as exc:
+            supported = ", ".join(models_hub.list_all_model_keys())
+            msg = f"Unknown model '{name}'. Registered models: {supported}"
+            console.print(f"[red]Error:[/red] {rich_escape(msg)}")
+            raise typer.Exit(code=1) from exc
+
+    try:
+        if onnx_spec is not None:
+            dest = models_hub.fetch_model(onnx_spec.key, force=force)
+            notice = onnx_spec.license_notice
+        else:
+            assert magi_spec is not None
             dest = models_hub.fetch_magi_model(magi_spec.key, force=force)
             notice = magi_spec.license_notice
-    except (ValueError, RuntimeError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[green]Cached model:[/green] {dest}")
-    console.print(f"[dim]License notice: {notice}[/dim]")
+    console.print(f"[green]Cached model:[/green] {rich_escape(str(dest))}")
+    console.print(f"[dim]License notice: {rich_escape(notice)}[/dim]")
 
 
 def _print_benchmark_notices(
     dataset: BenchmarkDatasetKind,
     backend_kinds: list[DetectorKind],
-    detector_model: str | None,
+    model_target: models_hub.ResolvedModelTarget | None,
 ) -> None:
     """Display dataset and model license/attribution notices before loading."""
     dataset_notice = cv_benchmark.get_dataset_license_notice(dataset)
     if dataset_notice:
-        console.print(f"[dim]Dataset license notice: {dataset_notice}[/dim]")
+        console.print(f"[dim]Dataset license notice: {rich_escape(dataset_notice)}[/dim]")
 
     for kind in backend_kinds:
+        if model_target is not None and model_target.backend == kind and model_target.model_path is not None:
+            continue
+        scoped_model = (
+            model_target.model_id
+            if model_target is not None and model_target.backend == kind
+            else None
+        )
         if kind == DetectorKind.ONNX_YOLO:
             try:
-                _, model_key = models_hub.resolve_model_spec(
-                    detector_model or models_hub.DEFAULT_ONNX_MODEL_KEY
+                spec = models_hub.get_model_spec(
+                    scoped_model or models_hub.DEFAULT_ONNX_MODEL_KEY
                 )
-                if model_key is not None:
-                    spec = models_hub.get_model_spec(model_key)
-                    console.print(f"[dim]Model license ({spec.key}): {spec.license_notice}[/dim]")
+                console.print(
+                    f"[dim]Model license ({rich_escape(spec.key)}): "
+                    f"{rich_escape(spec.license_notice)}[/dim]"
+                )
             except ValueError:
                 pass
         elif kind == DetectorKind.MAGI:
             try:
-                _, model_key = models_hub.resolve_magi_model_spec(
-                    detector_model or models_hub.DEFAULT_MAGI_MODEL_KEY
+                spec = models_hub.get_magi_model_spec(
+                    scoped_model or models_hub.DEFAULT_MAGI_MODEL_KEY
                 )
-                if model_key is not None:
-                    spec = models_hub.get_magi_model_spec(model_key)
-                    console.print(f"[dim]Model license ({spec.key}): {spec.license_notice}[/dim]")
+                console.print(
+                    f"[dim]Model license ({rich_escape(spec.key)}): "
+                    f"{rich_escape(spec.license_notice)}[/dim]"
+                )
             except ValueError:
                 pass
 
 
 def _render_benchmark_table(results: list[BenchmarkMetrics], title: str) -> Table:
-    table = Table(title=title, expand=True)
+    table = Table(title=rich_escape(title), expand=True)
     table.add_column("Backend", style="bold", no_wrap=True)
     table.add_column("Pages", justify="right")
     table.add_column("P@50", justify="right")
@@ -856,7 +938,7 @@ def _render_benchmark_table(results: list[BenchmarkMetrics], title: str) -> Tabl
 
     for row in results:
         table.add_row(
-            row.backend.value,
+            rich_escape(row.backend.value),
             str(row.pages_evaluated),
             f"{row.precision_50:.3f}",
             f"{row.recall_50:.3f}",
@@ -961,18 +1043,75 @@ def benchmark(
     ] = None,
 ) -> None:
     """Evaluate panel detection backends against PopManga, CoMix, or a local dataset."""
-    backend_kinds = _parse_compare_backends(backends) or [DetectorKind.CONTOUR]
+    backend_kinds = _parse_backend_list(backends, option_name="--backends") or [DetectorKind.CONTOUR]
     if any(k == DetectorKind.AUTO for k in backend_kinds):
         console.print("[red]Error:[/red] Specify concrete backends (contour, onnx, magi) instead of auto.")
         raise typer.Exit(code=1)
 
-    effective_direction = direction or cv_benchmark.default_direction_for_dataset(dataset)
-    _print_benchmark_notices(dataset, backend_kinds, detector_model)
-
+    model_target: models_hub.ResolvedModelTarget | None = None
     try:
+        if out is not None and out.exists() and out.is_dir():
+            raise ValueError(f"--out path exists and is a directory: {out}")
+
         if dataset == BenchmarkDatasetKind.LOCAL:
             if pages_dir is None or truth is None:
                 raise ValueError("--pages-dir and --truth are required when --dataset local is used.")
+            if not pages_dir.is_dir():
+                raise FileNotFoundError(f"Benchmark pages directory does not exist: {pages_dir}")
+            if not truth.is_file():
+                raise FileNotFoundError(f"Benchmark truth file does not exist: {truth}")
+
+        if detector_model is not None:
+            model_target = models_hub.resolve_detector_model_target(detector_model)
+            if model_target.backend not in backend_kinds:
+                raise ValueError(
+                    f"--detector-model '{detector_model}' targets backend "
+                    f"'{model_target.backend.value}', which is not in --backends "
+                    f"({', '.join(k.value for k in backend_kinds)})."
+                )
+
+        if DetectorKind.MAGI in backend_kinds and not allow_remote_code:
+            raise RuntimeError(
+                "MagiBackend executes custom model code from ragavsachdeva/magiv3 "
+                "(trust_remote_code=True). Pass --allow-remote-code to enable Magi."
+            )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    effective_direction = direction or cv_benchmark.default_direction_for_dataset(dataset)
+    _print_benchmark_notices(dataset, backend_kinds, model_target)
+
+    resolved_backends: list[tuple[DetectorKind, PanelDetectorBackend]] = []
+    for kind in backend_kinds:
+        try:
+            scoped_model = (
+                detector_model
+                if model_target is not None and model_target.backend == kind
+                else None
+            )
+            cfg = _build_detector_config(
+                detector=kind,
+                detector_model=scoped_model,
+                device=device,
+                score_threshold=score_threshold,
+                allow_remote_code=allow_remote_code,
+                padding=0.02,
+                min_panel_area=0.03,
+                merge_bridged_panels=False,
+            )
+            backend = resolve_auto_chain(cfg)[0]
+            resolved_backends.append((kind, backend))
+        except Exception as exc:  # noqa: BLE001
+            console.print(
+                f"[red]Benchmark failed for '{rich_escape(kind.value)}':[/red] "
+                f"{rich_escape(str(exc))}"
+            )
+            raise typer.Exit(code=1) from exc
+
+    try:
+        if dataset == BenchmarkDatasetKind.LOCAL:
+            assert pages_dir is not None and truth is not None
             samples = cv_benchmark.load_local_dataset(pages_dir, truth, limit=limit)
         elif dataset == BenchmarkDatasetKind.POPMANGA:
             samples = cv_benchmark.load_popmanga_split(
@@ -988,24 +1127,13 @@ def benchmark(
                 limit=limit,
                 trust_remote_code=allow_remote_code,
             )
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     results: list[BenchmarkMetrics] = []
-    for kind in backend_kinds:
+    for kind, backend in resolved_backends:
         try:
-            cfg = _build_detector_config(
-                detector=kind,
-                detector_model=detector_model,
-                device=device,
-                score_threshold=score_threshold,
-                allow_remote_code=allow_remote_code,
-                padding=0.02,
-                min_panel_area=0.03,
-                merge_bridged_panels=False,
-            )
-            backend = resolve_auto_chain(cfg)[0]
             metrics = cv_benchmark.run_benchmark(
                 samples,
                 backend,
@@ -1014,7 +1142,10 @@ def benchmark(
             )
             results.append(metrics)
         except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Benchmark failed for '{kind.value}':[/red] {exc}")
+            console.print(
+                f"[red]Benchmark failed for '{rich_escape(kind.value)}':[/red] "
+                f"{rich_escape(str(exc))}"
+            )
             raise typer.Exit(code=1) from exc
 
     table = _render_benchmark_table(
@@ -1024,15 +1155,21 @@ def benchmark(
     console.print(table)
 
     if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "dataset": dataset.value,
-            "direction": effective_direction.value,
-            "pages_evaluated": len(samples),
-            "results": [
-                {**dataclasses.asdict(item), "backend": item.backend.value}
-                for item in results
-            ],
-        }
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        console.print(f"[green]Wrote benchmark report:[/green] {out}")
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "dataset": dataset.value,
+                "direction": effective_direction.value,
+                "pages_evaluated": len(samples),
+                "results": [
+                    {**dataclasses.asdict(item), "backend": item.backend.value}
+                    for item in results
+                ],
+            }
+            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            console.print(
+                f"[red]Failed to write benchmark report:[/red] {rich_escape(str(exc))}"
+            )
+            raise typer.Exit(code=1) from exc
+        console.print(f"[green]Wrote benchmark report:[/green] {rich_escape(str(out))}")

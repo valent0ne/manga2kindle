@@ -333,3 +333,103 @@ def test_pipeline_preview_batch_beautify_and_collision(tmp_path: Path) -> None:
     _make_dummy_cbz(in_dir / "Witch Hat Atelier v12 (2024) (Digital) (f2).cbz")
     with pytest.raises(ValueError, match="collision"):
         pipeline.preview_batch(cfg)
+
+
+def test_beautify_source_does_not_rename_when_preconditions_fail_or_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = DeviceProfile.from_name("KPW5")
+
+    # 1. Missing calibre-debug leaves source file unrenamed in single mode
+    cbz = _make_dummy_cbz(tmp_path / "Dandadan v01 (2022) (Digital) (f).cbz")
+    monkeypatch.setattr(PlatformDiscovery, "find_calibre", lambda self, override=None: None)
+    pipeline = ConversionPipeline()
+    cfg_missing_calibre = ConversionConfig(
+        input_path=cbz,
+        output_path=tmp_path / "out",
+        profile=profile,
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        beautify_source=True,
+    )
+    with pytest.raises(Exception, match="calibre-debug"):
+        pipeline.run_single(cfg_missing_calibre)
+    assert cbz.is_file()
+
+    # 2. Failed detector resolution leaves source file unrenamed in single mode
+    monkeypatch.setattr(
+        PlatformDiscovery, "find_calibre", lambda self, override=None: Path("/usr/bin/calibre-debug")
+    )
+    cfg_bad_detector = ConversionConfig(
+        input_path=cbz,
+        output_path=tmp_path / "out",
+        profile=profile,
+        detector=DetectorConfig(kind=DetectorKind.MAGI, allow_remote_code=False),
+        no_kcc=True,
+        beautify_source=True,
+    )
+    with pytest.raises(RuntimeError, match="allow_remote_code"):
+        pipeline.run_single(cfg_bad_detector)
+    assert cbz.is_file()
+
+    # 3. Unsupported extension leaves file unrenamed
+    bad_ext = tmp_path / "Notes (Digital).txt"
+    bad_ext.write_text("not an archive")
+    cfg_bad_ext = ConversionConfig(
+        input_path=bad_ext,
+        output_path=tmp_path / "out" / "Notes.kfx",
+        profile=profile,
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        beautify_source=True,
+    )
+    with pytest.raises(ValueError, match="Unsupported input format"):
+        pipeline.run_single(cfg_bad_ext)
+    assert bad_ext.is_file()
+
+    # 4. skip_existing leaves source file unrenamed in single mode
+    out_dir = tmp_path / "skip_out"
+    out_dir.mkdir()
+    existing_kfx = out_dir / "Dandadan v01 (2022).kfx"
+    existing_kfx.write_bytes(b"EXISTING")
+    cfg_skip_single = ConversionConfig(
+        input_path=cbz,
+        output_path=out_dir,
+        profile=profile,
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        skip_existing=True,
+        beautify_source=True,
+    )
+    assert pipeline.run_single(cfg_skip_single) == existing_kfx
+    assert cbz.is_file()
+
+    # 5. Batch mode with missing calibre or all skipped leaves source files unrenamed
+    batch_dir = tmp_path / "batch_pre"
+    b1 = _make_dummy_cbz(batch_dir / "Dandadan v01 (2022) (Digital) (f).cbz")
+    b2 = _make_dummy_cbz(batch_dir / "Dandadan v02 (2022) (Digital) (f).cbz")
+
+    monkeypatch.setattr(PlatformDiscovery, "find_calibre", lambda self, override=None: None)
+    batch_cfg = ConversionConfig(
+        input_path=batch_dir,
+        output_path=tmp_path / "batch_out",
+        profile=profile,
+        detector=DetectorConfig(kind=DetectorKind.CONTOUR),
+        no_kcc=True,
+        beautify_source=True,
+    )
+    with pytest.raises(Exception, match="calibre-debug"):
+        pipeline.run_batch(batch_cfg)
+    assert b1.is_file()
+    assert b2.is_file()
+
+    batch_out = tmp_path / "batch_skip_out"
+    batch_out.mkdir()
+    (batch_out / "Dandadan v01 (2022).kfx").write_bytes(b"EXISTING_1")
+    (batch_out / "Dandadan v02 (2022).kfx").write_bytes(b"EXISTING_2")
+    monkeypatch.setattr(
+        PlatformDiscovery, "find_calibre", lambda self, override=None: Path("/usr/bin/calibre-debug")
+    )
+    assert pipeline.run_batch(batch_cfg.model_copy(update={"output_path": batch_out, "skip_existing": True})) == []
+    assert b1.is_file()
+    assert b2.is_file()

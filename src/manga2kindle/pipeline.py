@@ -12,11 +12,16 @@ from pathlib import Path
 
 from manga2kindle.beautify import beautify_name, beautify_source_file
 from manga2kindle.compiler.kfx import KfxCompilationError, KfxCompiler
-from manga2kindle.cv.backends import BackendRegistry
+from manga2kindle.cv.backends import BackendRegistry, infer_config_model_target
 from manga2kindle.cv.preview import PanelPreviewRenderer
 from manga2kindle.cv.sorter import PanelSorter
-from manga2kindle.extractor import ArchiveExtractor, natural_sort_key
+from manga2kindle.extractor import (
+    SUPPORTED_ARCHIVE_EXTENSIONS,
+    ArchiveExtractor,
+    natural_sort_key,
+)
 from manga2kindle.models import (
+    DEFAULT_COVER_SIZE,
     DEFAULT_PROFILE_NAME,
     ConversionConfig,
     DetectorConfig,
@@ -46,12 +51,14 @@ class ConversionPipeline:
         preprocessor: ImagePreprocessor | None = None,
         builder: KpfBuilder | None = None,
         backend_registry: BackendRegistry | None = None,
+        on_detector_resolved: Callable[[DetectorKind, list[DetectorKind]], None] | None = None,
     ) -> None:
         self.discovery = discovery or PlatformDiscovery()
         self.extractor = extractor or ArchiveExtractor(discovery=self.discovery)
         self.preprocessor = preprocessor or ImagePreprocessor(discovery=self.discovery)
         self.builder = builder or KpfBuilder()
         self._backend_registry = backend_registry
+        self._on_detector_resolved = on_detector_resolved
         self.last_batch_errors: list[tuple[Path, Exception]] = []
         self.last_batch_skipped: list[Path] = []
         self.last_single_skipped: bool = False
@@ -64,12 +71,13 @@ class ConversionPipeline:
         if registry is not None:
             registry.resolve()
             return registry
-        if self._backend_registry is not None:
-            self._backend_registry.resolve()
-            return self._backend_registry
-        created = BackendRegistry(detector_config)
-        created.resolve()
-        return created
+        resolved = self._backend_registry or BackendRegistry(detector_config)
+        backends = resolved.resolve()
+        if self._on_detector_resolved is not None:
+            active = resolved.active_backend
+            if active is not None:
+                self._on_detector_resolved(active.kind, [backend.kind for backend in backends])
+        return resolved
 
     @staticmethod
     def _find_archives(directory: Path) -> list[Path]:
@@ -296,9 +304,15 @@ class ConversionPipeline:
     ) -> Path:
         """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
         self.last_single_skipped = False
-        if config.beautify_source and config.input_path.is_file():
-            renamed_input = beautify_source_file(config.input_path)
-            config = config.model_copy(update={"input_path": renamed_input})
+        if not config.input_path.exists():
+            raise FileNotFoundError(f"Input path does not exist: {config.input_path}")
+        if (
+            config.input_path.is_file()
+            and config.input_path.suffix.lower() not in SUPPORTED_ARCHIVE_EXTENSIONS
+        ):
+            raise ValueError(
+                f"Unsupported input format '{config.input_path.suffix}' for {config.input_path}"
+            )
 
         effective_beautify = config.effective_beautify
         input_name = self.resolve_input_name(config.input_path, beautify=effective_beautify)
@@ -320,6 +334,10 @@ class ConversionPipeline:
             )
 
         active_registry = self._resolve_registry(config.detector, registry)
+        if config.beautify_source and config.input_path.is_file():
+            renamed_input = beautify_source_file(config.input_path)
+            config = config.model_copy(update={"input_path": renamed_input})
+
         return self._convert_single(
             config,
             input_name=input_name,
@@ -370,26 +388,19 @@ class ConversionPipeline:
                 seen_source_names[src_key] = archive_path
             planned.append((archive_path, target_stem, out_kfx))
 
-        targets: list[tuple[Path, str, Path]] = []
-        for archive_path, target_stem, out_kfx in planned:
-            resolved_archive = (
-                beautify_source_file(archive_path) if config.beautify_source else archive_path
-            )
-            targets.append((resolved_archive, target_stem, out_kfx))
-
         self.last_batch_errors = []
         self.last_batch_skipped = []
-        pending_targets: list[tuple[Path, str, Path]] = []
-        for archive_path, target_stem, out_kfx in targets:
+        pending_planned: list[tuple[Path, str, Path]] = []
+        for archive_path, target_stem, out_kfx in planned:
             if config.skip_existing and out_kfx.is_file():
                 logger.info("Skipping existing output: %s", out_kfx)
                 self.last_batch_skipped.append(out_kfx)
                 if on_skip is not None:
                     on_skip(archive_path, out_kfx)
             else:
-                pending_targets.append((archive_path, target_stem, out_kfx))
+                pending_planned.append((archive_path, target_stem, out_kfx))
 
-        if not pending_targets:
+        if not pending_planned:
             return []
 
         calibre_path = self.discovery.find_calibre(override=config.calibre_path)
@@ -400,6 +411,22 @@ class ConversionPipeline:
             )
 
         batch_registry = self._resolve_registry(config.detector)
+
+        if config.beautify_source:
+            for archive_path, target_stem, _ in pending_planned:
+                if target_stem != archive_path.stem:
+                    target_src = archive_path.with_name(f"{target_stem}{archive_path.suffix}")
+                    if target_src.exists() and target_src.resolve() != archive_path.resolve():
+                        raise FileExistsError(
+                            f"Cannot beautify '{archive_path.name}': target '{target_src.name}' already exists."
+                        )
+            pending_targets = [
+                (beautify_source_file(archive_path), target_stem, out_kfx)
+                for archive_path, target_stem, out_kfx in pending_planned
+            ]
+        else:
+            pending_targets = pending_planned
+
         out_dir.mkdir(parents=True, exist_ok=True)
 
         batch_workers, per_book_workers = self._resolve_batch_workers(
@@ -503,6 +530,12 @@ class ConversionPipeline:
             raise ValueError(
                 "Using 'magi' in --compare requires --allow-remote-code."
             )
+        model_target = infer_config_model_target(detector_config)
+        if model_target is not None and model_target not in unique_kinds:
+            raise ValueError(
+                f"Configured detector model targets backend '{model_target.value}', "
+                f"which is not in --compare ({', '.join(k.value for k in unique_kinds)})."
+            )
         return unique_kinds
 
     def preview_panels(
@@ -522,6 +555,7 @@ class ConversionPipeline:
         keep_temp: bool = False,
         workers: int = 4,
         kcc_path: Path | None = None,
+        cover_size: tuple[int, int] = DEFAULT_COVER_SIZE,
         registry: BackendRegistry | None = None,
     ) -> list[Path]:
         """Extract, preprocess, detect/sort panels, and render numbered PNG debug overlays."""
@@ -550,14 +584,22 @@ class ConversionPipeline:
             keep_temp=keep_temp,
             workers=workers,
             kcc_path=kcc_path,
+            cover_size=cover_size,
         )
 
         compare_registries: dict[DetectorKind, BackendRegistry] | None = None
         active_registry: BackendRegistry | None = None
         if compare_kinds is not None:
+            model_target = infer_config_model_target(detector_cfg)
             compare_registries = {}
             for kind in compare_kinds:
-                reg = BackendRegistry(detector_cfg.model_copy(update={"kind": kind}))
+                if model_target is not None and kind != model_target:
+                    kind_cfg = detector_cfg.model_copy(
+                        update={"kind": kind, "model_path": None, "model_id": None}
+                    )
+                else:
+                    kind_cfg = detector_cfg.model_copy(update={"kind": kind})
+                reg = BackendRegistry(kind_cfg)
                 reg.resolve()
                 compare_registries[kind] = reg
         else:
@@ -672,6 +714,7 @@ class ConversionPipeline:
                     keep_temp=config.keep_temp,
                     workers=per_book_workers,
                     kcc_path=config.kcc_path,
+                    cover_size=config.cover_size,
                     registry=batch_registry,
                 )
                 return archive_path, preview_dir, None

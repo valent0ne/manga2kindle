@@ -13,7 +13,6 @@ from manga2kindle.models import (
     PanelBox,
     ReadingDirection,
     SpreadMode,
-    ZoomRect,
 )
 from manga2kindle.platform import PlatformDiscovery, ToolStatus
 
@@ -45,7 +44,6 @@ def test_conversion_config_defaults_and_validators(tmp_path):
     )
     assert cfg.direction == ReadingDirection.RTL
     assert cfg.spread_mode == SpreadMode.SPLIT
-    assert cfg.zoom_factor == 1.5
     assert cfg.padding == 0.04
     assert cfg.min_panel_area == 0.03
     assert cfg.no_kcc is False
@@ -61,13 +59,6 @@ def test_conversion_config_defaults_and_validators(tmp_path):
             cover_size=(0, 2560),
         )
 
-    with pytest.raises(ValidationError):
-        ConversionConfig(
-            input_path=tmp_path / "in.cbz",
-            output_path=tmp_path / "out.kfx",
-            profile=profile,
-            zoom_factor=0.9,
-        )
     with pytest.raises(ValidationError):
         ConversionConfig(
             input_path=tmp_path / "in.cbz",
@@ -107,7 +98,6 @@ def test_conversion_config_defaults_and_validators(tmp_path):
 
 def test_panel_and_page_models(tmp_path):
     panel = PanelBox(x=10, y=20, w=300, h=400, ordinal=1)
-    zoom = ZoomRect(x=0, y=0, w=450, h=600)
     page = PageAsset(
         index=0,
         source_path=tmp_path / "0000.png",
@@ -117,7 +107,6 @@ def test_panel_and_page_models(tmp_path):
         panels=[panel],
     )
     assert panel.ordinal == 1
-    assert zoom.w == 450
     assert page.is_cover is True
     assert len(page.panels) == 1
 

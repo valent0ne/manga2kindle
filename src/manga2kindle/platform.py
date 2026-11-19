@@ -275,17 +275,20 @@ class PlatformDiscovery:
             )
         )
 
-        from manga2kindle.cv.backends import resolve_auto_chain
+        from manga2kindle.cv.backends import describe_auto_chain
         from manga2kindle.models import DetectorConfig
 
-        chain = resolve_auto_chain(DetectorConfig())
-        chain_names = [backend.kind.value for backend in chain]
+        chain, note = describe_auto_chain(DetectorConfig())
+        chain_names = [kind.value for kind in chain]
+        details = f"chain: {' -> '.join(chain_names)}"
+        if note:
+            details = f"{details} ({note})"
         results.append(
             ToolStatus(
                 name="AUTO Detector",
                 found=True,
                 version=chain_names[0] if chain_names else None,
-                details=f"chain: {' -> '.join(chain_names)}",
+                details=details,
             )
         )
         return results

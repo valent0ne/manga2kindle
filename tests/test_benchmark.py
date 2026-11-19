@@ -465,3 +465,94 @@ class TestRunBenchmarkAndCli:
         assert result.exit_code == 0, result.output
         assert len(seen_configs) == 1
         assert seen_configs[0].merge_bridged_panels is False
+
+    def test_cli_benchmark_validation_dedup_and_error_handling(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Invalid backend error references --backends (not --compare)
+        bad_backend = runner.invoke(app, ["benchmark", "--backends", "foo"])
+        assert bad_backend.exit_code != 0
+        assert "--backends" in bad_backend.output
+        assert "--compare" not in bad_backend.output
+
+        # --out pointing to an existing directory fails fast before loading dataset
+        existing_dir = tmp_path / "existing_dir"
+        existing_dir.mkdir()
+        load_called = False
+
+        def fail_load(*_args, **_kwargs):
+            nonlocal load_called
+            load_called = True
+            raise AssertionError("Dataset loader must not run on upfront validation failure")
+
+        monkeypatch.setattr("manga2kindle.cv.benchmark.load_popmanga_split", fail_load)
+
+        bad_out = runner.invoke(
+            app,
+            ["benchmark", "--dataset", "popmanga", "--backends", "contour", "--out", str(existing_dir)],
+        )
+        assert bad_out.exit_code == 1
+        assert not load_called
+
+        # Missing --allow-remote-code for magi fails fast before loading dataset
+        magi_no_opt = runner.invoke(
+            app,
+            ["benchmark", "--dataset", "popmanga", "--backends", "contour,magi"],
+        )
+        assert magi_no_opt.exit_code == 1
+        assert "allow-remote-code" in magi_no_opt.output.lower()
+        assert not load_called
+
+        # Network/OSError from dataset loader exits cleanly with code 1
+        def fail_network(*_args, **_kwargs):
+            raise ConnectionError("HF gated repo unreachable")
+
+        monkeypatch.setattr("manga2kindle.cv.benchmark.load_popmanga_split", fail_network)
+        net_err = runner.invoke(
+            app,
+            ["benchmark", "--dataset", "popmanga", "--backends", "contour"],
+        )
+        assert net_err.exit_code == 1
+        assert "HF gated repo unreachable" in net_err.output
+
+        # Duplicate backends in --backends are deduplicated
+        pages_dir = tmp_path / "dup_pages"
+        pages_dir.mkdir()
+        Image.new("RGB", (800, 1200), (255, 255, 255)).save(pages_dir / "p1.png")
+        truth_file = tmp_path / "dup_truth.json"
+        truth_file.write_text(
+            json.dumps(
+                {
+                    "pages": [
+                        {
+                            "page_id": "p1",
+                            "file_name": "p1.png",
+                            "panels": [{"x": 50, "y": 50, "w": 300, "h": 400, "ordinal": 1}],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        dup_out = tmp_path / "dup_report.json"
+        dup_res = runner.invoke(
+            app,
+            [
+                "benchmark",
+                "--dataset",
+                "local",
+                "--pages-dir",
+                str(pages_dir),
+                "--truth",
+                str(truth_file),
+                "--backends",
+                "contour,contour",
+                "--out",
+                str(dup_out),
+            ],
+        )
+        assert dup_res.exit_code == 0, dup_res.output
+        payload = json.loads(dup_out.read_text(encoding="utf-8"))
+        assert len(payload["results"]) == 1

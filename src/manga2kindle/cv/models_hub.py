@@ -8,6 +8,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from manga2kindle.models import DetectorKind
+
 _APP_NAME = "manga2kindle"
 _DOWNLOAD_CHUNK_BYTES = 65536
 _DOWNLOAD_TIMEOUT_SECONDS = 120.0
@@ -357,3 +359,56 @@ def resolve_magi_model_spec(raw: str) -> tuple[Path | None, str | None]:
 
     canonical = _MAGI_ALIASES.get(value, value)
     return (None, canonical)
+
+
+@dataclass(frozen=True)
+class ResolvedModelTarget:
+    """Resolved target backend and local weights path or registered model key."""
+
+    backend: DetectorKind
+    model_path: Path | None = None
+    model_id: str | None = None
+
+
+def list_all_model_keys() -> list[str]:
+    """Return all registered ONNX and Magi model keys."""
+    return [s.key for s in list_registered_models()] + [s.key for s in list_registered_magi_models()]
+
+
+def resolve_detector_model_target(raw: str) -> ResolvedModelTarget:
+    """Resolve a --detector-model specifier to its target backend and key or existing local path."""
+    value = raw.strip()
+    if not value:
+        raise ValueError("Model specifier must not be empty")
+
+    try:
+        spec = get_model_spec(value)
+        return ResolvedModelTarget(backend=DetectorKind.ONNX_YOLO, model_id=spec.key)
+    except ValueError:
+        pass
+
+    try:
+        magi_spec = get_magi_model_spec(value)
+        return ResolvedModelTarget(backend=DetectorKind.MAGI, model_id=magi_spec.key)
+    except ValueError:
+        pass
+
+    is_windows_drive = len(value) >= 2 and value[1] == ":" and value[0].isalpha()
+    is_unc_or_relative = value.startswith(("/", "\\", "./", "../", ".\\", "..\\", "~"))
+    has_onnx_suffix = value.lower().endswith(".onnx")
+    candidate = Path(value).expanduser()
+
+    if is_windows_drive or is_unc_or_relative or has_onnx_suffix or candidate.exists():
+        if not candidate.exists():
+            if has_onnx_suffix:
+                raise FileNotFoundError(f"ONNX model file not found: {candidate}")
+            raise FileNotFoundError(f"Detector model path not found: {candidate}")
+        if candidate.is_dir():
+            return ResolvedModelTarget(backend=DetectorKind.MAGI, model_path=candidate)
+        return ResolvedModelTarget(backend=DetectorKind.ONNX_YOLO, model_path=candidate)
+
+    supported = ", ".join(list_all_model_keys())
+    raise ValueError(
+        f"Unknown detector model '{raw}'. Registered models: {supported} "
+        "(or pass an existing local weights path)."
+    )
