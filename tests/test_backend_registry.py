@@ -477,3 +477,50 @@ class TestModelsAndDoctorCli:
         assert resolved.panel_overlap_threshold == 0.40
         assert resolved.max_merged_area_ratio == 0.50
         assert resolved.min_fill_ratio == 0.70
+
+    def test_models_fetch_preserves_sha256_error_lists_all_keys_and_handles_network_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import urllib.error
+
+        # Unknown model lists both ONNX and Magi keys
+        unknown_res = runner.invoke(app, ["models", "fetch", "nonexistent-model"])
+        assert unknown_res.exit_code == 1
+        for key in ("manga109-yolo-s", "manga109-yolo-n", "magiv3", "magiv2"):
+            assert key in unknown_res.output
+
+        # SHA-256 ValueError must NOT be masked by Magi lookup
+        def sha_fail(model_key: str, force: bool = False) -> Path:
+            raise ValueError(f"SHA-256 mismatch for {model_key}")
+
+        monkeypatch.setattr("manga2kindle.cv.models_hub.fetch_model", sha_fail)
+        sha_res = runner.invoke(app, ["models", "fetch", "manga109-yolo-s"])
+        assert sha_res.exit_code == 1
+        assert "SHA-256 mismatch" in sha_res.output
+        assert "Unknown Magi model" not in sha_res.output
+
+        # Network errors exit cleanly with code 1 instead of crashing with traceback
+        def url_fail(model_key: str, force: bool = False) -> Path:
+            raise urllib.error.URLError("offline")
+
+        monkeypatch.setattr("manga2kindle.cv.models_hub.fetch_model", url_fail)
+        net_res = runner.invoke(app, ["models", "fetch", "manga109-yolo-s"])
+        assert net_res.exit_code == 1
+        assert "offline" in net_res.output
+
+    def test_doctor_does_not_emit_auto_warning_when_magi_ready_without_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            "manga2kindle.cv.backends._probe_magi_readiness",
+            lambda _cfg: (True, "ready"),
+        )
+        with caplog.at_level(logging.WARNING, logger="manga2kindle.cv.backends"):
+            statuses = PlatformDiscovery().run_doctor()
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        auto_status = next(s for s in statuses if s.name == "AUTO Detector")
+        assert "magi ready with --allow-remote-code" in auto_status.details

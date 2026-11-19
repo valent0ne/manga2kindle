@@ -202,7 +202,6 @@ uv run manga2kindle benchmark --dataset local --pages-dir ./pages --truth ./trut
 | `--cover-size` | `1600x2560` | Cover `WIDTHxHEIGHT` (stretched to fill without borders) |
 | `-d, --direction` | `rtl` | Reading direction (`rtl` or `ltr`) |
 | `-s, --spread-mode` | `split` | Double-page spread handling (`split`, `rotate`, or `keep`) |
-| `-z, --zoom-factor` | `1.5` | Guided View magnification factor (`>= 1.0`) |
 | `--padding` | `0.04` | Panel bounding-box padding ratio (`0.0`–`0.25`) |
 | `--min-panel-area` | `0.03` | Minimum panel area ratio (`0.01`–`0.50`) |
 | `--detector` | `auto` | Panel detector backend (`auto`, `magi`, `onnx`, or `contour`) |

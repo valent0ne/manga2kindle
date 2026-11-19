@@ -302,7 +302,6 @@ class TestKfxCompilerIntegration:
             output_path=kfx_path,
             profile=DeviceProfile.from_name("KPW5"),
             direction=ReadingDirection.RTL,
-            zoom_factor=1.5,
         )
 
         KpfBuilder().build(

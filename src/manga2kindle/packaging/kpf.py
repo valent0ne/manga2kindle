@@ -17,7 +17,6 @@ from manga2kindle.models import (
     PageAsset,
     PanelBox,
     ReadingDirection,
-    ZoomRect,
 )
 from manga2kindle.packaging.ion import (
     ION_BVM,
@@ -237,32 +236,6 @@ class KpfBuilder:
             img_w=float(page_w) * scale,
             img_h=float(page_h) * scale,
         )
-
-    @staticmethod
-    def compute_zoom_rect(
-        panel: PanelBox,
-        page_w: int,
-        page_h: int,
-        zoom_factor: float = 1.5,
-    ) -> ZoomRect:
-        """Compute zoomed and clamped bounding box for Guided View magnification."""
-        factor = max(1.0, float(zoom_factor))
-        scaled_w = int(round(panel.w * factor))
-        scaled_h = int(round(panel.h * factor))
-
-        target_w = max(1, min(scaled_w, page_w))
-        target_h = max(1, min(scaled_h, page_h))
-
-        cx = panel.x + panel.w / 2.0
-        cy = panel.y + panel.h / 2.0
-
-        target_x = int(round(cx - target_w / 2.0))
-        target_y = int(round(cy - target_h / 2.0))
-
-        clamped_x = max(0, min(target_x, page_w - target_w))
-        clamped_y = max(0, min(target_y, page_h - target_h))
-
-        return ZoomRect(x=clamped_x, y=clamped_y, w=target_w, h=target_h)
 
     def build(
         self,
