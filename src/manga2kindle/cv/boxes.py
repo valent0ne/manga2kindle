@@ -138,6 +138,8 @@ _SAME_ROW_ADJACENCY_WEIGHT = 0.20
 
 _MARGIN_HALO_MIN_PX = 8
 _MARGIN_HALO_PAGE_RATIO = 0.04
+_ESSENTIAL_ALCOVE_MAX_GAP_RATIO = 0.12
+_MAX_ALCOVE_ADDED_AREA_RATIO = 0.08
 _DOMINANT_CLUSTER_MIN_TEXT_FRAC = 0.55
 _MAX_EXTERNAL_SLICE_OVERLAP = 0.25
 _MAX_TEXT_EXPANSION_AREA_RATIO = 0.85
@@ -329,6 +331,67 @@ def _rect_gap_sq(box_a: Rect, box_b: Rect) -> int:
     return dx * dx + dy * dy
 
 
+def _rect_intersects_halo(
+    t_box: Rect,
+    cluster_rect: Rect,
+    halo_px: int,
+    page_width: int,
+    page_height: int,
+) -> bool:
+    """Return True if ``t_box`` intersects ``cluster_rect`` expanded by ``halo_px``."""
+    rx, ry, rw, rh = cluster_rect
+    x1 = max(0, rx - halo_px)
+    y1 = max(0, ry - halo_px)
+    x2 = min(page_width, rx + rw + halo_px)
+    y2 = min(page_height, ry + rh + halo_px)
+    return _intersection_area(t_box, (x1, y1, x2 - x1, y2 - y1)) > 0
+
+
+def _pick_nearest_zero_conflict_cluster(
+    t_box: Rect,
+    candidate_roots: Sequence[int],
+    *,
+    cluster_rects: dict[int, Rect],
+    active_roots: Sequence[int],
+    page_area: int,
+    expansion_cap: float,
+    containment_threshold: float,
+    max_added_area_ratio: float | None = None,
+) -> int | None:
+    """Pick the closest candidate cluster whose expansion adds zero sibling overlap."""
+    scored: list[tuple[tuple[int, int, int, int], int]] = []
+    for r in candidate_roots:
+        curr_rect = cluster_rects[r]
+        cand = _union_rect(curr_rect, t_box)
+        cand_area = _box_area(cand)
+        if (cand_area / page_area) > expansion_cap:
+            continue
+        added_area = cand_area - _box_area(curr_rect)
+        if max_added_area_ratio is not None and (added_area / page_area) > max_added_area_ratio:
+            continue
+        if any(
+            other != r
+            and (
+                compute_containment(cand, cluster_rects[other]) >= containment_threshold
+                or _intersection_area(cand, cluster_rects[other])
+                > _intersection_area(curr_rect, cluster_rects[other])
+            )
+            for other in active_roots
+        ):
+            continue
+        score_key = (
+            _rect_gap_sq(t_box, curr_rect),
+            -_intersection_area(t_box, curr_rect),
+            added_area,
+            r,
+        )
+        scored.append((score_key, r))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
 def merge_bridged_panel_clusters(
     boxes: Sequence[Rect],
     page_width: int,
@@ -484,10 +547,16 @@ def merge_bridged_panel_clusters(
 
     # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
     # outside a single panel (or sit immediately adjacent in the white margin).
-    margin_px = max(_MARGIN_HALO_MIN_PX, int(round(_MARGIN_HALO_PAGE_RATIO * min(page_width, page_height))))
+    min_dim = min(page_width, page_height)
+    margin_px = max(_MARGIN_HALO_MIN_PX, int(round(_MARGIN_HALO_PAGE_RATIO * min_dim)))
+    alcove_px = max(margin_px, int(round(_ESSENTIAL_ALCOVE_MAX_GAP_RATIO * min_dim)))
     expansion_cap = max(max_merged_area_ratio, _MAX_TEXT_EXPANSION_AREA_RATIO)
     active_roots = list(cluster_rects.keys())
-    for t_box in (*text_boxes, *margin_text_boxes):
+    tagged_texts = [
+        *((t_box, True) for t_box in text_boxes),
+        *((t_box, False) for t_box in margin_text_boxes),
+    ]
+    for t_box, allow_alcove in tagged_texts:
         t_area = _box_area(t_box)
         if t_area <= 0 or (t_area / page_area) < min_text_area_ratio:
             continue
@@ -507,45 +576,42 @@ def merge_bridged_panel_clusters(
             if _DOMINANT_CLUSTER_MIN_TEXT_FRAC <= best_frac < 1.0:
                 target_root = best_root
         elif not direct_matches:
-            prox_matches: list[int] = []
-            for r in active_roots:
-                rx, ry, rw, rh = cluster_rects[r]
-                expanded_r = (
-                    max(0, rx - margin_px),
-                    max(0, ry - margin_px),
-                    min(page_width, rx + rw + margin_px) - max(0, rx - margin_px),
-                    min(page_height, ry + rh + margin_px) - max(0, ry - margin_px),
-                )
-                if _intersection_area(t_box, expanded_r) > 0:
-                    prox_matches.append(r)
+            prox_matches = [
+                r
+                for r in active_roots
+                if _rect_intersects_halo(t_box, cluster_rects[r], margin_px, page_width, page_height)
+            ]
             if len(prox_matches) == 1:
                 target_root = prox_matches[0]
             elif len(prox_matches) >= 2:
-                zero_conflict_candidates: list[tuple[tuple[int, int, int, int], int]] = []
-                for r in prox_matches:
-                    cand = _union_rect(cluster_rects[r], t_box)
-                    if (_box_area(cand) / page_area) > expansion_cap:
-                        continue
-                    if any(
-                        other != r
-                        and (
-                            compute_containment(cand, cluster_rects[other]) >= containment_threshold
-                            or _intersection_area(cand, cluster_rects[other])
-                            > _intersection_area(cluster_rects[r], cluster_rects[other])
-                        )
-                        for other in active_roots
-                    ):
-                        continue
-                    score_key = (
-                        _rect_gap_sq(t_box, cluster_rects[r]),
-                        -_intersection_area(t_box, cluster_rects[r]),
-                        _box_area(cand) - _box_area(cluster_rects[r]),
-                        r,
+                target_root = _pick_nearest_zero_conflict_cluster(
+                    t_box,
+                    prox_matches,
+                    cluster_rects=cluster_rects,
+                    active_roots=active_roots,
+                    page_area=page_area,
+                    expansion_cap=expansion_cap,
+                    containment_threshold=containment_threshold,
+                )
+            elif allow_alcove:
+                alcove_matches = [
+                    r
+                    for r in active_roots
+                    if _rect_intersects_halo(
+                        t_box, cluster_rects[r], alcove_px, page_width, page_height
                     )
-                    zero_conflict_candidates.append((score_key, r))
-                if zero_conflict_candidates:
-                    zero_conflict_candidates.sort(key=lambda item: item[0])
-                    target_root = zero_conflict_candidates[0][1]
+                ]
+                if alcove_matches:
+                    target_root = _pick_nearest_zero_conflict_cluster(
+                        t_box,
+                        alcove_matches,
+                        cluster_rects=cluster_rects,
+                        active_roots=active_roots,
+                        page_area=page_area,
+                        expansion_cap=expansion_cap,
+                        containment_threshold=containment_threshold,
+                        max_added_area_ratio=_MAX_ALCOVE_ADDED_AREA_RATIO,
+                    )
 
         if target_root is None:
             continue

@@ -514,3 +514,41 @@ def test_merge_bridged_panel_clusters_encloses_stranded_and_floating_margin_text
     assert len(c_large) == 2
     assert c_large[0].rect == upper_wide
     assert c_large[1].rect == (60, 330, 880, 660)
+
+
+def test_merge_bridged_panel_clusters_alcove_fallback_essential_only_and_bounded() -> None:
+    """Essential text in an open alcove beyond the 4% halo expands the unique zero-conflict panel."""
+    # Models Ch.71 p.0015 (1000x1000): 4% margin_px=40, 12% alcove_px=120
+    p_right = (440, 10, 480, 440)   # gap 60px from alcove_text (collides with p_above if expanded left)
+    p_above = (80, 10, 340, 260)    # y=10..270 -> gap 70px (>40, <=120); added area = 340*110 = 37_400 (3.7% <= 8%)
+    p_below = (80, 470, 840, 480)   # gap 90px below alcove_text (collides with p_right if expanded up)
+    alcove_text = (150, 340, 220, 40)  # y=340..380
+
+    # Essential text -> expands p_above down to y=380 with zero overlap on p_right or p_below
+    c_ess = merge_bridged_panel_clusters(
+        [p_right, p_above, p_below],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[alcove_text],
+    )
+    assert [c.rect for c in c_ess] == [p_right, (80, 10, 340, 370), p_below]
+
+    # Non-essential margin_text_boxes at the exact same distance must NOT trigger alcove expansion
+    c_margin = merge_bridged_panel_clusters(
+        [p_right, p_above, p_below],
+        page_width=1000,
+        page_height=1000,
+        margin_text_boxes=[alcove_text],
+    )
+    assert [c.rect for c in c_margin] == [p_right, p_above, p_below]
+
+    # Essential alcove text requiring > 8% added area is rejected by the bounded bloat guard
+    wide_top = (80, 10, 840, 200)
+    far_text = (200, 315, 400, 30)  # 105px below wide_top -> added area = 840*135 = 113_400 (11.3% > 8%)
+    c_bloat = merge_bridged_panel_clusters(
+        [wide_top],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[far_text],
+    )
+    assert c_bloat[0].rect == wide_top
