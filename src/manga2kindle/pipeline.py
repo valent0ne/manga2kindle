@@ -13,6 +13,8 @@ from pathlib import Path
 from manga2kindle.beautify import beautify_name, beautify_source_file
 from manga2kindle.compiler.kfx import KfxCompilationError, KfxCompiler
 from manga2kindle.cv.backends import BackendRegistry, infer_config_model_target
+from manga2kindle.cv.boxes import DEFAULT_PADDING
+from manga2kindle.cv.merger import PanelMerger
 from manga2kindle.cv.preview import PanelPreviewRenderer
 from manga2kindle.cv.sorter import PanelSorter
 from manga2kindle.extractor import (
@@ -29,6 +31,7 @@ from manga2kindle.models import (
     DeviceProfile,
     PageAsset,
     PanelBox,
+    PanelMergeConfig,
     ReadingDirection,
     SpreadMode,
 )
@@ -207,6 +210,8 @@ class ConversionPipeline:
         registry: BackendRegistry,
         direction: ReadingDirection,
         workers: int,
+        panel_merge: PanelMergeConfig | None = None,
+        padding: float = DEFAULT_PADDING,
     ) -> list[PageAsset]:
         sorter = PanelSorter(direction=direction)
         active = registry.active_backend
@@ -220,25 +225,44 @@ class ConversionPipeline:
                 page_widths=widths,
                 is_spreads=spreads,
             )
-            return [
+            annotated = [
                 page.model_copy(update={"panels": panels})
                 for page, panels in zip(pages, panel_lists)
             ]
+        else:
+            def _process_page(page: PageAsset) -> PageAsset:
+                img_path = page.processed_path or page.source_path
+                panels = registry.detect_and_sort(
+                    img_path,
+                    sorter,
+                    page_width=page.width,
+                    is_spread=page.is_spread,
+                )
+                return page.model_copy(update={"panels": panels})
 
-        def _process_page(page: PageAsset) -> PageAsset:
-            img_path = page.processed_path or page.source_path
-            panels = registry.detect_and_sort(
-                img_path,
-                sorter,
-                page_width=page.width,
-                is_spread=page.is_spread,
-            )
-            return page.model_copy(update={"panels": panels})
+            if workers > 1 and len(pages) > 1:
+                with ThreadPoolExecutor(max_workers=min(workers, len(pages))) as executor:
+                    annotated = list(executor.map(_process_page, pages))
+            else:
+                annotated = [_process_page(page) for page in pages]
 
-        if workers > 1 and len(pages) > 1:
-            with ThreadPoolExecutor(max_workers=min(workers, len(pages))) as executor:
-                return list(executor.map(_process_page, pages))
-        return [_process_page(page) for page in pages]
+        if panel_merge is not None and panel_merge.enabled:
+            merger = PanelMerger(panel_merge)
+            return [
+                page.model_copy(
+                    update={
+                        "panels": merger.merge(
+                            page.panels,
+                            page_width=page.width,
+                            page_height=page.height,
+                            is_spread=page.is_spread,
+                            padding=padding,
+                        )
+                    }
+                )
+                for page in annotated
+            ]
+        return annotated
 
     def _convert_single(
         self,
@@ -263,6 +287,8 @@ class ConversionPipeline:
                 registry=registry,
                 direction=config.direction,
                 workers=config.workers,
+                panel_merge=config.panel_merge,
+                padding=config.detector.padding,
             )
 
             kpf_path = work_dir / f"{input_name}.kpf"
@@ -550,6 +576,7 @@ class ConversionPipeline:
         min_panel_area: float = 0.03,
         detector: DetectorConfig | None = None,
         detector_config: DetectorConfig | None = None,
+        panel_merge: PanelMergeConfig | None = None,
         compare: list[DetectorKind] | None = None,
         no_kcc: bool = False,
         keep_temp: bool = False,
@@ -564,6 +591,14 @@ class ConversionPipeline:
             detector_config
             or detector
             or DetectorConfig(padding=padding, min_panel_area=min_panel_area)
+        )
+        resolved_merge = (
+            panel_merge
+            if panel_merge is not None
+            else PanelMergeConfig.for_profile(
+                resolved_profile,
+                enabled=detector_cfg.merge_bridged_panels,
+            )
         )
 
         compare_kinds: list[DetectorKind] | None = None
@@ -580,6 +615,7 @@ class ConversionPipeline:
             padding=padding,
             min_panel_area=min_panel_area,
             detector=detector_cfg,
+            panel_merge=resolved_merge,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             workers=workers,
@@ -619,6 +655,8 @@ class ConversionPipeline:
                         registry=reg,
                         direction=direction,
                         workers=workers,
+                        panel_merge=config.panel_merge,
+                        padding=config.detector.padding,
                     )
                     for kind, reg in compare_registries.items()
                 }
@@ -645,6 +683,8 @@ class ConversionPipeline:
                 registry=active_registry,
                 direction=direction,
                 workers=workers,
+                panel_merge=config.panel_merge,
+                padding=config.detector.padding,
             )
 
             def _render_page(page: PageAsset) -> Path:
@@ -710,6 +750,7 @@ class ConversionPipeline:
                     padding=config.padding,
                     min_panel_area=config.min_panel_area,
                     detector_config=config.detector,
+                    panel_merge=config.panel_merge,
                     no_kcc=config.no_kcc,
                     keep_temp=config.keep_temp,
                     workers=per_book_workers,

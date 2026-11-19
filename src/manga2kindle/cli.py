@@ -30,6 +30,7 @@ from manga2kindle.models import (
     DetectorKind,
     DevicePreference,
     DeviceProfile,
+    PanelMergeConfig,
     ReadingDirection,
     SpreadMode,
 )
@@ -380,7 +381,10 @@ def convert(
         bool,
         typer.Option(
             "--merge-panels/--no-merge-panels",
-            help="Merge adjacent panels bridged by shared dialogue bubbles or substantial overlap.",
+            help=(
+                "Merge panels bridged by dialogue bubbles or overlap and apply "
+                "profile-calibrated mini-panel row/sub-column merging."
+            ),
         ),
     ] = True,
 ) -> None:
@@ -441,6 +445,7 @@ def convert(
             padding=padding,
             min_panel_area=min_panel_area,
             detector=detector_cfg,
+            panel_merge=PanelMergeConfig.for_profile(device_profile, enabled=merge_panels),
             no_kcc=no_kcc,
             keep_temp=keep_temp,
             skip_existing=skip_existing,
@@ -490,6 +495,7 @@ def convert(
                 padding=padding,
                 min_panel_area=min_panel_area,
                 detector_config=detector_cfg,
+                panel_merge=config.panel_merge,
                 no_kcc=no_kcc,
                 keep_temp=keep_temp,
                 workers=workers,
@@ -661,7 +667,10 @@ def preview_panels(
         bool,
         typer.Option(
             "--merge-panels/--no-merge-panels",
-            help="Merge adjacent panels bridged by shared dialogue bubbles or substantial overlap.",
+            help=(
+                "Merge panels bridged by dialogue bubbles or overlap and apply "
+                "profile-calibrated mini-panel row/sub-column merging."
+            ),
         ),
     ] = True,
 ) -> None:
@@ -710,6 +719,7 @@ def preview_panels(
             padding=padding,
             min_panel_area=min_panel_area,
             detector_config=detector_cfg,
+            panel_merge=PanelMergeConfig.for_profile(device_profile, enabled=merge_panels),
             compare=compare_kinds,
             no_kcc=no_kcc,
             keep_temp=keep_temp,
