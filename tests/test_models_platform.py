@@ -273,3 +273,26 @@ def test_device_profile_size_tier_and_panel_merge_calibration(tmp_path: Path) ->
     )
     assert cfg_merge_explicit.panel_merge.enabled is True
 
+    # Bridged merge max_merged_area_ratio is also calibrated per DeviceSizeTier unless explicit
+    cfg_compact = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("CUSTOM", custom_size=(1072, 1448)),
+    )
+    cfg_standard = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("KPW6"),
+    )
+    assert cfg_compact.detector.max_merged_area_ratio == 0.45
+    assert cfg_standard.detector.max_merged_area_ratio == 0.55
+    assert cfg_ks.detector.max_merged_area_ratio == 0.70
+
+    cfg_bridged_explicit = ConversionConfig(
+        input_path=tmp_path / "in.cbz",
+        output_path=tmp_path / "out.kfx",
+        profile=DeviceProfile.from_name("KPW6"),
+        detector=DetectorConfig(max_merged_area_ratio=0.62),
+    )
+    assert cfg_bridged_explicit.detector.max_merged_area_ratio == 0.62
+

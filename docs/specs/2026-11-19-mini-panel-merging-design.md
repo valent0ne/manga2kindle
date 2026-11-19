@@ -42,10 +42,14 @@ Why post-sort rather than pre-padding inside `boxes.py`:
 
 Display presets and `--custom-size` profiles are classified by short edge (`min(width, height)`):
 
-| Tier (`DeviceSizeTier`) | Short Edge | Profiles | Tier Height Cap | Max Panel W / Area | Sub-Col W / H / Panel Area |
-| --- | --- | --- | --- | --- | --- |
-| `COMPACT` | `< 1150px` | 6" Basic (`CUSTOM` e.g. `1072×1448`) | `0.32` | `0.45` / `0.15` | `0.40` / `0.48` / `0.12` |
-| `STANDARD` *(default)* | `1150–1599px` | `KPW6`, `KPW5`, `OASIS` | `0.37` | `0.55` / `0.20` | `0.45` / `0.55` / `0.15` |
-| `LARGE` | `>= 1600px` | `KS` (Kindle Scribe) | `0.46` | `0.60` / `0.25` | `0.50` / `0.65` / `0.20` |
+| Tier (`DeviceSizeTier`) | Short Edge | Profiles | Bridged Area Cap (`max_merged_area_ratio`) | Tier Height Cap | Max Panel W / Area | Sub-Col W / H / Panel Area |
+| --- | --- | --- | --- | --- | --- | --- |
+| `COMPACT` | `< 1150px` | 6" Basic (`CUSTOM` e.g. `1072×1448`) | `0.45` | `0.32` | `0.45` / `0.15` | `0.40` / `0.48` / `0.12` |
+| `STANDARD` *(default)* | `1150–1599px` | `KPW6`, `KPW5`, `OASIS` | `0.55` | `0.37` | `0.55` / `0.20` | `0.45` / `0.55` / `0.15` |
+| `LARGE` | `>= 1600px` | `KS` (Kindle Scribe) | `0.70` | `0.46` | `0.60` / `0.25` | `0.50` / `0.65` / `0.20` |
 
-`ConversionConfig` auto-calibrates `panel_merge: PanelMergeConfig` from `profile` while preserving any explicitly overridden fields and respecting `detector.merge_bridged_panels`. The existing `--merge-panels / --no-merge-panels` CLI flag controls both bridged/bubble merging and Mode B mini-panel merging together (`benchmark` continues to keep `merge_bridged_panels=False` and skips `PanelMerger`).
+Additional bridged/gutter safety guards in `boxes.py` / `magi.py`:
+- **Partial-slice bridge guard (`_MAX_EXTERNAL_SLICE_OVERLAP = 0.25`):** rejects L-shaped bridge unions that slice `>= 25%` across unrelated panels instead of engulfing them.
+- **Nearest zero-conflict gutter text expansion & floating non-essential narration enclosure:** when unmerged gutter text sits near `>= 2` panels (`prox_matches`) — including floating `is_essential_text=False` narration captions with `< text_bridge_overlap` panel overlap (`margin_text_boxes`) — expands the closest zero-conflict panel up to `_MAX_TEXT_EXPANSION_AREA_RATIO = 0.85` without overlapping sibling panels or triggering panel merges.
+
+`ConversionConfig` auto-calibrates `panel_merge: PanelMergeConfig` and unset `detector.max_merged_area_ratio` from `profile` while preserving any explicitly overridden fields and respecting `detector.merge_bridged_panels`. The existing `--merge-panels / --no-merge-panels` CLI flag controls both bridged/bubble merging and Mode B mini-panel merging together (`benchmark` continues to keep `merge_bridged_panels=False` and skips `PanelMerger`).

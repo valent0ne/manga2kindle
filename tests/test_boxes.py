@@ -174,8 +174,10 @@ def test_merge_bridged_panel_clusters_three_panels_strongest_first_and_area_cap(
     # In p0 (x=300..500, y=380..450): 200x70 = 14_000 (29.2%)
     # In p1 (x=520..700, y=380..450): 180x70 = 12_600 (26.25%)
     # In p2 (x=300..700, y=470..500): 400x30 = 12_000 (25.0%)
-    # Weights: (0,1)=0.2625, (0,2)=0.25, (1,2)=0.25 -> (0,1) merges first (360_000 <= 650_000),
-    # then merging with p2 would be 900x900=810_000 > 650_000 so rejected!
+    # Weights: (0,1)=0.2625, (0,2)=0.25, (1,2)=0.25 -> (0,1) merges first (360_000 <= 550_000),
+    # then merging with p2 would be 900x900=810_000 > 550_000 so rejected!
+    # Merged cluster (0, 1) holds 400x70 = 28_000 / 48_000 (58.3% >= _DOMINANT_CLUSTER_MIN_TEXT_FRAC)
+    # of `bridge`, so it expands downward to y=500 to keep `bridge` intact while keeping member_indices split.
     clusters = merge_bridged_panel_clusters(
         [p0, p1, p2],
         page_width=1000,
@@ -183,7 +185,7 @@ def test_merge_bridged_panel_clusters_three_panels_strongest_first_and_area_cap(
         text_boxes=[bridge],
     )
     assert clusters == [
-        MergedCluster(rect=(50, 50, 900, 400), member_indices=(0, 1)),
+        MergedCluster(rect=(50, 50, 900, 450), member_indices=(0, 1)),
         MergedCluster(rect=p2, member_indices=(2,)),
     ]
 
@@ -434,3 +436,81 @@ def test_axis_interval_and_split_by_gutter() -> None:
     top = PanelBox(x=50, y=40, w=900, h=300)
     bot = PanelBox(x=50, y=360, w=900, h=400)
     assert split_by_gutter([bot, top], CutAxis.HORIZONTAL) == [[top], [bot]]
+
+
+def test_merge_bridged_panel_clusters_rejects_partial_slice_bridge_cascade() -> None:
+    """L-shaped bridge slicing >=25% across unrelated panels is rejected; clean sub-merge & text expansion succeed."""
+    # Models Ch.69 p.0013 (1000x1000 normalized): middle wide P2, bottom-right P3/P4, P5, P6
+    p2 = (50, 330, 900, 320)    # middle full-width
+    p3 = (680, 665, 270, 155)   # bottom-right top
+    p4 = (675, 830, 275, 165)   # bottom-right bottom
+    p5 = (440, 665, 230, 330)   # bottom middle (~46% sliced if (P2, P3) merged!)
+    p6 = (60, 670, 370, 325)    # bottom left (~45% sliced if (P2, P3) merged!)
+    # Bubble bridges P2 (28%) and P3 (69%): must NOT merge (P2, P3), instead P3 expands up after (P3, P4, P5) merges
+    bubble_p2_p3 = (690, 580, 210, 230)
+    # Bubble bridges P4 (72%) and P5 (23%): clean merge of (P4, P5) which engulfs P3 (~100%)
+    bubble_p4_p5 = (615, 815, 225, 155)
+
+    clusters = merge_bridged_panel_clusters(
+        [p2, p3, p4, p5, p6],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[bubble_p2_p3, bubble_p4_p5],
+        max_merged_area_ratio=0.55,
+    )
+    assert [c.member_indices for c in clusters] == [(0,), (1, 2, 3), (4,)]
+    assert clusters[0].rect == p2
+    # Bottom-right+mid cluster expanded upward to y=580 to enclose bubble_p2_p3 completely
+    assert clusters[1].rect == (440, 580, 510, 415)
+    assert clusters[2].rect == p6
+
+
+def test_merge_bridged_panel_clusters_encloses_stranded_and_floating_margin_text() -> None:
+    """Stranded 2-neighbor gutter text and wide floating margin text attach to zero-conflict panels without bridging."""
+    # Case 1 (Ch.70 p.0009): text overlaps right panel by 3.6% (<5%) and sits 4px from left panel
+    p_right = (504, 10, 450, 440)
+    p_left = (50, 10, 344, 440)
+    p_mid = (50, 500, 904, 300)
+    stranded = (398, 150, 110, 140)  # touches p_right 4px, gap 4px from p_left
+    c_stranded = merge_bridged_panel_clusters(
+        [p_right, p_left, p_mid],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[stranded],
+    )
+    assert [c.member_indices for c in c_stranded] == [(0,), (1,), (2,)]
+    assert c_stranded[0].rect == (398, 10, 556, 440)  # p_right enclosed stranded without touching p_left
+    assert c_stranded[1].rect == p_left
+
+    # Case 2 (Ch.69 p.0018 + Ch.70 p.0015): margin_text_boxes never merge, pick zero-conflict panel, and allow <=0.85 expansion
+    top_wide = (80, 10, 840, 260)
+    mid_right = (510, 330, 410, 250)
+    mid_left = (80, 330, 410, 250)
+    caption_below_top = (200, 290, 600, 26)  # 20px below top_wide, 14px above split mid_right/mid_left -> only top_wide has 0 overlap conflict!
+
+    c_caption = merge_bridged_panel_clusters(
+        [top_wide, mid_right, mid_left],
+        page_width=1000,
+        page_height=1000,
+        margin_text_boxes=[caption_below_top],
+        max_merged_area_ratio=0.55,
+    )
+    assert len(c_caption) == 3
+    assert c_caption[0].rect == (80, 10, 840, 306)  # expanded down to y=316, leaving mid_right/mid_left untouched
+    assert c_caption[1].rect == mid_right
+    assert c_caption[2].rect == mid_left
+
+    # Case 3 (Ch.70 p.0015 area > 0.55): single panel at 0.55 area expands up to <= 0.85 for floating caption
+    upper_wide = (60, 100, 880, 200)
+    lower_large = (60, 380, 880, 610)  # area = 0.537; expanded up to y=330 -> area = 0.581 (> 0.55, <= 0.85)
+    lower_caption = (200, 330, 600, 26)  # 24px above lower_large vs 30px below upper_wide -> closer to lower_large
+    c_large = merge_bridged_panel_clusters(
+        [upper_wide, lower_large],
+        page_width=1000,
+        page_height=1000,
+        margin_text_boxes=[lower_caption],
+        max_merged_area_ratio=0.55,
+    )
+    assert len(c_large) == 2
+    assert c_large[0].rect == upper_wide
+    assert c_large[1].rect == (60, 330, 880, 660)

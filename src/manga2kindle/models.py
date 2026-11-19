@@ -68,6 +68,7 @@ class _TierMergePreset:
     max_subcol_height_ratio: float
     max_subcol_panel_area_ratio: float
     max_external_overlap_ratio: float
+    max_bridged_area_ratio: float
 
 
 _PANEL_MERGE_TIER_PRESETS: dict[DeviceSizeTier, _TierMergePreset] = {
@@ -81,6 +82,7 @@ _PANEL_MERGE_TIER_PRESETS: dict[DeviceSizeTier, _TierMergePreset] = {
         max_subcol_height_ratio=0.48,
         max_subcol_panel_area_ratio=0.12,
         max_external_overlap_ratio=0.15,
+        max_bridged_area_ratio=0.45,
     ),
     DeviceSizeTier.STANDARD: _TierMergePreset(
         min_tier_panels=3,
@@ -92,6 +94,7 @@ _PANEL_MERGE_TIER_PRESETS: dict[DeviceSizeTier, _TierMergePreset] = {
         max_subcol_height_ratio=0.55,
         max_subcol_panel_area_ratio=0.15,
         max_external_overlap_ratio=0.15,
+        max_bridged_area_ratio=0.55,
     ),
     DeviceSizeTier.LARGE: _TierMergePreset(
         min_tier_panels=3,
@@ -103,6 +106,7 @@ _PANEL_MERGE_TIER_PRESETS: dict[DeviceSizeTier, _TierMergePreset] = {
         max_subcol_height_ratio=0.65,
         max_subcol_panel_area_ratio=0.20,
         max_external_overlap_ratio=0.15,
+        max_bridged_area_ratio=0.70,
     ),
 }
 
@@ -183,7 +187,7 @@ class PageAsset(BaseModel):
 
 DEFAULT_TEXT_BRIDGE_OVERLAP = 0.05
 DEFAULT_PANEL_OVERLAP_THRESHOLD = 0.25
-DEFAULT_MAX_MERGED_AREA_RATIO = 0.70
+DEFAULT_MAX_MERGED_AREA_RATIO = 0.55
 DEFAULT_MIN_FILL_RATIO = 0.55
 DEFAULT_MIN_TEXT_AREA_RATIO = 0.0005
 
@@ -227,7 +231,11 @@ class PanelMergeConfig(BaseModel):
     def for_tier(cls, tier: DeviceSizeTier, *, enabled: bool = True) -> PanelMergeConfig:
         """Return calibrated merge thresholds for a DeviceSizeTier."""
         preset = _PANEL_MERGE_TIER_PRESETS[tier]
-        preset_values = {f.name: getattr(preset, f.name) for f in fields(preset)}
+        preset_values = {
+            f.name: getattr(preset, f.name)
+            for f in fields(preset)
+            if f.name in cls.model_fields
+        }
         return cls(enabled=enabled, **preset_values)
 
     @classmethod
@@ -278,7 +286,7 @@ class ConversionConfig(BaseModel):
 
     @model_validator(mode="after")
     def _sync_panel_merge_for_profile(self) -> ConversionConfig:
-        """Calibrate unset panel_merge thresholds from the active DeviceProfile."""
+        """Calibrate unset panel_merge and detector bridge thresholds from the active DeviceProfile."""
         explicit = self.panel_merge.model_fields_set
         effective_enabled = (
             self.detector.merge_bridged_panels
@@ -292,12 +300,18 @@ class ConversionConfig(BaseModel):
         updates: dict[str, object] = {
             field_info.name: getattr(calibrated, field_info.name)
             for field_info in fields(_TierMergePreset)
-            if field_info.name not in explicit
+            if field_info.name in PanelMergeConfig.model_fields and field_info.name not in explicit
         }
         if "enabled" not in explicit:
             updates["enabled"] = calibrated.enabled
         if updates:
             self.panel_merge = self.panel_merge.model_copy(update=updates)
+
+        if "max_merged_area_ratio" not in self.detector.model_fields_set:
+            preset = _PANEL_MERGE_TIER_PRESETS[self.profile.size_tier]
+            self.detector = self.detector.model_copy(
+                update={"max_merged_area_ratio": preset.max_bridged_area_ratio}
+            )
         return self
 
     @field_validator("cover_size")

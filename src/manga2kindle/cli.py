@@ -494,7 +494,7 @@ def convert(
                 spread_mode=spread_mode,
                 padding=padding,
                 min_panel_area=min_panel_area,
-                detector_config=detector_cfg,
+                detector_config=config.detector,
                 panel_merge=config.panel_merge,
                 no_kcc=no_kcc,
                 keep_temp=keep_temp,

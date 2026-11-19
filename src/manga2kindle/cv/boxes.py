@@ -138,7 +138,9 @@ _SAME_ROW_ADJACENCY_WEIGHT = 0.20
 
 _MARGIN_HALO_MIN_PX = 8
 _MARGIN_HALO_PAGE_RATIO = 0.04
-_DOMINANT_CLUSTER_MIN_TEXT_FRAC = 0.65
+_DOMINANT_CLUSTER_MIN_TEXT_FRAC = 0.55
+_MAX_EXTERNAL_SLICE_OVERLAP = 0.25
+_MAX_TEXT_EXPANSION_AREA_RATIO = 0.85
 
 
 @dataclass(frozen=True)
@@ -320,12 +322,20 @@ def _union_rect(box_a: Rect, box_b: Rect) -> Rect:
     return (x1, y1, x2 - x1, y2 - y1)
 
 
+def _rect_gap_sq(box_a: Rect, box_b: Rect) -> int:
+    """Return squared Euclidean gap in pixels between two axis-aligned rectangles."""
+    dx = max(0, max(box_a[0], box_b[0]) - min(box_a[0] + box_a[2], box_b[0] + box_b[2]))
+    dy = max(0, max(box_a[1], box_b[1]) - min(box_a[1] + box_a[3], box_b[1] + box_b[3]))
+    return dx * dx + dy * dy
+
+
 def merge_bridged_panel_clusters(
     boxes: Sequence[Rect],
     page_width: int,
     page_height: int,
     *,
     text_boxes: Sequence[Rect] = (),
+    margin_text_boxes: Sequence[Rect] = (),
     text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
     panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
     max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
@@ -453,6 +463,14 @@ def merge_bridged_panel_clusters(
         if union_area <= 0 or (combined_area / union_area) < min_fill_ratio:
             continue
 
+        # Reject L-shaped merges that slice partially through unrelated panels.
+        if any(
+            _find(k) not in roots_to_merge
+            and compute_containment(union_rect, boxes[k]) >= _MAX_EXTERNAL_SLICE_OVERLAP
+            for k in valid_indices
+        ):
+            continue
+
         for other_root in roots_to_merge:
             if other_root == root_a:
                 continue
@@ -467,8 +485,9 @@ def merge_bridged_panel_clusters(
     # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
     # outside a single panel (or sit immediately adjacent in the white margin).
     margin_px = max(_MARGIN_HALO_MIN_PX, int(round(_MARGIN_HALO_PAGE_RATIO * min(page_width, page_height))))
+    expansion_cap = max(max_merged_area_ratio, _MAX_TEXT_EXPANSION_AREA_RATIO)
     active_roots = list(cluster_rects.keys())
-    for t_box in text_boxes:
+    for t_box in (*text_boxes, *margin_text_boxes):
         t_area = _box_area(t_box)
         if t_area <= 0 or (t_area / page_area) < min_text_area_ratio:
             continue
@@ -501,12 +520,38 @@ def merge_bridged_panel_clusters(
                     prox_matches.append(r)
             if len(prox_matches) == 1:
                 target_root = prox_matches[0]
+            elif len(prox_matches) >= 2:
+                zero_conflict_candidates: list[tuple[tuple[int, int, int, int], int]] = []
+                for r in prox_matches:
+                    cand = _union_rect(cluster_rects[r], t_box)
+                    if (_box_area(cand) / page_area) > expansion_cap:
+                        continue
+                    if any(
+                        other != r
+                        and (
+                            compute_containment(cand, cluster_rects[other]) >= containment_threshold
+                            or _intersection_area(cand, cluster_rects[other])
+                            > _intersection_area(cluster_rects[r], cluster_rects[other])
+                        )
+                        for other in active_roots
+                    ):
+                        continue
+                    score_key = (
+                        _rect_gap_sq(t_box, cluster_rects[r]),
+                        -_intersection_area(t_box, cluster_rects[r]),
+                        _box_area(cand) - _box_area(cluster_rects[r]),
+                        r,
+                    )
+                    zero_conflict_candidates.append((score_key, r))
+                if zero_conflict_candidates:
+                    zero_conflict_candidates.sort(key=lambda item: item[0])
+                    target_root = zero_conflict_candidates[0][1]
 
         if target_root is None:
             continue
 
         candidate_rect = _union_rect(cluster_rects[target_root], t_box)
-        if (_box_area(candidate_rect) / page_area) > max_merged_area_ratio:
+        if (_box_area(candidate_rect) / page_area) > expansion_cap:
             continue
         if any(
             other != target_root
@@ -533,6 +578,7 @@ def merge_bridged_panels(
     page_height: int,
     *,
     text_boxes: Sequence[Rect] = (),
+    margin_text_boxes: Sequence[Rect] = (),
     text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
     panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
     max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
@@ -546,6 +592,7 @@ def merge_bridged_panels(
         page_width,
         page_height,
         text_boxes=text_boxes,
+        margin_text_boxes=margin_text_boxes,
         text_bridge_overlap=text_bridge_overlap,
         panel_overlap_threshold=panel_overlap_threshold,
         max_merged_area_ratio=max_merged_area_ratio,
@@ -562,6 +609,7 @@ def finalize_panel_boxes(
     page_h: int,
     *,
     text_boxes: Sequence[Rect] = (),
+    margin_text_boxes: Sequence[Rect] = (),
     scores: Sequence[float] | None = None,
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
     containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
@@ -597,6 +645,7 @@ def finalize_panel_boxes(
             page_w,
             page_h,
             text_boxes=text_boxes,
+            margin_text_boxes=margin_text_boxes,
             text_bridge_overlap=text_bridge_overlap,
             panel_overlap_threshold=panel_overlap_threshold,
             max_merged_area_ratio=max_merged_area_ratio,

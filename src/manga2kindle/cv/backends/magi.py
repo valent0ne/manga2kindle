@@ -260,6 +260,40 @@ class MagiBackend:
                 rects.append(rect)
         return rects
 
+    def _extract_floating_non_essential_text_rects(
+        self,
+        page_result: Any,
+        panel_rects: Sequence[Rect],
+        orig_w: int,
+        orig_h: int,
+    ) -> list[Rect]:
+        """Extract non-essential texts floating outside all panels (e.g. gutter narration)."""
+        if not isinstance(page_result, dict) or not panel_rects:
+            return []
+        raw_texts = page_result.get(_MAGI_TEXTS_KEY)
+        essential_mask = page_result.get(_MAGI_ESSENTIAL_TEXT_KEY)
+        if raw_texts is None or essential_mask is None:
+            return []
+        text_list = list(raw_texts)
+        mask_list = list(essential_mask)
+        if not text_list or len(mask_list) != len(text_list):
+            return []
+
+        floating: list[Rect] = []
+        overlap_limit = self._config.text_bridge_overlap
+        for idx, box in enumerate(text_list):
+            if bool(mask_list[idx]):
+                continue
+            rect = _xyxy_to_rect(box, orig_w, orig_h)
+            if rect is None:
+                continue
+            area = rect[2] * rect[3]
+            if area <= 0:
+                continue
+            if all((intersection_area(rect, p_rect) / area) < overlap_limit for p_rect in panel_rects):
+                floating.append(rect)
+        return floating
+
     def _recover_uncovered_contour_panels(
         self,
         magi_rects: list[Rect],
@@ -334,6 +368,11 @@ class MagiBackend:
             if self._config.merge_bridged_panels
             else []
         )
+        floating_margin_texts = (
+            self._extract_floating_non_essential_text_rects(page_result, rects, orig_w, orig_h)
+            if self._config.merge_bridged_panels
+            else []
+        )
         if image is not None and text_rects:
             text_rects = expand_text_boxes_to_bubbles(image, text_rects, is_rgb=True)
 
@@ -342,6 +381,7 @@ class MagiBackend:
             orig_w,
             orig_h,
             text_boxes=text_rects,
+            margin_text_boxes=floating_margin_texts,
             iou_threshold=self._config.iou_threshold,
             containment_threshold=self._config.containment_threshold,
             padding=self._config.padding,

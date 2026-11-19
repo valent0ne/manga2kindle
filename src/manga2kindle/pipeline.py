@@ -626,15 +626,15 @@ class ConversionPipeline:
         compare_registries: dict[DetectorKind, BackendRegistry] | None = None
         active_registry: BackendRegistry | None = None
         if compare_kinds is not None:
-            model_target = infer_config_model_target(detector_cfg)
+            model_target = infer_config_model_target(config.detector)
             compare_registries = {}
             for kind in compare_kinds:
                 if model_target is not None and kind != model_target:
-                    kind_cfg = detector_cfg.model_copy(
+                    kind_cfg = config.detector.model_copy(
                         update={"kind": kind, "model_path": None, "model_id": None}
                     )
                 else:
-                    kind_cfg = detector_cfg.model_copy(update={"kind": kind})
+                    kind_cfg = config.detector.model_copy(update={"kind": kind})
                 reg = BackendRegistry(kind_cfg)
                 reg.resolve()
                 compare_registries[kind] = reg
