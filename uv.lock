@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1283,8 +1283,7 @@ magi = [
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "platformdirs" },
-    { name = "pytorch-metric-learning", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "pytorch-metric-learning", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "pytorch-metric-learning" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "shapely" },
@@ -1317,15 +1316,15 @@ requires-dist = [
     { name = "psutil", marker = "extra == 'benchmark'", specifier = ">=5.9" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
-    { name = "pytorch-metric-learning", marker = "extra == 'magi'", specifier = ">=2.0" },
+    { name = "pytorch-metric-learning", marker = "extra == 'magi'", specifier = ">=2.0,<3.0" },
     { name = "rarfile", specifier = ">=4.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "scipy", marker = "extra == 'magi'", specifier = ">=1.11" },
     { name = "shapely", marker = "extra == 'magi'", specifier = ">=2.0" },
     { name = "timm", marker = "extra == 'magi'", specifier = ">=0.9" },
-    { name = "torch", marker = "(sys_platform == 'linux' or sys_platform == 'win32') and extra == 'magi'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'magi') or (sys_platform == 'win32' and extra == 'magi')", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'magi'", specifier = ">=2.2" },
-    { name = "torchvision", marker = "(sys_platform == 'linux' or sys_platform == 'win32') and extra == 'magi'", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torchvision", marker = "(sys_platform == 'linux' and extra == 'magi') or (sys_platform == 'win32' and extra == 'magi')", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'magi'", specifier = ">=0.17" },
     { name = "transformers", marker = "extra == 'magi'", specifier = ">=4.40,<4.50" },
     { name = "typer", extras = ["all"], specifier = ">=0.9.0" },
@@ -2999,19 +2998,9 @@ wheels = [
 name = "pytorch-metric-learning"
 version = "2.9.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform == 'win32'",
-    "python_full_version < '3.12' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-]
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and (sys_platform == 'linux' or sys_platform == 'win32')" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "scikit-learn" },
     { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
@@ -3020,25 +3009,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9b/80/6e61b1a91debf4c1b47d441f9a9d7fe2aabcdd9575ed70b2811474eb95c3/pytorch-metric-learning-2.9.0.tar.gz", hash = "sha256:27a626caf5e2876a0fd666605a78cb67ef7597e25d7a68c18053dd503830701f", size = 84530, upload-time = "2025-08-17T17:11:19.501Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/46/7d/73ef5052f57b7720cad00e16598db3592a5ef4826745ffca67a2f085d4dc/pytorch_metric_learning-2.9.0-py3-none-any.whl", hash = "sha256:d51646006dc87168f00cf954785db133a4c5aac81253877248737aa42ef6432a", size = 127801, upload-time = "2025-08-17T17:11:18.185Z" },
-]
-
-[[package]]
-name = "pytorch-metric-learning"
-version = "3.0.3"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-]
-dependencies = [
-    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" } },
-    { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" } },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e3/3d/100a7f6f7fc71783eca43d8ede7042d96681263d9494071815964ab4e907/pytorch_metric_learning-3.0.3.tar.gz", hash = "sha256:f0482dc376f954af2f83f85a48e3c735cac63e0a4de4a4a73bd63dea6810c9ae", size = 68824, upload-time = "2026-11-13T20:06:02.892Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f7/db/919c49c27246b865929f4b67f4d29a6a7ffd4b43839d3cf47aa60ae2936c/pytorch_metric_learning-3.0.3-py3-none-any.whl", hash = "sha256:a93bd769f3ae90cb3cac52bdb012c17e3b88be78a022f7d07cdcc98fe27b1737", size = 116792, upload-time = "2026-11-13T20:06:01.564Z" },
 ]
 
 [[package]]
@@ -3286,9 +3256,9 @@ dependencies = [
     { name = "joblib" },
     { name = "narwhals" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and (sys_platform == 'linux' or sys_platform == 'win32')" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and (sys_platform == 'linux' or sys_platform == 'win32')" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "threadpoolctl" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d2/eb/eaf5e07fcc0da7149b0e084f24e54edd7441b9a89ce7e034032ae97fe3a0/scikit_learn-1.9.1.tar.gz", hash = "sha256:629cada3e33e2b9bf376cdc7614a47a4140b8aedc1d836579e359736fbd82977", size = 7786908, upload-time = "2026-09-10T18:34:04.679Z" }
