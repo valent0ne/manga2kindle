@@ -36,6 +36,7 @@ from manga2kindle.models import (
 )
 from manga2kindle.pipeline import ConversionPipeline
 from manga2kindle.platform import PlatformDiscovery
+from manga2kindle.progress import RichProgressReporter
 
 app = typer.Typer(
     name="manga2kindle",
@@ -392,14 +393,14 @@ def convert(
     device_profile = _resolve_profile(profile, custom_size)
     resolved_cover_size = _resolve_cover_size(cover_size)
     effective_beautify = beautify or beautify_source
-    pipeline = ConversionPipeline(on_detector_resolved=_announce_detector)
+    probe_pipeline = ConversionPipeline()
 
     try:
         if preview_only and beautify_source:
             raise ValueError(
                 "--beautify-source cannot be used with --preview-only; use --beautify instead."
             )
-        is_batch = pipeline.is_batch_input(input_path)
+        is_batch = probe_pipeline.is_batch_input(input_path)
         if is_batch and title is not None:
             raise ValueError("--title cannot be used with a batch archive directory.")
         if output is None:
@@ -464,17 +465,17 @@ def convert(
     if preview_only:
         if is_batch:
             try:
-                preview_dirs = pipeline.preview_batch(config)
+                with RichProgressReporter(
+                    console, is_batch=True, complete_prefix="Rendered preview(s)"
+                ) as reporter:
+                    pipeline = ConversionPipeline(
+                        on_detector_resolved=_announce_detector,
+                        progress=reporter,
+                    )
+                    preview_dirs = pipeline.preview_batch(config)
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[red]Batch preview failed:[/red] {rich_escape(str(exc))}")
                 raise typer.Exit(code=1) from exc
-
-            for preview_dir in preview_dirs:
-                console.print(f"[green]Rendered preview(s):[/green] {rich_escape(str(preview_dir))}")
-            for failed_archive, err in pipeline.last_batch_errors:
-                console.print(
-                    f"[red]Failed:[/red] {rich_escape(failed_archive.name)} - {rich_escape(str(err))}"
-                )
 
             total = len(preview_dirs) + len(pipeline.last_batch_errors)
             console.print(
@@ -486,22 +487,27 @@ def convert(
             return
 
         try:
-            rendered = pipeline.preview_panels(
-                input_path=input_path,
-                output_dir=resolved_output,
-                profile=device_profile,
-                direction=direction,
-                spread_mode=spread_mode,
-                padding=padding,
-                min_panel_area=min_panel_area,
-                detector_config=config.detector,
-                panel_merge=config.panel_merge,
-                no_kcc=no_kcc,
-                keep_temp=keep_temp,
-                workers=workers,
-                kcc_path=kcc_path,
-                cover_size=resolved_cover_size,
-            )
+            with RichProgressReporter(console, is_batch=False) as reporter:
+                pipeline = ConversionPipeline(
+                    on_detector_resolved=_announce_detector,
+                    progress=reporter,
+                )
+                rendered = pipeline.preview_panels(
+                    input_path=input_path,
+                    output_dir=resolved_output,
+                    profile=device_profile,
+                    direction=direction,
+                    spread_mode=spread_mode,
+                    padding=padding,
+                    min_panel_area=min_panel_area,
+                    detector_config=config.detector,
+                    panel_merge=config.panel_merge,
+                    no_kcc=no_kcc,
+                    keep_temp=keep_temp,
+                    workers=workers,
+                    kcc_path=kcc_path,
+                    cover_size=resolved_cover_size,
+                )
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Preview failed:[/red] {rich_escape(str(exc))}")
             raise typer.Exit(code=1) from exc
@@ -514,21 +520,17 @@ def convert(
 
     if is_batch:
         try:
-            outputs = pipeline.run_batch(config, author=author)
+            with RichProgressReporter(
+                console, is_batch=True, complete_prefix="Converted"
+            ) as reporter:
+                pipeline = ConversionPipeline(
+                    on_detector_resolved=_announce_detector,
+                    progress=reporter,
+                )
+                outputs = pipeline.run_batch(config, author=author)
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Batch conversion failed:[/red] {rich_escape(str(exc))}")
             raise typer.Exit(code=1) from exc
-
-        for out_kfx in outputs:
-            console.print(f"[green]Converted:[/green] {rich_escape(str(out_kfx))}")
-        for skipped_kfx in pipeline.last_batch_skipped:
-            console.print(
-                f"[yellow]Skipped (already exists):[/yellow] {rich_escape(str(skipped_kfx))}"
-            )
-        for failed_archive, err in pipeline.last_batch_errors:
-            console.print(
-                f"[red]Failed:[/red] {rich_escape(failed_archive.name)} - {rich_escape(str(err))}"
-            )
 
         total = len(outputs) + len(pipeline.last_batch_skipped) + len(pipeline.last_batch_errors)
         if pipeline.last_batch_skipped:
@@ -547,7 +549,12 @@ def convert(
         return
 
     try:
-        out_kfx = pipeline.run_single(config, title=title, author=author)
+        with RichProgressReporter(console, is_batch=False) as reporter:
+            pipeline = ConversionPipeline(
+                on_detector_resolved=_announce_detector,
+                progress=reporter,
+            )
+            out_kfx = pipeline.run_single(config, title=title, author=author)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Conversion failed:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
@@ -685,10 +692,6 @@ def preview_panels(
             f"{rich_escape(str(target_dir))}"
         )
         raise typer.Exit(code=1)
-    pipeline = ConversionPipeline(
-        on_detector_resolved=None if compare_kinds else _announce_detector
-    )
-
     try:
         effective_detector = detector
         if compare_kinds is not None and detector_model is not None:
@@ -710,22 +713,27 @@ def preview_panels(
             batch_size=gpu_batch_size,
             merge_bridged_panels=merge_panels,
         )
-        rendered = pipeline.preview_panels(
-            input_path=input_path,
-            output_dir=target_dir,
-            profile=device_profile,
-            direction=direction,
-            spread_mode=spread_mode,
-            padding=padding,
-            min_panel_area=min_panel_area,
-            detector_config=detector_cfg,
-            panel_merge=PanelMergeConfig.for_profile(device_profile, enabled=merge_panels),
-            compare=compare_kinds,
-            no_kcc=no_kcc,
-            keep_temp=keep_temp,
-            workers=workers,
-            kcc_path=kcc_path,
-        )
+        with RichProgressReporter(console, is_batch=False) as reporter:
+            pipeline = ConversionPipeline(
+                on_detector_resolved=None if compare_kinds else _announce_detector,
+                progress=reporter,
+            )
+            rendered = pipeline.preview_panels(
+                input_path=input_path,
+                output_dir=target_dir,
+                profile=device_profile,
+                direction=direction,
+                spread_mode=spread_mode,
+                padding=padding,
+                min_panel_area=min_panel_area,
+                detector_config=detector_cfg,
+                panel_merge=PanelMergeConfig.for_profile(device_profile, enabled=merge_panels),
+                compare=compare_kinds,
+                no_kcc=no_kcc,
+                keep_temp=keep_temp,
+                workers=workers,
+                kcc_path=kcc_path,
+            )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Preview failed:[/red] {rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc

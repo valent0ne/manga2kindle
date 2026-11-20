@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -403,14 +403,20 @@ class MagiBackend:
             scores=None,
         )
 
-    def detect_batch(self, image_paths: Sequence[Path]) -> list[DetectionResult]:
+    def detect_batch(
+        self,
+        image_paths: Sequence[Path],
+        *,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[DetectionResult]:
         """Detect panels across a sequence of page images in VRAM-tuned GPU batches."""
         if not image_paths:
             return []
 
         results: list[DetectionResult] = []
+        total_pages = len(image_paths)
         step = max(1, self._batch_size)
-        for start in range(0, len(image_paths), step):
+        for start in range(0, total_pages, step):
             chunk_paths = image_paths[start : start + step]
             rgb_images: list[np.ndarray] = []
             dims: list[tuple[int, int]] = []
@@ -440,5 +446,8 @@ class MagiBackend:
                         image=rgb_images[idx],
                     )
                 )
+
+            if on_progress is not None:
+                on_progress(len(results), total_pages)
 
         return results

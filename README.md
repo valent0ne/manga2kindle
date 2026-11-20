@@ -12,7 +12,7 @@ Cross-platform headless CLI for converting `.cbz`, `.cbr`, and image folders int
   - **`auto` (default):** Resolves `magi` (when GPU, cached weights, and `--allow-remote-code` are present) -> `onnx` (when `onnxruntime` and cached weights are present) -> `contour` fallback.
 - **E-Ink Image Preprocessing:** Uses **Kindle Comic Converter (`kcc-c2e`)** by default for E-Ink-tuned dithering/contrast and spread handling, with a pure-Pillow fallback via `--no-kcc`.
 - **Visual QA, Benchmarking & Diagnostics:** Includes `preview-panels` (with `--compare` side-by-side backend grids), `convert --preview-only`, `models list`/`fetch`, `benchmark` (PopManga, CoMix, and local JSON/COCO), and `doctor` to verify dependencies.
-- **Single, Folder, and Batch Modes:** Automatically handles a single `.cbz`/`.cbr`, a directory of images, or a batch directory of archives using parallel worker threads.
+- **Single, Folder, and Batch Modes:** Automatically handles a single `.cbz`/`.cbr`, a directory of images, or a batch directory of archives using parallel worker threads, with live Rich CLI progress reporting (overall batch bar, ETA, per-worker stage & detection page progress, and clean streaming output when piped).
 - **Cross-Platform:** Built for macOS and Windows using `pathlib.Path` and automatic executable discovery with explicit `--*-path` overrides.
 
 ## Prerequisites
@@ -171,6 +171,48 @@ uv run manga2kindle convert -i "Chapter 01.cbz" --preview-only
 uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify
 uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify-source
 ```
+
+**High-quality batch conversion with Magi (`magiv3`), source+output beautification, and max parallelism:**
+
+*macOS / Linux (`sh` / `bash` / `zsh`):*
+
+```sh
+CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+uv run manga2kindle convert \
+  -i "./Chapters" \
+  -o "./kfx" \
+  --beautify-source \
+  --detector magi \
+  --detector-model magiv3 \
+  --allow-remote-code \
+  --merge-panels \
+  --skip-existing \
+  -w "$CORES" \
+  --batch-workers "$CORES" \
+  --gpu-batch-size 8
+```
+
+*Windows (PowerShell):*
+
+```powershell
+$cores = [Environment]::ProcessorCount
+uv run manga2kindle convert `
+  -i ".\Chapters" `
+  -o ".\kfx" `
+  --beautify-source `
+  --detector magi `
+  --detector-model magiv3 `
+  --allow-remote-code `
+  --merge-panels `
+  --skip-existing `
+  -w $cores `
+  --batch-workers $cores `
+  --gpu-batch-size 8
+```
+
+- `--beautify-source` automatically beautifies both the source `.cbz`/`.cbr` files (in place) and the output `.kfx` filenames + embedded KFX titles.
+- Lower `--batch-workers` (e.g., `4`–`6`) if RAM-constrained since each concurrent `kcc-c2e` process uses memory, and omit `--gpu-batch-size` for automatic VRAM/MPS tuning.
+- Live progress bars and per-worker stage updates render automatically in interactive terminals and stream per-file completion lines when piped.
 
 ### 5. Benchmark Panel Detectors (`benchmark`)
 
