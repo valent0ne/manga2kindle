@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import types
 from pathlib import Path
 from PIL import Image
 
 import pytest
 
 from manga2kindle.compiler import KfxCompilationError, KfxCompiler
+from manga2kindle.compiler import _calibre_worker
 from manga2kindle.models import (
     ConversionConfig,
     DeviceProfile,
@@ -205,12 +208,16 @@ class TestKfxCompilerUnit:
         compiler = KfxCompiler(calibre_debug)
         assert compiler.verify_pdoc(kfx_path) is True
         cmd = captured["cmd"]
-        assert isinstance(cmd, list)
-        assert cmd[0] == str(calibre_debug)
-        assert cmd[1] == "-c"
-        assert "YJ_Book" in cmd[2]
-        assert "calibre.customize.ui" in cmd[2]
-        assert cmd[3] == str(kfx_path)
+        worker_script = Path(_calibre_worker.__file__).resolve()
+        assert cmd == [
+            str(calibre_debug),
+            "-e",
+            str(worker_script),
+            "--",
+            "verify",
+            str(kfx_path.resolve()),
+        ]
+        assert Path(cmd[2]).is_file()
 
     @pytest.mark.parametrize(
         ("returncode", "stdout"),
@@ -278,10 +285,16 @@ class TestKfxCompilerUnit:
         assert result == output_kfx
         assert output_kfx.is_file()
         assert len(calls) == 1
-        assert calls[0][0] == str(calibre_debug)
-        assert calls[0][1] == "-c"
-        assert calls[0][3] == str(kpf_path.resolve())
-        assert calls[0][4] == str(output_kfx.resolve())
+        worker_script = Path(_calibre_worker.__file__).resolve()
+        assert calls[0] == [
+            str(calibre_debug),
+            "-e",
+            str(worker_script),
+            "--",
+            "compile-and-verify",
+            str(kpf_path.resolve()),
+            str(output_kfx.resolve()),
+        ]
 
         # EBOK marker or missing marker fails verification
         for bad_stdout in (
@@ -330,6 +343,161 @@ class TestKfxCompilerUnit:
         )
         assert compiler.compile_and_verify(kpf_path, output_kfx) == output_kfx
         assert hook_calls == ["compile", "verify"]
+
+
+class TestCalibreWorkerUnit:
+    """Unit tests for the standalone Calibre worker script."""
+
+    @staticmethod
+    def _install_fake_calibre(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        plugin: object | None,
+        cde_content_type: str | None = "PDOC",
+    ) -> list[str]:
+        yj_calls: list[str] = []
+
+        class FakeYJBook:
+            def __init__(self, path: str) -> None:
+                yj_calls.append(path)
+
+            def get_metadata(self) -> object:
+                return types.SimpleNamespace(cde_content_type=cde_content_type)
+
+        calibre_mod = types.ModuleType("calibre")
+        customize_mod = types.ModuleType("calibre.customize")
+        ui_mod = types.ModuleType("calibre.customize.ui")
+        ui_mod.find_plugin = lambda _name: plugin
+        customize_mod.ui = ui_mod
+        calibre_mod.customize = customize_mod
+
+        plugins_mod = types.ModuleType("calibre_plugins")
+        kfx_output_mod = types.ModuleType("calibre_plugins.kfx_output")
+        kfxlib_mod = types.ModuleType("calibre_plugins.kfx_output.kfxlib")
+        yj_book_mod = types.ModuleType("calibre_plugins.kfx_output.kfxlib.yj_book")
+        yj_book_mod.YJ_Book = FakeYJBook
+        kfxlib_mod.yj_book = yj_book_mod
+        kfx_output_mod.kfxlib = kfxlib_mod
+        plugins_mod.kfx_output = kfx_output_mod
+
+        for name, mod in (
+            ("calibre", calibre_mod),
+            ("calibre.customize", customize_mod),
+            ("calibre.customize.ui", ui_mod),
+            ("calibre_plugins", plugins_mod),
+            ("calibre_plugins.kfx_output", kfx_output_mod),
+            ("calibre_plugins.kfx_output.kfxlib", kfxlib_mod),
+            ("calibre_plugins.kfx_output.kfxlib.yj_book", yj_book_mod),
+        ):
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        return yj_calls
+
+    def test_verify_emits_pdoc_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        kfx_path = tmp_path / "book.kfx"
+        kfx_path.write_bytes(b"kfx")
+        yj_calls = self._install_fake_calibre(monkeypatch, plugin=None, cde_content_type="PDOC")
+
+        assert _calibre_worker.main(["verify", str(kfx_path)]) == 0
+        assert yj_calls == [str(kfx_path)]
+        captured = capsys.readouterr()
+        assert captured.out.strip() == 'M2K_META:{"cde_content_type": "PDOC"}'
+
+    def test_compile_and_verify_invokes_plugin_and_emits_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        kpf_path = tmp_path / "book.kpf"
+        kpf_path.write_bytes(b"kpf")
+        output_kfx = tmp_path / "book.kfx"
+        cli_calls: list[list[str]] = []
+
+        class FakePlugin:
+            def cli_main(self, argv: list[str]) -> int:
+                cli_calls.append(argv)
+                output_kfx.write_bytes(b"compiled")
+                return 0
+
+        yj_calls = self._install_fake_calibre(
+            monkeypatch, plugin=FakePlugin(), cde_content_type="PDOC"
+        )
+
+        assert (
+            _calibre_worker.main(["compile-and-verify", str(kpf_path), str(output_kfx)]) == 0
+        )
+        assert cli_calls == [["KFX Output", "-d", str(kpf_path), str(output_kfx)]]
+        assert yj_calls == [str(output_kfx)]
+        assert capsys.readouterr().out.strip() == 'M2K_META:{"cde_content_type": "PDOC"}'
+
+    def test_compile_and_verify_skips_metadata_when_output_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        kpf_path = tmp_path / "book.kpf"
+        kpf_path.write_bytes(b"kpf")
+        output_kfx = tmp_path / "missing.kfx"
+
+        class FakePlugin:
+            def cli_main(self, argv: list[str]) -> int:
+                return 0
+
+        yj_calls = self._install_fake_calibre(monkeypatch, plugin=FakePlugin())
+        assert (
+            _calibre_worker.main(["compile-and-verify", str(kpf_path), str(output_kfx)]) == 0
+        )
+        assert yj_calls == []
+        assert capsys.readouterr().out == ""
+
+    def test_compile_and_verify_raises_when_plugin_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._install_fake_calibre(monkeypatch, plugin=None)
+        with pytest.raises(RuntimeError, match="KFX Output plugin not installed"):
+            _calibre_worker.main(
+                ["compile-and-verify", str(tmp_path / "book.kpf"), str(tmp_path / "book.kfx")]
+            )
+
+    def test_compile_and_verify_raises_system_exit_on_nonzero_plugin_exit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class FailingPlugin:
+            def cli_main(self, argv: list[str]) -> int:
+                return 2
+
+        self._install_fake_calibre(monkeypatch, plugin=FailingPlugin())
+        with pytest.raises(SystemExit) as exc_info:
+            _calibre_worker.main(
+                ["compile-and-verify", str(tmp_path / "book.kpf"), str(tmp_path / "book.kfx")]
+            )
+        assert exc_info.value.code == 2
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            [],
+            ["unknown-action"],
+            ["verify"],
+            ["verify", "a.kfx", "extra"],
+            ["compile-and-verify", "only_one.kpf"],
+            ["compile-and-verify", "a.kpf", "b.kfx", "extra"],
+        ],
+    )
+    def test_main_rejects_invalid_arguments(self, argv: list[str]) -> None:
+        with pytest.raises(ValueError):
+            _calibre_worker.main(argv)
 
 
 class TestKfxCompilerIntegration:

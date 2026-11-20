@@ -2,36 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from importlib import resources
 import json
 import os
 import subprocess
 from pathlib import Path
 
-_META_PREFIX = "M2K_META:"
-_KFX_OUTPUT_PLUGIN_NAME = "KFX Output"
-_PDOC_CONTENT_TYPE = "PDOC"
-_VERIFY_PDOC_SCRIPT = (
-    "import json, sys; "
-    "import calibre.customize.ui; "
-    "from calibre_plugins.kfx_output.kfxlib.yj_book import YJ_Book; "
-    "meta = YJ_Book(sys.argv[1]).get_metadata(); "
-    f"print({_META_PREFIX!r} + json.dumps({{'cde_content_type': getattr(meta, 'cde_content_type', None)}}))"
+from manga2kindle.compiler._calibre_worker import (
+    CDE_CONTENT_TYPE_KEY,
+    CalibreWorkerAction,
+    KFX_OUTPUT_PLUGIN_NAME,
+    META_PREFIX,
+    PDOC_CLI_FLAG,
+    PDOC_CONTENT_TYPE,
 )
-_COMPILE_AND_VERIFY_SCRIPT = "\n".join(
-    [
-        "import json, os, sys",
-        "import calibre.customize.ui as ui",
-        "from calibre_plugins.kfx_output.kfxlib.yj_book import YJ_Book",
-        f"plugin = ui.find_plugin({_KFX_OUTPUT_PLUGIN_NAME!r})",
-        "if plugin is None:",
-        f"    raise RuntimeError({_KFX_OUTPUT_PLUGIN_NAME + ' plugin not installed'!r})",
-        f"plugin.cli_main([{_KFX_OUTPUT_PLUGIN_NAME!r}, '-d', sys.argv[1], sys.argv[2]])",
-        "out = sys.argv[2]",
-        "if os.path.isfile(out) and os.path.getsize(out) > 0:",
-        "    meta = YJ_Book(out).get_metadata()",
-        f"    print({_META_PREFIX!r} + json.dumps({{'cde_content_type': getattr(meta, 'cde_content_type', None)}}))",
-    ]
-)
+
+_WORKER_SCRIPT_NAME = "_calibre_worker.py"
 
 
 class KfxCompilationError(RuntimeError):
@@ -72,15 +60,22 @@ class KfxCompiler:
             )
 
     @staticmethod
+    @contextmanager
+    def _worker_script_path() -> Iterator[Path]:
+        worker_resource = resources.files(__package__).joinpath(_WORKER_SCRIPT_NAME)
+        with resources.as_file(worker_resource) as worker_path:
+            yield worker_path.resolve()
+
+    @staticmethod
     def _has_pdoc_marker(stdout: str) -> bool:
         for line in reversed(stdout.splitlines()):
-            if line.startswith(_META_PREFIX):
-                raw_json = line[len(_META_PREFIX) :]
+            if line.startswith(META_PREFIX):
+                raw_json = line[len(META_PREFIX) :]
                 try:
                     data = json.loads(raw_json)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     return False
-                return isinstance(data, dict) and data.get("cde_content_type") == _PDOC_CONTENT_TYPE
+                return isinstance(data, dict) and data.get(CDE_CONTENT_TYPE_KEY) == PDOC_CONTENT_TYPE
         return False
 
     def _run_compile_command(
@@ -111,7 +106,14 @@ class KfxCompiler:
         resolved_kpf = kpf_path.resolve()
         resolved_kfx = output_kfx.resolve()
         self._run_compile_command(
-            ["-r", _KFX_OUTPUT_PLUGIN_NAME, "--", "-d", str(resolved_kpf), str(resolved_kfx)],
+            [
+                "-r",
+                KFX_OUTPUT_PLUGIN_NAME,
+                "--",
+                PDOC_CLI_FLAG,
+                str(resolved_kpf),
+                str(resolved_kfx),
+            ],
             output_kfx,
         )
         return output_kfx
@@ -122,7 +124,16 @@ class KfxCompiler:
             return False
 
         try:
-            proc = self._run_calibre(["-c", _VERIFY_PDOC_SCRIPT, str(kfx_path.resolve())])
+            with self._worker_script_path() as worker_path:
+                proc = self._run_calibre(
+                    [
+                        "-e",
+                        str(worker_path),
+                        "--",
+                        CalibreWorkerAction.VERIFY.value,
+                        str(kfx_path.resolve()),
+                    ]
+                )
         except (OSError, subprocess.SubprocessError):
             return False
 
@@ -146,10 +157,18 @@ class KfxCompiler:
                 )
             return compiled
 
-        proc = self._run_compile_command(
-            ["-c", _COMPILE_AND_VERIFY_SCRIPT, str(kpf_path.resolve()), str(output_kfx.resolve())],
-            output_kfx,
-        )
+        with self._worker_script_path() as worker_path:
+            proc = self._run_compile_command(
+                [
+                    "-e",
+                    str(worker_path),
+                    "--",
+                    CalibreWorkerAction.COMPILE_AND_VERIFY.value,
+                    str(kpf_path.resolve()),
+                    str(output_kfx.resolve()),
+                ],
+                output_kfx,
+            )
         if not self._has_pdoc_marker(proc.stdout or ""):
             raise KfxCompilationError(
                 f"Compiled KFX failed PDOC verification: {output_kfx}"
