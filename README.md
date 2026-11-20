@@ -177,10 +177,11 @@ uv run manga2kindle convert -i ./Chapters -o ./KFX_Output --beautify-source
 *macOS / Linux (`sh` / `bash` / `zsh`):*
 
 ```sh
+INPUT_DIR="/path/to/Manga"
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 uv run manga2kindle convert \
-  -i "./Chapters" \
-  -o "./kfx" \
+  -i "$INPUT_DIR" \
+  -o "${INPUT_DIR%/}/kfx" \
   --beautify-source \
   --detector magi \
   --detector-model magiv3 \
@@ -195,10 +196,11 @@ uv run manga2kindle convert \
 *Windows (PowerShell):*
 
 ```powershell
+$inputDir = "C:\path\to\Manga"
 $cores = [Environment]::ProcessorCount
 uv run manga2kindle convert `
-  -i ".\Chapters" `
-  -o ".\kfx" `
+  -i $inputDir `
+  -o (Join-Path $inputDir "kfx") `
   --beautify-source `
   --detector magi `
   --detector-model magiv3 `
