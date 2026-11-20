@@ -209,7 +209,8 @@ uv run manga2kindle convert `
 ```
 
 - `--beautify-source` automatically beautifies both the source `.cbz`/`.cbr` files (in place) and the output `.kfx` filenames + embedded KFX titles.
-- Omit `--batch-workers` and `--gpu-batch-size` for automatic tuning: `--batch-workers` scales up to `4` concurrent books (while `kcc-c2e` is concurrency-capped automatically to prevent OOM) and `--gpu-batch-size` scales by VRAM (up to `16` on 16 GB+ GPUs, `8` on 12 GB, `4` on 8 GB, `2` on MPS).
+- Omit `--batch-workers` and `--gpu-batch-size` for automatic tuning: `--batch-workers` samples available RAM before loading the detector and scales up to `6` concurrent books on systems with `>= 12 GiB` available RAM and `>= 8` worker threads (while `kcc-c2e` remains concurrency-capped automatically to prevent OOM), and `--gpu-batch-size` adapts to both total and free VRAM (up to `32` on 24 GB+ GPUs, `16` on 16 GB, `8` on 12 GB, `4` on 8 GB, `2` on MPS).
+- For `magiv3`, `manga2kindle` automatically enables PyTorch SDPA + CUDA TF32, GPU-vectorized compact beam search, and overlapped CPU/GPU batch pipelining for maximum throughput.
 - Live progress bars and per-worker stage updates render automatically in interactive terminals and stream per-file completion lines when piped.
 
 ### 5. Benchmark Panel Detectors (`benchmark`)

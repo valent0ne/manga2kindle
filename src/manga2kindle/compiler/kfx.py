@@ -18,8 +18,10 @@ from manga2kindle.compiler._calibre_worker import (
     PDOC_CLI_FLAG,
     PDOC_CONTENT_TYPE,
 )
+from manga2kindle.platform import run_managed_subprocess
 
 _WORKER_SCRIPT_NAME = "_calibre_worker.py"
+_DEFAULT_SUBPROCESS_RUN = subprocess.run
 
 
 class KfxCompilationError(RuntimeError):
@@ -38,15 +40,18 @@ class KfxCompiler:
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
         }
-        return subprocess.run(
-            [str(self.calibre_debug_path), *args],
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        cmd = [str(self.calibre_debug_path), *args]
+        if subprocess.run is not _DEFAULT_SUBPROCESS_RUN:
+            return subprocess.run(
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        return run_managed_subprocess(cmd, env=env)
 
     @staticmethod
     def _validate_compiled_output(output_kfx: Path) -> None:

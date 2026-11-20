@@ -7,6 +7,7 @@ import logging
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 from manga2kindle.cv.backends.base import DetectionResult, PanelDetectorBackend
 from manga2kindle.cv.backends.contour import ContourBackend
@@ -336,12 +337,12 @@ class BackendRegistry:
         )
 
     @staticmethod
-    def _supports_on_progress(backend: PanelDetectorBackend) -> bool:
+    def _supports_kwarg(backend: PanelDetectorBackend, param_name: str) -> bool:
         try:
             params = inspect.signature(backend.detect_batch).parameters
         except (TypeError, ValueError):
             return False
-        return "on_progress" in params or any(
+        return param_name in params or any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
 
@@ -363,6 +364,7 @@ class BackendRegistry:
         image_paths: Sequence[Path],
         *,
         on_progress: Callable[[int, int], None] | None = None,
+        workers: int | None = None,
     ) -> list[DetectionResult]:
         """Detect panels across a batch of pages, falling back per-session on error or per-page on empty."""
         if not image_paths:
@@ -375,12 +377,21 @@ class BackendRegistry:
 
         for idx, backend in enumerate(active_backends):
             try:
-                if on_progress is not None and self._supports_on_progress(backend):
-                    batch_results = list(backend.detect_batch(image_paths, on_progress=on_progress))
-                else:
-                    batch_results = list(backend.detect_batch(image_paths))
-                    if on_progress is not None and len(batch_results) == len(image_paths):
-                        on_progress(len(image_paths), len(image_paths))
+                kwargs: dict[str, Any] = {}
+                supports_progress = on_progress is not None and self._supports_kwarg(
+                    backend, "on_progress"
+                )
+                if supports_progress:
+                    kwargs["on_progress"] = on_progress
+                if workers is not None and self._supports_kwarg(backend, "workers"):
+                    kwargs["workers"] = workers
+                batch_results = list(backend.detect_batch(image_paths, **kwargs))
+                if (
+                    on_progress is not None
+                    and not supports_progress
+                    and len(batch_results) == len(image_paths)
+                ):
+                    on_progress(len(image_paths), len(image_paths))
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Backend %s failed during batch detection (%s); disabling for this session.",
@@ -426,9 +437,10 @@ class BackendRegistry:
         page_widths: Sequence[int] | None = None,
         is_spreads: Sequence[bool] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        workers: int | None = None,
     ) -> list[list[PanelBox]]:
         """Detect and sort panels for a sequence of pages using batched backend inference."""
-        results = self.detect_batch(image_paths, on_progress=on_progress)
+        results = self.detect_batch(image_paths, on_progress=on_progress, workers=workers)
         widths = page_widths if page_widths is not None else [0] * len(results)
         spreads = is_spreads if is_spreads is not None else [False] * len(results)
         return [

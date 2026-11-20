@@ -266,6 +266,10 @@ class TestKpfBuilderIntegration:
             # Raw images
             rsrc_entries = [name for name in namelist if name.startswith("res/")]
             assert len(rsrc_entries) == 2
+            assert zf.getinfo("book.kdf").compress_type == zipfile.ZIP_DEFLATED
+            assert zf.getinfo("book.kcb").compress_type == zipfile.ZIP_DEFLATED
+            for rsrc_name in rsrc_entries:
+                assert zf.getinfo(rsrc_name).compress_type == zipfile.ZIP_STORED
 
             # 2. Verify book.kcb format
             kcb_raw = zf.read("book.kcb").decode("utf-8")
