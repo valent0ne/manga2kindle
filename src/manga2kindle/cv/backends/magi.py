@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import warnings
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,14 @@ from manga2kindle.models import DetectorConfig, DetectorKind, DevicePreference
 
 
 _BYTES_PER_GIB = 1024**3
+_VRAM_TIER_LARGE_GIB = 15.0
+_VRAM_TIER_MEDIUM_GIB = 12.0
+_VRAM_TIER_SMALL_GIB = 8.0
+_BATCH_SIZE_LARGE = 16
+_BATCH_SIZE_MEDIUM = 8
+_BATCH_SIZE_SMALL = 4
+_BATCH_SIZE_FALLBACK = 2
+_MAGI_CPU_WORKERS_CAP = 8
 _MAGI_PANELS_KEY = "panels"
 _MAGI_TEXTS_KEY = "texts"
 _MAGI_ESSENTIAL_TEXT_KEY = "is_essential_text"
@@ -51,16 +61,18 @@ def resolve_magi_batch_size(device: str, torch_mod: Any, configured: int | None)
             if cuda_mod is not None:
                 props = cuda_mod.get_device_properties(0)
                 total_gib = getattr(props, "total_memory", 0) / _BYTES_PER_GIB
-                if total_gib >= 12.0:
-                    return 8
-                if total_gib >= 8.0:
-                    return 4
-                return 2
+                if total_gib >= _VRAM_TIER_LARGE_GIB:
+                    return _BATCH_SIZE_LARGE
+                if total_gib >= _VRAM_TIER_MEDIUM_GIB:
+                    return _BATCH_SIZE_MEDIUM
+                if total_gib >= _VRAM_TIER_SMALL_GIB:
+                    return _BATCH_SIZE_SMALL
+                return _BATCH_SIZE_FALLBACK
         except Exception:  # noqa: BLE001
-            return 2
-        return 2
+            return _BATCH_SIZE_FALLBACK
+        return _BATCH_SIZE_FALLBACK
     if device == "mps":
-        return 2
+        return _BATCH_SIZE_FALLBACK
     return 1
 
 
@@ -403,6 +415,31 @@ class MagiBackend:
             scores=None,
         )
 
+    @staticmethod
+    def _load_rgb_page(path: Path) -> tuple[np.ndarray, tuple[int, int]]:
+        """Decode an image file from disk and convert it to RGB with (width, height)."""
+        bgr_image = read_image_bgr(path)
+        orig_h, orig_w = bgr_image.shape[:2]
+        return to_rgb_array(bgr_image), (orig_w, orig_h)
+
+    def _infer_chunk_with_oom_fallback(self, rgb_images: list[np.ndarray]) -> list[Any]:
+        """Run GPU inference, recursively halving batch size on CUDA OOM."""
+        try:
+            return self._infer_chunk(rgb_images)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower() or len(rgb_images) == 1:
+                raise
+            mid = len(rgb_images) // 2
+            with self._lock:
+                cuda_mod = getattr(self._torch, "cuda", None)
+                if cuda_mod is not None and hasattr(cuda_mod, "empty_cache"):
+                    cuda_mod.empty_cache()
+                self._batch_size = max(1, min(self._batch_size, mid))
+            return (
+                self._infer_chunk_with_oom_fallback(rgb_images[:mid])
+                + self._infer_chunk_with_oom_fallback(rgb_images[mid:])
+            )
+
     def detect_batch(
         self,
         image_paths: Sequence[Path],
@@ -413,41 +450,70 @@ class MagiBackend:
         if not image_paths:
             return []
 
-        results: list[DetectionResult] = []
         total_pages = len(image_paths)
-        step = max(1, self._batch_size)
-        for start in range(0, total_pages, step):
-            chunk_paths = image_paths[start : start + step]
-            rgb_images: list[np.ndarray] = []
-            dims: list[tuple[int, int]] = []
-            for path in chunk_paths:
-                bgr_image = read_image_bgr(path)
-                orig_h, orig_w = bgr_image.shape[:2]
-                dims.append((orig_w, orig_h))
-                rgb_images.append(to_rgb_array(bgr_image))
+        if total_pages == 1:
+            rgb, (orig_w, orig_h) = self._load_rgb_page(image_paths[0])
+            raw_chunk = self._infer_chunk_with_oom_fallback([rgb])
+            page_result = raw_chunk[0] if raw_chunk else {}
+            parsed = self._parse_page_result(page_result, orig_w, orig_h, image=rgb)
+            if on_progress is not None:
+                on_progress(1, 1)
+            return [parsed]
 
-            try:
-                raw_chunk = self._infer_chunk(rgb_images)
-            except RuntimeError as exc:
-                if "out of memory" not in str(exc).lower() or len(rgb_images) == 1:
-                    raise
-                cuda_mod = getattr(self._torch, "cuda", None)
-                if cuda_mod is not None and hasattr(cuda_mod, "empty_cache"):
-                    cuda_mod.empty_cache()
-                raw_chunk = [self._infer_chunk([img])[0] for img in rgb_images]
+        results: list[DetectionResult] = []
+        cpu_workers = min(total_pages, os.cpu_count() or 4, _MAGI_CPU_WORKERS_CAP)
 
-            for idx, (orig_w, orig_h) in enumerate(dims):
-                page_result = raw_chunk[idx] if idx < len(raw_chunk) else {}
-                results.append(
-                    self._parse_page_result(
-                        page_result,
+        with ThreadPoolExecutor(max_workers=cpu_workers) as pool:
+            def _submit_load(
+                paths: Sequence[Path],
+            ) -> list[Future[tuple[np.ndarray, tuple[int, int]]]]:
+                return [pool.submit(self._load_rgb_page, path) for path in paths]
+
+            start = 0
+            first_end = min(total_pages, max(1, self._batch_size))
+            current_futures = _submit_load(image_paths[start:first_end])
+
+            while start < total_pages:
+                loaded = [fut.result() for fut in current_futures]
+                rgb_images = [item[0] for item in loaded]
+                dims = [item[1] for item in loaded]
+
+                next_start = start + len(loaded)
+                if next_start < total_pages:
+                    next_end = min(total_pages, next_start + max(1, self._batch_size))
+                    current_futures = _submit_load(image_paths[next_start:next_end])
+                else:
+                    current_futures = []
+
+                step = max(1, self._batch_size)
+                if len(rgb_images) <= step:
+                    raw_chunk = self._infer_chunk_with_oom_fallback(rgb_images)
+                else:
+                    raw_chunk = []
+                    for sub_start in range(0, len(rgb_images), step):
+                        raw_chunk.extend(
+                            self._infer_chunk_with_oom_fallback(
+                                rgb_images[sub_start : sub_start + step]
+                            )
+                        )
+
+                parse_futures = [
+                    pool.submit(
+                        self._parse_page_result,
+                        raw_chunk[idx] if idx < len(raw_chunk) else {},
                         orig_w,
                         orig_h,
-                        image=rgb_images[idx],
+                        rgb_images[idx],
                     )
-                )
+                    for idx, (orig_w, orig_h) in enumerate(dims)
+                ]
+                results.extend(fut.result() for fut in parse_futures)
+                rgb_images.clear()
+                loaded.clear()
 
-            if on_progress is not None:
-                on_progress(len(results), total_pages)
+                if on_progress is not None:
+                    on_progress(len(results), total_pages)
+
+                start = next_start
 
         return results

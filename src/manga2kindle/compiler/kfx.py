@@ -8,12 +8,29 @@ import subprocess
 from pathlib import Path
 
 _META_PREFIX = "M2K_META:"
+_KFX_OUTPUT_PLUGIN_NAME = "KFX Output"
+_PDOC_CONTENT_TYPE = "PDOC"
 _VERIFY_PDOC_SCRIPT = (
     "import json, sys; "
     "import calibre.customize.ui; "
     "from calibre_plugins.kfx_output.kfxlib.yj_book import YJ_Book; "
     "meta = YJ_Book(sys.argv[1]).get_metadata(); "
     f"print({_META_PREFIX!r} + json.dumps({{'cde_content_type': getattr(meta, 'cde_content_type', None)}}))"
+)
+_COMPILE_AND_VERIFY_SCRIPT = "\n".join(
+    [
+        "import json, os, sys",
+        "import calibre.customize.ui as ui",
+        "from calibre_plugins.kfx_output.kfxlib.yj_book import YJ_Book",
+        f"plugin = ui.find_plugin({_KFX_OUTPUT_PLUGIN_NAME!r})",
+        "if plugin is None:",
+        f"    raise RuntimeError({_KFX_OUTPUT_PLUGIN_NAME + ' plugin not installed'!r})",
+        f"plugin.cli_main([{_KFX_OUTPUT_PLUGIN_NAME!r}, '-d', sys.argv[1], sys.argv[2]])",
+        "out = sys.argv[2]",
+        "if os.path.isfile(out) and os.path.getsize(out) > 0:",
+        "    meta = YJ_Book(out).get_metadata()",
+        f"    print({_META_PREFIX!r} + json.dumps({{'cde_content_type': getattr(meta, 'cde_content_type', None)}}))",
+    ]
 )
 
 
@@ -43,17 +60,37 @@ class KfxCompiler:
             check=False,
         )
 
-    def compile(self, kpf_path: Path, output_kfx: Path) -> Path:
-        """Compile a .kpf package into a PDOC-tagged .kfx file using calibre-debug."""
+    @staticmethod
+    def _validate_compiled_output(output_kfx: Path) -> None:
+        if not output_kfx.is_file():
+            raise KfxCompilationError(
+                f"KFX Output exited cleanly but output file is missing: {output_kfx}"
+            )
+        if output_kfx.stat().st_size == 0:
+            raise KfxCompilationError(
+                f"KFX Output produced an empty file (0 bytes): {output_kfx}"
+            )
+
+    @staticmethod
+    def _has_pdoc_marker(stdout: str) -> bool:
+        for line in reversed(stdout.splitlines()):
+            if line.startswith(_META_PREFIX):
+                raw_json = line[len(_META_PREFIX) :]
+                try:
+                    data = json.loads(raw_json)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    return False
+                return isinstance(data, dict) and data.get("cde_content_type") == _PDOC_CONTENT_TYPE
+        return False
+
+    def _run_compile_command(
+        self, args: list[str], output_kfx: Path
+    ) -> subprocess.CompletedProcess[str]:
         output_kfx.parent.mkdir(parents=True, exist_ok=True)
         # Prevent stale pre-existing outputs from masking silent KFX Output exit-0 failures.
         output_kfx.unlink(missing_ok=True)
-        resolved_kpf = kpf_path.resolve()
-        resolved_kfx = output_kfx.resolve()
         try:
-            proc = self._run_calibre(
-                ["-r", "KFX Output", "--", "-d", str(resolved_kpf), str(resolved_kfx)]
-            )
+            proc = self._run_calibre(args)
         except (OSError, subprocess.SubprocessError) as exc:
             raise KfxCompilationError(
                 f"Failed to invoke calibre-debug at {self.calibre_debug_path}: {exc}"
@@ -66,16 +103,17 @@ class KfxCompiler:
                 + (f": {details}" if details else "")
             )
 
-        if not output_kfx.is_file():
-            raise KfxCompilationError(
-                f"KFX Output exited cleanly but output file is missing: {output_kfx}"
-            )
+        self._validate_compiled_output(output_kfx)
+        return proc
 
-        if output_kfx.stat().st_size == 0:
-            raise KfxCompilationError(
-                f"KFX Output produced an empty file (0 bytes): {output_kfx}"
-            )
-
+    def compile(self, kpf_path: Path, output_kfx: Path) -> Path:
+        """Compile a .kpf package into a PDOC-tagged .kfx file using calibre-debug."""
+        resolved_kpf = kpf_path.resolve()
+        resolved_kfx = output_kfx.resolve()
+        self._run_compile_command(
+            ["-r", _KFX_OUTPUT_PLUGIN_NAME, "--", "-d", str(resolved_kpf), str(resolved_kfx)],
+            output_kfx,
+        )
         return output_kfx
 
     def verify_pdoc(self, kfx_path: Path) -> bool:
@@ -91,13 +129,33 @@ class KfxCompiler:
         if proc.returncode != 0:
             return False
 
-        for line in reversed((proc.stdout or "").splitlines()):
-            if line.startswith(_META_PREFIX):
-                raw_json = line[len(_META_PREFIX) :]
-                try:
-                    data = json.loads(raw_json)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    return False
-                return isinstance(data, dict) and data.get("cde_content_type") == "PDOC"
+        return self._has_pdoc_marker(proc.stdout or "")
 
-        return False
+    def compile_and_verify(self, kpf_path: Path, output_kfx: Path) -> Path:
+        """Compile a .kpf to .kfx and verify PDOC tagging in one calibre-debug invocation."""
+        if (
+            type(self).compile is not _DEFAULT_COMPILE
+            or type(self).verify_pdoc is not _DEFAULT_VERIFY_PDOC
+            or "compile" in self.__dict__
+            or "verify_pdoc" in self.__dict__
+        ):
+            compiled = self.compile(kpf_path, output_kfx)
+            if not self.verify_pdoc(compiled):
+                raise KfxCompilationError(
+                    f"Compiled KFX failed PDOC verification: {compiled}"
+                )
+            return compiled
+
+        proc = self._run_compile_command(
+            ["-c", _COMPILE_AND_VERIFY_SCRIPT, str(kpf_path.resolve()), str(output_kfx.resolve())],
+            output_kfx,
+        )
+        if not self._has_pdoc_marker(proc.stdout or ""):
+            raise KfxCompilationError(
+                f"Compiled KFX failed PDOC verification: {output_kfx}"
+            )
+        return output_kfx
+
+
+_DEFAULT_COMPILE = KfxCompiler.compile
+_DEFAULT_VERIFY_PDOC = KfxCompiler.verify_pdoc
