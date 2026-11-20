@@ -5,13 +5,18 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
 _BYTES_PER_GIB: float = 1024.0**3
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: int = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: int = 9
+_POSIX_TERM_GRACE_SECONDS: float = 2.0
 
 
 class _MemoryStatusEx(ctypes.Structure):
@@ -60,6 +65,199 @@ def available_memory_gib() -> float | None:
         return avail_commit if avail_commit is not None else avail_phys
 
     return avail_phys
+
+
+def _win32_create_kill_job() -> tuple[int, Any] | None:
+    """Create a Win32 Job Object configured to kill all assigned descendants on handle close."""
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_uint64)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
+
+        class _JobBasicLimitInfo(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _JobExtendedLimitInfo(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JobBasicLimitInfo),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _JobExtendedLimitInfo()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+        return int(job), kernel32
+    except (AttributeError, OSError, ImportError):
+        return None
+
+
+def _close_win32_job(job_pair: tuple[int, Any] | None) -> None:
+    if job_pair is None:
+        return
+    job_handle, kernel32 = job_pair
+    try:
+        kernel32.CloseHandle(job_handle)
+    except (AttributeError, OSError):
+        pass
+
+
+def _terminate_posix_group(pid: int) -> None:
+    killpg = getattr(os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if killpg is None:
+        return
+    try:
+        killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    try:
+        import time
+
+        deadline = time.monotonic() + _POSIX_TERM_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                killpg(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        killpg(pid, sigkill)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def run_managed_subprocess(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an external CLI and guarantee full process-tree cleanup on exit or interrupt."""
+    if sys.platform.startswith("win"):
+        job_pair = _win32_create_kill_job()
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if job_pair is not None:
+            job_handle, kernel32 = job_pair
+            proc_handle = getattr(proc, "_handle", None)
+            if proc_handle is None or not kernel32.AssignProcessToJobObject(
+                job_handle, int(proc_handle)
+            ):
+                _close_win32_job(job_pair)
+                job_pair = None
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout=stdout, stderr=stderr)
+        except BaseException:
+            if job_pair is not None:
+                _close_win32_job(job_pair)
+                job_pair = None
+            else:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=_POSIX_TERM_GRACE_SECONDS)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            raise
+        finally:
+            _close_win32_job(job_pair)
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout=stdout, stderr=stderr)
+    except BaseException:
+        _terminate_posix_group(proc.pid)
+        try:
+            proc.wait(timeout=_POSIX_TERM_GRACE_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        raise
 
 
 class ToolStatus(BaseModel):

@@ -817,8 +817,10 @@ class KpfBuilder:
         with tempfile.TemporaryDirectory(prefix="m2k_kpf_") as tmp_dir_str:
             db_path = Path(tmp_dir_str) / "book.kdf"
             conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
             try:
-                cur = conn.cursor()
+                cur.execute("PRAGMA synchronous = OFF")
+                cur.execute("PRAGMA journal_mode = MEMORY").fetchall()
                 cur.execute(
                     "CREATE TABLE capabilities(key char(20), version smallint, "
                     "primary key (key, version)) without rowid"
@@ -839,16 +841,22 @@ class KpfBuilder:
                     "CREATE TABLE gc_reachable(id varchar(40), primary key (id)) without rowid"
                 )
                 cur.execute("INSERT INTO capabilities VALUES ('db.schema', 1)")
-                for fid, ptype, pval in fragments:
-                    cur.execute("INSERT INTO fragments VALUES (?, ?, ?)", (fid, ptype, pval))
-                for fid, k, v in set(frag_props):
-                    cur.execute("INSERT OR IGNORE INTO fragment_properties VALUES (?, ?, ?)", (fid, k, v))
-                for fid, k, v in set(gc_frag_props):
-                    cur.execute("INSERT OR IGNORE INTO gc_fragment_properties VALUES (?, ?, ?)", (fid, k, v))
-                for rid in sorted(gc_reachable):
-                    cur.execute("INSERT OR IGNORE INTO gc_reachable VALUES (?)", (rid,))
+                cur.executemany("INSERT INTO fragments VALUES (?, ?, ?)", fragments)
+                cur.executemany(
+                    "INSERT OR IGNORE INTO fragment_properties VALUES (?, ?, ?)",
+                    set(frag_props),
+                )
+                cur.executemany(
+                    "INSERT OR IGNORE INTO gc_fragment_properties VALUES (?, ?, ?)",
+                    set(gc_frag_props),
+                )
+                cur.executemany(
+                    "INSERT OR IGNORE INTO gc_reachable VALUES (?)",
+                    ((rid,) for rid in sorted(gc_reachable)),
+                )
                 conn.commit()
             finally:
+                cur.close()
                 conn.close()
 
             raw_db_bytes = db_path.read_bytes()
@@ -866,4 +874,8 @@ class KpfBuilder:
                 zf.writestr("book.kdf", wrapped_kdf)
                 zf.writestr("book.kcb", kcb_raw)
                 for pd in page_data:
-                    zf.write(pd["img_path"], f"res/{pd['rsrc_id']}")
+                    zf.write(
+                        pd["img_path"],
+                        f"res/{pd['rsrc_id']}",
+                        compress_type=zipfile.ZIP_STORED,
+                    )

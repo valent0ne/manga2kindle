@@ -323,3 +323,54 @@ def test_extract_folder_skips_symlinks(tmp_path: Path) -> None:
 
     pages = ArchiveExtractor().extract(src_dir, tmp_path / "work_dir_sym")
     assert [(p.width, p.height) for p in pages] == [(100, 150)]
+
+
+def test_extract_parallel_workers_preserves_order_and_staging_semantics(tmp_path: Path) -> None:
+    # 1. CBZ with 10 naturally sorted pages + one spread
+    cbz_path = tmp_path / "parallel.cbz"
+    expected_dims = [
+        (100, 150),
+        (300, 150),  # spread at page 2
+        (102, 150),
+        (104, 150),
+        (106, 150),
+        (108, 150),
+        (110, 150),
+        (112, 150),
+        (114, 150),
+        (116, 150),
+    ]
+    with zipfile.ZipFile(cbz_path, "w") as zf:
+        for idx in reversed(range(10)):
+            w, h = expected_dims[idx]
+            zf.writestr(f"page_{idx + 1}.png", _make_png_bytes(w, h))
+
+    work_cbz = tmp_path / "work_cbz"
+    cbz_pages = ArchiveExtractor().extract(cbz_path, work_cbz, workers=4)
+    assert [p.index for p in cbz_pages] == list(range(10))
+    assert [p.is_cover for p in cbz_pages] == [i == 0 for i in range(10)]
+    assert [p.is_spread for p in cbz_pages] == [i == 1 for i in range(10)]
+    assert [(p.width, p.height) for p in cbz_pages] == expected_dims
+    assert not any(p.name.startswith("raw_") for p in work_cbz.iterdir())
+
+    # 2. Image directory preserves source files while staging cleanly with workers=4
+    src_dir = tmp_path / "folder_manga"
+    src_files = []
+    for idx in range(6):
+        w, h = expected_dims[idx]
+        src_files.append(_write_png(src_dir / f"p_{idx + 1}.png", w, h))
+
+    dir_pages = ArchiveExtractor().extract(src_dir, tmp_path / "work_dir", workers=4)
+    assert [p.index for p in dir_pages] == list(range(6))
+    assert [(p.width, p.height) for p in dir_pages] == expected_dims[:6]
+    assert all(f.is_file() for f in src_files)
+
+    # 3. Corrupted image surfaces ValueError even when parallel workers are used
+    bad_cbz = tmp_path / "bad_parallel.cbz"
+    with zipfile.ZipFile(bad_cbz, "w") as zf:
+        zf.writestr("page_1.png", _make_png_bytes(100, 150))
+        zf.writestr("page_2.png", b"not-an-image")
+        zf.writestr("page_3.png", _make_png_bytes(100, 150))
+
+    with pytest.raises(ValueError, match="page_2\\.png"):
+        ArchiveExtractor().extract(bad_cbz, tmp_path / "work_bad", workers=4)
