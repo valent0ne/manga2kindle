@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -9,6 +10,56 @@ import sys
 from pathlib import Path
 
 from pydantic import BaseModel
+
+_BYTES_PER_GIB: float = 1024.0**3
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def _windows_avail_commit_gib() -> float | None:
+    """Return the minimum of available Windows physical RAM and commit charge in GiB, or None."""
+    try:
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return min(float(status.ullAvailPhys), float(status.ullAvailPageFile)) / _BYTES_PER_GIB
+    except (AttributeError, OSError):
+        return None
+
+
+def available_memory_gib() -> float | None:
+    """Return effective available memory (min of physical RAM and Windows commit limit) in GiB."""
+    avail_phys: float | None = None
+    try:
+        import psutil
+
+        avail_phys = float(psutil.virtual_memory().available) / _BYTES_PER_GIB
+    except ImportError:
+        avail_phys = None
+
+    if sys.platform.startswith("win"):
+        avail_commit = _windows_avail_commit_gib()
+        if avail_phys is not None and avail_commit is not None:
+            return min(avail_phys, avail_commit)
+        return avail_commit if avail_commit is not None else avail_phys
+
+    return avail_phys
 
 
 class ToolStatus(BaseModel):
