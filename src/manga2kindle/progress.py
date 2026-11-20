@@ -266,11 +266,12 @@ class RichProgressReporter:
             if self._is_batch:
                 self._succeeded += 1
                 self._advance_overall_locked()
-                self._console.print(
-                    f"[green]{rich_escape(self._complete_prefix)}:[/green] "
-                    f"{rich_escape(str(output_path))}",
-                    soft_wrap=True,
-                )
+                if not self._live_enabled:
+                    self._console.print(
+                        f"[green]{rich_escape(self._complete_prefix)}:[/green] "
+                        f"{rich_escape(str(output_path))}",
+                        soft_wrap=True,
+                    )
 
     def on_book_skip(self, book_id: str, book_name: str, output_path: Path) -> None:
         with self._lock:
@@ -278,11 +279,12 @@ class RichProgressReporter:
             if self._is_batch:
                 self._skipped += 1
                 self._advance_overall_locked()
-                self._console.print(
-                    f"[yellow]Skipped (already exists):[/yellow] "
-                    f"{rich_escape(str(output_path))}",
-                    soft_wrap=True,
-                )
+                if not self._live_enabled:
+                    self._console.print(
+                        f"[yellow]Skipped (already exists):[/yellow] "
+                        f"{rich_escape(str(output_path))}",
+                        soft_wrap=True,
+                    )
 
     def on_book_error(self, book_id: str, source_name: str, error: Exception) -> None:
         with self._lock:

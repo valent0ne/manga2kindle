@@ -441,9 +441,12 @@ class TestModelsAndDoctorCli:
     def test_resolve_batch_workers_auto_and_tunable(self) -> None:
         assert ConversionPipeline._resolve_batch_workers(
             16, 10, no_kcc=False, detector_kind=DetectorKind.CONTOUR, available_ram_gib=16.0
+        ) == (4, 4)
+        assert ConversionPipeline._resolve_batch_workers(
+            16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, available_ram_gib=6.0
         ) == (2, 8)
         assert ConversionPipeline._resolve_batch_workers(
-            16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, available_ram_gib=4.0
+            16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, available_ram_gib=3.0
         ) == (1, 16)
         assert ConversionPipeline._resolve_batch_workers(
             16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, batch_workers_override=3

@@ -254,6 +254,83 @@ class TestKfxCompilerUnit:
         empty_kfx.write_bytes(b"")
         assert compiler.verify_pdoc(empty_kfx) is False
 
+    def test_compile_and_verify_single_process_happy_path_and_errors(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calibre_debug = tmp_path / "calibre-debug"
+        kpf_path = tmp_path / "book.kpf"
+        kpf_path.write_bytes(b"kpf")
+        output_kfx = tmp_path / "out" / "book.kfx"
+
+        calls: list[list[str]] = []
+
+        def fake_ok(cmd, **kwargs):
+            calls.append(cmd)
+            output_kfx.write_bytes(b"\xeaDRMION\x00compiled")
+            payload = json.dumps({"cde_content_type": "PDOC"})
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"M2K_META:{payload}\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_ok)
+        compiler = KfxCompiler(calibre_debug)
+        result = compiler.compile_and_verify(kpf_path, output_kfx)
+        assert result == output_kfx
+        assert output_kfx.is_file()
+        assert len(calls) == 1
+        assert calls[0][0] == str(calibre_debug)
+        assert calls[0][1] == "-c"
+        assert calls[0][3] == str(kpf_path.resolve())
+        assert calls[0][4] == str(output_kfx.resolve())
+
+        # EBOK marker or missing marker fails verification
+        for bad_stdout in (
+            'M2K_META:{"cde_content_type": "EBOK"}\n',
+            "no metadata marker\n",
+        ):
+            monkeypatch.setattr(
+                subprocess,
+                "run",
+                lambda cmd, _out=bad_stdout, **kw: (
+                    output_kfx.write_bytes(b"data"),
+                    subprocess.CompletedProcess(cmd, 0, stdout=_out, stderr=""),
+                )[1],
+            )
+            with pytest.raises(KfxCompilationError, match="PDOC"):
+                compiler.compile_and_verify(kpf_path, output_kfx)
+
+        # Missing/empty output or non-zero exit raises KfxCompilationError
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout='M2K_META:{"cde_content_type":"PDOC"}', stderr=""),
+        )
+        with pytest.raises(KfxCompilationError, match="missing"):
+            compiler.compile_and_verify(kpf_path, output_kfx)
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom"),
+        )
+        with pytest.raises(KfxCompilationError, match="boom"):
+            compiler.compile_and_verify(kpf_path, output_kfx)
+
+        # Respects monkeypatched compile/verify_pdoc overrides
+        hook_calls: list[str] = []
+        monkeypatch.setattr(
+            KfxCompiler,
+            "compile",
+            lambda self, kp, ok: (hook_calls.append("compile"), ok.write_bytes(b"fake"), ok)[2],
+        )
+        monkeypatch.setattr(
+            KfxCompiler,
+            "verify_pdoc",
+            lambda self, ok: (hook_calls.append("verify"), True)[1],
+        )
+        assert compiler.compile_and_verify(kpf_path, output_kfx) == output_kfx
+        assert hook_calls == ["compile", "verify"]
+
 
 class TestKfxCompilerIntegration:
     """Live Calibre KFX Output integration tests."""
@@ -349,3 +426,42 @@ class TestKfxCompilerIntegration:
         corrupt_kfx = tmp_path / "corrupt.kfx"
         corrupt_kfx.write_bytes(b"not-a-real-kfx-PDOC")
         assert compiler.verify_pdoc(corrupt_kfx) is False
+
+    def test_compile_and_verify_two_page_kpf_real_calibre(self, tmp_path: Path) -> None:
+        calibre_debug = _has_calibre_and_kfx_output()
+        if calibre_debug is None:
+            pytest.skip("calibre-debug or KFX Output plugin not installed")
+
+        img1 = tmp_path / "page_001.png"
+        Image.new("RGB", (1264, 1680), (255, 255, 255)).save(img1, "PNG")
+        pages = [
+            PageAsset(
+                index=0,
+                source_path=img1,
+                processed_path=img1,
+                width=1264,
+                height=1680,
+                is_cover=True,
+                panels=[PanelBox(x=50, y=50, w=550, h=750, ordinal=1)],
+            )
+        ]
+        kpf_path = tmp_path / "single_proc.kpf"
+        kfx_path = tmp_path / "single_proc.kfx"
+        config = ConversionConfig(
+            input_path=tmp_path / "input.cbz",
+            output_path=kfx_path,
+            profile=DeviceProfile.from_name("KPW5"),
+            direction=ReadingDirection.RTL,
+        )
+        KpfBuilder().build(
+            pages=pages,
+            title="Single Process Test",
+            config=config,
+            output_kpf=kpf_path,
+        )
+
+        compiler = KfxCompiler(calibre_debug)
+        compiled = compiler.compile_and_verify(kpf_path, kfx_path)
+        assert compiled == kfx_path
+        assert kfx_path.is_file() and kfx_path.stat().st_size > 0
+        assert compiler.verify_pdoc(kfx_path) is True
