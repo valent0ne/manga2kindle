@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 
 from manga2kindle.models import (
     DEFAULT_MAX_MERGED_AREA_RATIO,
@@ -20,6 +21,114 @@ DEFAULT_IOU_THRESHOLD = 0.4
 DEFAULT_CONTAINMENT_THRESHOLD = 0.85
 DEFAULT_PADDING = 0.04
 DEFAULT_BLEED_MARGIN = 2
+GUTTER_INSET_MAX_PX = 24
+GUTTER_INSET_RATIO = 0.05
+
+
+class CutAxis(str, Enum):
+    """Axis along which panel intervals are projected for gutter splitting."""
+
+    HORIZONTAL = "y"
+    VERTICAL = "x"
+
+
+def panel_to_rect(box: PanelBox) -> Rect:
+    """Convert a PanelBox to an (x, y, w, h) rectangle tuple."""
+    return (box.x, box.y, box.w, box.h)
+
+
+def union_rect(boxes: Sequence[PanelBox]) -> Rect:
+    """Return the exact enclosing (x, y, w, h) bounding box of non-empty PanelBoxes."""
+    if not boxes:
+        raise ValueError("Cannot compute union of empty box sequence")
+    min_x = min(box.x for box in boxes)
+    min_y = min(box.y for box in boxes)
+    max_x = max(box.x + box.w for box in boxes)
+    max_y = max(box.y + box.h for box in boxes)
+    return (min_x, min_y, max_x - min_x, max_y - min_y)
+
+
+def unpad_rect(rect: Rect, padding: float) -> Rect:
+    """Approximate the pre-padding rectangle from a padded (x, y, w, h) rectangle."""
+    if padding <= 0.0:
+        return rect
+    frac = padding / (1.0 + 2.0 * padding)
+    dx = min(int(round(rect[2] * frac)), max(0, (rect[2] - 1) // 2))
+    dy = min(int(round(rect[3] * frac)), max(0, (rect[3] - 1) // 2))
+    return (
+        rect[0] + dx,
+        rect[1] + dy,
+        max(1, rect[2] - 2 * dx),
+        max(1, rect[3] - 2 * dy),
+    )
+
+
+def axis_interval(
+    box: PanelBox,
+    axis: CutAxis,
+    *,
+    inset: bool = False,
+    inset_ratio: float = GUTTER_INSET_RATIO,
+    inset_max_px: int | None = GUTTER_INSET_MAX_PX,
+) -> tuple[int, int]:
+    """Return [start, end) along ``axis``, optionally inset to clear minor padding overlap."""
+    start, dim = (box.y, box.h) if axis is CutAxis.HORIZONTAL else (box.x, box.w)
+    if not inset:
+        return (start, start + dim)
+    margin = int(inset_ratio * dim)
+    if inset_max_px is not None:
+        margin = min(inset_max_px, margin)
+    margin = min(margin, max(0, (dim - 1) // 2))
+    return (start + margin, start + dim - margin)
+
+
+def split_by_gutter(
+    boxes: Sequence[PanelBox],
+    axis: CutAxis,
+    *,
+    inset: bool = False,
+    reverse: bool = False,
+    inset_ratio: float = GUTTER_INSET_RATIO,
+    inset_max_px: int | None = GUTTER_INSET_MAX_PX,
+) -> list[list[PanelBox]]:
+    """Sweep 1D panel intervals to split into non-overlapping bands or columns."""
+    if not boxes:
+        return []
+
+    items = sorted(
+        (
+            (
+                axis_interval(
+                    box,
+                    axis,
+                    inset=inset,
+                    inset_ratio=inset_ratio,
+                    inset_max_px=inset_max_px,
+                ),
+                box,
+            )
+            for box in boxes
+        ),
+        key=lambda item: (item[0][0], item[0][1]),
+    )
+    groups: list[list[PanelBox]] = []
+    current_group: list[PanelBox] = [items[0][1]]
+    current_end = items[0][0][1]
+
+    for (start, end), box in items[1:]:
+        if start >= current_end:
+            groups.append(current_group)
+            current_group = [box]
+            current_end = end
+        else:
+            current_group.append(box)
+            if end > current_end:
+                current_end = end
+    groups.append(current_group)
+
+    if reverse:
+        groups.reverse()
+    return groups
 
 _TINY_PANEL_MAX_AREA_RATIO = 0.04
 _TINY_PANEL_WIDTH_RATIO = 3.0
@@ -29,7 +138,11 @@ _SAME_ROW_ADJACENCY_WEIGHT = 0.20
 
 _MARGIN_HALO_MIN_PX = 8
 _MARGIN_HALO_PAGE_RATIO = 0.04
-_DOMINANT_CLUSTER_MIN_TEXT_FRAC = 0.65
+_ESSENTIAL_ALCOVE_MAX_GAP_RATIO = 0.12
+_MAX_ALCOVE_ADDED_AREA_RATIO = 0.08
+_DOMINANT_CLUSTER_MIN_TEXT_FRAC = 0.55
+_MAX_EXTERNAL_SLICE_OVERLAP = 0.25
+_MAX_TEXT_EXPANSION_AREA_RATIO = 0.85
 
 
 @dataclass(frozen=True)
@@ -211,12 +324,81 @@ def _union_rect(box_a: Rect, box_b: Rect) -> Rect:
     return (x1, y1, x2 - x1, y2 - y1)
 
 
+def _rect_gap_sq(box_a: Rect, box_b: Rect) -> int:
+    """Return squared Euclidean gap in pixels between two axis-aligned rectangles."""
+    dx = max(0, max(box_a[0], box_b[0]) - min(box_a[0] + box_a[2], box_b[0] + box_b[2]))
+    dy = max(0, max(box_a[1], box_b[1]) - min(box_a[1] + box_a[3], box_b[1] + box_b[3]))
+    return dx * dx + dy * dy
+
+
+def _rect_intersects_halo(
+    t_box: Rect,
+    cluster_rect: Rect,
+    halo_px: int,
+    page_width: int,
+    page_height: int,
+) -> bool:
+    """Return True if ``t_box`` intersects ``cluster_rect`` expanded by ``halo_px``."""
+    rx, ry, rw, rh = cluster_rect
+    x1 = max(0, rx - halo_px)
+    y1 = max(0, ry - halo_px)
+    x2 = min(page_width, rx + rw + halo_px)
+    y2 = min(page_height, ry + rh + halo_px)
+    return _intersection_area(t_box, (x1, y1, x2 - x1, y2 - y1)) > 0
+
+
+def _pick_nearest_zero_conflict_cluster(
+    t_box: Rect,
+    candidate_roots: Sequence[int],
+    *,
+    cluster_rects: dict[int, Rect],
+    active_roots: Sequence[int],
+    page_area: int,
+    expansion_cap: float,
+    containment_threshold: float,
+    max_added_area_ratio: float | None = None,
+) -> int | None:
+    """Pick the closest candidate cluster whose expansion adds zero sibling overlap."""
+    scored: list[tuple[tuple[int, int, int, int], int]] = []
+    for r in candidate_roots:
+        curr_rect = cluster_rects[r]
+        cand = _union_rect(curr_rect, t_box)
+        cand_area = _box_area(cand)
+        if (cand_area / page_area) > expansion_cap:
+            continue
+        added_area = cand_area - _box_area(curr_rect)
+        if max_added_area_ratio is not None and (added_area / page_area) > max_added_area_ratio:
+            continue
+        if any(
+            other != r
+            and (
+                compute_containment(cand, cluster_rects[other]) >= containment_threshold
+                or _intersection_area(cand, cluster_rects[other])
+                > _intersection_area(curr_rect, cluster_rects[other])
+            )
+            for other in active_roots
+        ):
+            continue
+        score_key = (
+            _rect_gap_sq(t_box, curr_rect),
+            -_intersection_area(t_box, curr_rect),
+            added_area,
+            r,
+        )
+        scored.append((score_key, r))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
 def merge_bridged_panel_clusters(
     boxes: Sequence[Rect],
     page_width: int,
     page_height: int,
     *,
     text_boxes: Sequence[Rect] = (),
+    margin_text_boxes: Sequence[Rect] = (),
     text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
     panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
     max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
@@ -319,7 +501,7 @@ def merge_bridged_panel_clusters(
             continue
 
         roots_to_merge = {root_a, root_b}
-        union_rect = _union_rect(cluster_rects[root_a], cluster_rects[root_b])
+        merged_rect = _union_rect(cluster_rects[root_a], cluster_rects[root_b])
 
         # Absorb any external cluster engulfed by the merged bounding box so we
         # preserve bridged layouts without creating nested duplicate panels.
@@ -328,20 +510,28 @@ def merge_bridged_panel_clusters(
                 _find(k)
                 for k in valid_indices
                 if _find(k) not in roots_to_merge
-                and compute_containment(union_rect, boxes[k]) >= containment_threshold
+                and compute_containment(merged_rect, boxes[k]) >= containment_threshold
             }
             if not engulfed_roots:
                 break
             roots_to_merge.update(engulfed_roots)
             for eroot in engulfed_roots:
-                union_rect = _union_rect(union_rect, cluster_rects[eroot])
+                merged_rect = _union_rect(merged_rect, cluster_rects[eroot])
 
-        union_area = _box_area(union_rect)
+        union_area = _box_area(merged_rect)
         if (union_area / page_area) > max_merged_area_ratio:
             continue
 
         combined_area = sum(cluster_member_areas[r] for r in roots_to_merge)
         if union_area <= 0 or (combined_area / union_area) < min_fill_ratio:
+            continue
+
+        # Reject L-shaped merges that slice partially through unrelated panels.
+        if any(
+            _find(k) not in roots_to_merge
+            and compute_containment(merged_rect, boxes[k]) >= _MAX_EXTERNAL_SLICE_OVERLAP
+            for k in valid_indices
+        ):
             continue
 
         for other_root in roots_to_merge:
@@ -352,14 +542,21 @@ def merge_bridged_panel_clusters(
             cluster_rects.pop(other_root)
             cluster_member_areas.pop(other_root)
 
-        cluster_rects[root_a] = union_rect
+        cluster_rects[root_a] = merged_rect
         cluster_member_areas[root_a] = combined_area
 
     # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
     # outside a single panel (or sit immediately adjacent in the white margin).
-    margin_px = max(_MARGIN_HALO_MIN_PX, int(round(_MARGIN_HALO_PAGE_RATIO * min(page_width, page_height))))
+    min_dim = min(page_width, page_height)
+    margin_px = max(_MARGIN_HALO_MIN_PX, int(round(_MARGIN_HALO_PAGE_RATIO * min_dim)))
+    alcove_px = max(margin_px, int(round(_ESSENTIAL_ALCOVE_MAX_GAP_RATIO * min_dim)))
+    expansion_cap = max(max_merged_area_ratio, _MAX_TEXT_EXPANSION_AREA_RATIO)
     active_roots = list(cluster_rects.keys())
-    for t_box in text_boxes:
+    tagged_texts = [
+        *((t_box, True) for t_box in text_boxes),
+        *((t_box, False) for t_box in margin_text_boxes),
+    ]
+    for t_box, allow_alcove in tagged_texts:
         t_area = _box_area(t_box)
         if t_area <= 0 or (t_area / page_area) < min_text_area_ratio:
             continue
@@ -379,25 +576,48 @@ def merge_bridged_panel_clusters(
             if _DOMINANT_CLUSTER_MIN_TEXT_FRAC <= best_frac < 1.0:
                 target_root = best_root
         elif not direct_matches:
-            prox_matches: list[int] = []
-            for r in active_roots:
-                rx, ry, rw, rh = cluster_rects[r]
-                expanded_r = (
-                    max(0, rx - margin_px),
-                    max(0, ry - margin_px),
-                    min(page_width, rx + rw + margin_px) - max(0, rx - margin_px),
-                    min(page_height, ry + rh + margin_px) - max(0, ry - margin_px),
-                )
-                if _intersection_area(t_box, expanded_r) > 0:
-                    prox_matches.append(r)
+            prox_matches = [
+                r
+                for r in active_roots
+                if _rect_intersects_halo(t_box, cluster_rects[r], margin_px, page_width, page_height)
+            ]
             if len(prox_matches) == 1:
                 target_root = prox_matches[0]
+            elif len(prox_matches) >= 2:
+                target_root = _pick_nearest_zero_conflict_cluster(
+                    t_box,
+                    prox_matches,
+                    cluster_rects=cluster_rects,
+                    active_roots=active_roots,
+                    page_area=page_area,
+                    expansion_cap=expansion_cap,
+                    containment_threshold=containment_threshold,
+                )
+            elif allow_alcove:
+                alcove_matches = [
+                    r
+                    for r in active_roots
+                    if _rect_intersects_halo(
+                        t_box, cluster_rects[r], alcove_px, page_width, page_height
+                    )
+                ]
+                if alcove_matches:
+                    target_root = _pick_nearest_zero_conflict_cluster(
+                        t_box,
+                        alcove_matches,
+                        cluster_rects=cluster_rects,
+                        active_roots=active_roots,
+                        page_area=page_area,
+                        expansion_cap=expansion_cap,
+                        containment_threshold=containment_threshold,
+                        max_added_area_ratio=_MAX_ALCOVE_ADDED_AREA_RATIO,
+                    )
 
         if target_root is None:
             continue
 
         candidate_rect = _union_rect(cluster_rects[target_root], t_box)
-        if (_box_area(candidate_rect) / page_area) > max_merged_area_ratio:
+        if (_box_area(candidate_rect) / page_area) > expansion_cap:
             continue
         if any(
             other != target_root
@@ -424,6 +644,7 @@ def merge_bridged_panels(
     page_height: int,
     *,
     text_boxes: Sequence[Rect] = (),
+    margin_text_boxes: Sequence[Rect] = (),
     text_bridge_overlap: float = DEFAULT_TEXT_BRIDGE_OVERLAP,
     panel_overlap_threshold: float = DEFAULT_PANEL_OVERLAP_THRESHOLD,
     max_merged_area_ratio: float = DEFAULT_MAX_MERGED_AREA_RATIO,
@@ -437,6 +658,7 @@ def merge_bridged_panels(
         page_width,
         page_height,
         text_boxes=text_boxes,
+        margin_text_boxes=margin_text_boxes,
         text_bridge_overlap=text_bridge_overlap,
         panel_overlap_threshold=panel_overlap_threshold,
         max_merged_area_ratio=max_merged_area_ratio,
@@ -453,6 +675,7 @@ def finalize_panel_boxes(
     page_h: int,
     *,
     text_boxes: Sequence[Rect] = (),
+    margin_text_boxes: Sequence[Rect] = (),
     scores: Sequence[float] | None = None,
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
     containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
@@ -488,6 +711,7 @@ def finalize_panel_boxes(
             page_w,
             page_h,
             text_boxes=text_boxes,
+            margin_text_boxes=margin_text_boxes,
             text_bridge_overlap=text_bridge_overlap,
             panel_overlap_threshold=panel_overlap_threshold,
             max_merged_area_ratio=max_merged_area_ratio,

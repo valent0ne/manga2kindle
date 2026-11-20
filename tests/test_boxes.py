@@ -9,8 +9,12 @@ from manga2kindle.cv.boxes import (
     DEFAULT_MIN_FILL_RATIO,
     DEFAULT_MIN_TEXT_AREA_RATIO,
     DEFAULT_PANEL_OVERLAP_THRESHOLD,
+    DEFAULT_PADDING,
     DEFAULT_TEXT_BRIDGE_OVERLAP,
+    GUTTER_INSET_MAX_PX,
+    CutAxis,
     MergedCluster,
+    axis_interval,
     compute_containment,
     compute_iou,
     finalize_panel_boxes,
@@ -19,6 +23,10 @@ from manga2kindle.cv.boxes import (
     nms_and_prune,
     nms_and_prune_indices,
     pad_and_clamp,
+    panel_to_rect,
+    split_by_gutter,
+    union_rect,
+    unpad_rect,
 )
 from manga2kindle.models import DetectorConfig, PanelBox
 
@@ -151,10 +159,10 @@ def test_merge_bridged_panel_clusters_ignores_degenerate_boxes() -> None:
 
 
 def test_merge_bridged_panel_clusters_three_panels_strongest_first_and_area_cap() -> None:
-    # Page 1000x1000 -> max_merged_area_ratio=0.65 -> max 650_000 px
+    # Page 1000x1000 -> max_merged_area_ratio=0.55 -> max 550_000 px
     p0 = (50, 50, 450, 400)    # 180_000
-    p1 = (520, 50, 430, 400)   # 172_000; union(p0, p1) = 900x400 = 360_000 (<= 0.65)
-    p2 = (50, 470, 900, 480)   # union(p0,p1,p2) = 900x900 = 810_000 (> 0.65)
+    p1 = (520, 50, 430, 400)   # 172_000; union(p0, p1) = 900x400 = 360_000 (<= 0.55)
+    p2 = (50, 470, 900, 480)   # union(p0,p1,p2) = 900x900 = 810_000 (> 0.55)
     # Text box bridges p0, p1, p2:
     # x=300..700 (w=400), y=400..520 (h=120) -> area=48_000
     # In p0 (y=400..450, x=300..500): 200x50 = 10_000 (20.8%)
@@ -166,8 +174,10 @@ def test_merge_bridged_panel_clusters_three_panels_strongest_first_and_area_cap(
     # In p0 (x=300..500, y=380..450): 200x70 = 14_000 (29.2%)
     # In p1 (x=520..700, y=380..450): 180x70 = 12_600 (26.25%)
     # In p2 (x=300..700, y=470..500): 400x30 = 12_000 (25.0%)
-    # Weights: (0,1)=0.2625, (0,2)=0.25, (1,2)=0.25 -> (0,1) merges first (360_000 <= 650_000),
-    # then merging with p2 would be 900x900=810_000 > 650_000 so rejected!
+    # Weights: (0,1)=0.2625, (0,2)=0.25, (1,2)=0.25 -> (0,1) merges first (360_000 <= 550_000),
+    # then merging with p2 would be 900x900=810_000 > 550_000 so rejected!
+    # Merged cluster (0, 1) holds 400x70 = 28_000 / 48_000 (58.3% >= _DOMINANT_CLUSTER_MIN_TEXT_FRAC)
+    # of `bridge`, so it expands downward to y=500 to keep `bridge` intact while keeping member_indices split.
     clusters = merge_bridged_panel_clusters(
         [p0, p1, p2],
         page_width=1000,
@@ -175,7 +185,7 @@ def test_merge_bridged_panel_clusters_three_panels_strongest_first_and_area_cap(
         text_boxes=[bridge],
     )
     assert clusters == [
-        MergedCluster(rect=(50, 50, 900, 400), member_indices=(0, 1)),
+        MergedCluster(rect=(50, 50, 900, 450), member_indices=(0, 1)),
         MergedCluster(rect=p2, member_indices=(2,)),
     ]
 
@@ -372,3 +382,173 @@ def test_detector_config_merge_fields_validation() -> None:
         DetectorConfig(max_merged_area_ratio=0.0)
     with pytest.raises(ValueError):
         DetectorConfig(min_fill_ratio=1.1)
+
+
+def test_panel_to_rect_and_union_rect() -> None:
+    b1 = PanelBox(x=100, y=50, w=200, h=300)
+    b2 = PanelBox(x=250, y=100, w=150, h=350)
+    assert panel_to_rect(b1) == (100, 50, 200, 300)
+    assert union_rect([b1, b2]) == (100, 50, 300, 400)
+    with pytest.raises(ValueError):
+        union_rect([])
+
+
+def test_unpad_rect_inverts_padding_and_preserves_zero() -> None:
+    raw = (200, 300, 500, 800)
+    assert unpad_rect(raw, 0.0) == raw
+    padded = pad_and_clamp(raw, page_w=2000, page_h=2600, padding=DEFAULT_PADDING, bleed_margin=0)
+    unpadded = unpad_rect(panel_to_rect(padded), DEFAULT_PADDING)
+    assert unpadded == raw
+    # Tiny box still preserves at least 1x1 dimensions
+    assert unpad_rect((10, 10, 2, 2), 0.1) == (10, 10, 2, 2)
+
+
+def test_axis_interval_and_split_by_gutter() -> None:
+    # Wide box exceeds GUTTER_INSET_MAX_PX when uncapped
+    wide = PanelBox(x=100, y=200, w=1000, h=400)
+    assert axis_interval(wide, CutAxis.VERTICAL, inset=False) == (100, 1100)
+    assert axis_interval(wide, CutAxis.VERTICAL, inset=True) == (
+        100 + GUTTER_INSET_MAX_PX,
+        1100 - GUTTER_INSET_MAX_PX,
+    )
+    assert axis_interval(wide, CutAxis.VERTICAL, inset=True, inset_max_px=None) == (150, 1050)
+
+    # High-res panels padded with 0.04 overlap > 24px across a 10px vertical gutter
+    raw_hero = (700, 100, 1100, 800)
+    raw_sub = (100, 100, 590, 380)
+    p_hero = pad_and_clamp(raw_hero, page_w=1908, page_h=2544, padding=0.04, bleed_margin=0)
+    p_sub = pad_and_clamp(raw_sub, page_w=1908, page_h=2544, padding=0.04, bleed_margin=0)
+    # Capped inset (24px) fails to split across 10px gutter, uncapped 6% splits cleanly
+    assert len(split_by_gutter([p_hero, p_sub], CutAxis.VERTICAL, inset=True)) == 1
+    cols = split_by_gutter(
+        [p_hero, p_sub],
+        CutAxis.VERTICAL,
+        inset=True,
+        reverse=True,
+        inset_ratio=0.06,
+        inset_max_px=None,
+    )
+    assert len(cols) == 2
+    assert cols[0] == [p_hero]
+    assert cols[1] == [p_sub]
+
+    # Horizontal strict gutter split
+    top = PanelBox(x=50, y=40, w=900, h=300)
+    bot = PanelBox(x=50, y=360, w=900, h=400)
+    assert split_by_gutter([bot, top], CutAxis.HORIZONTAL) == [[top], [bot]]
+
+
+def test_merge_bridged_panel_clusters_rejects_partial_slice_bridge_cascade() -> None:
+    """L-shaped bridge slicing >=25% across unrelated panels is rejected; clean sub-merge & text expansion succeed."""
+    # Models Ch.69 p.0013 (1000x1000 normalized): middle wide P2, bottom-right P3/P4, P5, P6
+    p2 = (50, 330, 900, 320)    # middle full-width
+    p3 = (680, 665, 270, 155)   # bottom-right top
+    p4 = (675, 830, 275, 165)   # bottom-right bottom
+    p5 = (440, 665, 230, 330)   # bottom middle (~46% sliced if (P2, P3) merged!)
+    p6 = (60, 670, 370, 325)    # bottom left (~45% sliced if (P2, P3) merged!)
+    # Bubble bridges P2 (28%) and P3 (69%): must NOT merge (P2, P3), instead P3 expands up after (P3, P4, P5) merges
+    bubble_p2_p3 = (690, 580, 210, 230)
+    # Bubble bridges P4 (72%) and P5 (23%): clean merge of (P4, P5) which engulfs P3 (~100%)
+    bubble_p4_p5 = (615, 815, 225, 155)
+
+    clusters = merge_bridged_panel_clusters(
+        [p2, p3, p4, p5, p6],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[bubble_p2_p3, bubble_p4_p5],
+        max_merged_area_ratio=0.55,
+    )
+    assert [c.member_indices for c in clusters] == [(0,), (1, 2, 3), (4,)]
+    assert clusters[0].rect == p2
+    # Bottom-right+mid cluster expanded upward to y=580 to enclose bubble_p2_p3 completely
+    assert clusters[1].rect == (440, 580, 510, 415)
+    assert clusters[2].rect == p6
+
+
+def test_merge_bridged_panel_clusters_encloses_stranded_and_floating_margin_text() -> None:
+    """Stranded 2-neighbor gutter text and wide floating margin text attach to zero-conflict panels without bridging."""
+    # Case 1 (Ch.70 p.0009): text overlaps right panel by 3.6% (<5%) and sits 4px from left panel
+    p_right = (504, 10, 450, 440)
+    p_left = (50, 10, 344, 440)
+    p_mid = (50, 500, 904, 300)
+    stranded = (398, 150, 110, 140)  # touches p_right 4px, gap 4px from p_left
+    c_stranded = merge_bridged_panel_clusters(
+        [p_right, p_left, p_mid],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[stranded],
+    )
+    assert [c.member_indices for c in c_stranded] == [(0,), (1,), (2,)]
+    assert c_stranded[0].rect == (398, 10, 556, 440)  # p_right enclosed stranded without touching p_left
+    assert c_stranded[1].rect == p_left
+
+    # Case 2 (Ch.69 p.0018 + Ch.70 p.0015): margin_text_boxes never merge, pick zero-conflict panel, and allow <=0.85 expansion
+    top_wide = (80, 10, 840, 260)
+    mid_right = (510, 330, 410, 250)
+    mid_left = (80, 330, 410, 250)
+    caption_below_top = (200, 290, 600, 26)  # 20px below top_wide, 14px above split mid_right/mid_left -> only top_wide has 0 overlap conflict!
+
+    c_caption = merge_bridged_panel_clusters(
+        [top_wide, mid_right, mid_left],
+        page_width=1000,
+        page_height=1000,
+        margin_text_boxes=[caption_below_top],
+        max_merged_area_ratio=0.55,
+    )
+    assert len(c_caption) == 3
+    assert c_caption[0].rect == (80, 10, 840, 306)  # expanded down to y=316, leaving mid_right/mid_left untouched
+    assert c_caption[1].rect == mid_right
+    assert c_caption[2].rect == mid_left
+
+    # Case 3 (Ch.70 p.0015 area > 0.55): single panel at 0.55 area expands up to <= 0.85 for floating caption
+    upper_wide = (60, 100, 880, 200)
+    lower_large = (60, 380, 880, 610)  # area = 0.537; expanded up to y=330 -> area = 0.581 (> 0.55, <= 0.85)
+    lower_caption = (200, 330, 600, 26)  # 24px above lower_large vs 30px below upper_wide -> closer to lower_large
+    c_large = merge_bridged_panel_clusters(
+        [upper_wide, lower_large],
+        page_width=1000,
+        page_height=1000,
+        margin_text_boxes=[lower_caption],
+        max_merged_area_ratio=0.55,
+    )
+    assert len(c_large) == 2
+    assert c_large[0].rect == upper_wide
+    assert c_large[1].rect == (60, 330, 880, 660)
+
+
+def test_merge_bridged_panel_clusters_alcove_fallback_essential_only_and_bounded() -> None:
+    """Essential text in an open alcove beyond the 4% halo expands the unique zero-conflict panel."""
+    # Models Ch.71 p.0015 (1000x1000): 4% margin_px=40, 12% alcove_px=120
+    p_right = (440, 10, 480, 440)   # gap 60px from alcove_text (collides with p_above if expanded left)
+    p_above = (80, 10, 340, 260)    # y=10..270 -> gap 70px (>40, <=120); added area = 340*110 = 37_400 (3.7% <= 8%)
+    p_below = (80, 470, 840, 480)   # gap 90px below alcove_text (collides with p_right if expanded up)
+    alcove_text = (150, 340, 220, 40)  # y=340..380
+
+    # Essential text -> expands p_above down to y=380 with zero overlap on p_right or p_below
+    c_ess = merge_bridged_panel_clusters(
+        [p_right, p_above, p_below],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[alcove_text],
+    )
+    assert [c.rect for c in c_ess] == [p_right, (80, 10, 340, 370), p_below]
+
+    # Non-essential margin_text_boxes at the exact same distance must NOT trigger alcove expansion
+    c_margin = merge_bridged_panel_clusters(
+        [p_right, p_above, p_below],
+        page_width=1000,
+        page_height=1000,
+        margin_text_boxes=[alcove_text],
+    )
+    assert [c.rect for c in c_margin] == [p_right, p_above, p_below]
+
+    # Essential alcove text requiring > 8% added area is rejected by the bounded bloat guard
+    wide_top = (80, 10, 840, 200)
+    far_text = (200, 315, 400, 30)  # 105px below wide_top -> added area = 840*135 = 113_400 (11.3% > 8%)
+    c_bloat = merge_bridged_panel_clusters(
+        [wide_top],
+        page_width=1000,
+        page_height=1000,
+        text_boxes=[far_text],
+    )
+    assert c_bloat[0].rect == wide_top
