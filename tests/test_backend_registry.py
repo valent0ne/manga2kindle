@@ -441,6 +441,9 @@ class TestModelsAndDoctorCli:
     def test_resolve_batch_workers_auto_and_tunable(self) -> None:
         assert ConversionPipeline._resolve_batch_workers(
             16, 10, no_kcc=False, detector_kind=DetectorKind.CONTOUR, available_ram_gib=16.0
+        ) == (6, 2)
+        assert ConversionPipeline._resolve_batch_workers(
+            16, 10, no_kcc=False, detector_kind=DetectorKind.CONTOUR, available_ram_gib=10.0
         ) == (4, 4)
         assert ConversionPipeline._resolve_batch_workers(
             16, 10, no_kcc=False, detector_kind=DetectorKind.MAGI, available_ram_gib=6.0
@@ -454,6 +457,84 @@ class TestModelsAndDoctorCli:
         assert ConversionPipeline._resolve_batch_workers(
             4, 10, no_kcc=True, detector_kind=DetectorKind.CONTOUR
         ) == (4, 1)
+
+    def test_run_batch_and_preview_batch_sample_ram_before_model_load(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        input_dir = tmp_path / "series"
+        for vol in range(1, 7):
+            _make_cbz(input_dir / f"Series v0{vol}.cbz", num_pages=1)
+
+        fake_calibre = tmp_path / "calibre-debug"
+        fake_calibre.write_text("", encoding="utf-8")
+        discovery = MagicMock(spec=PlatformDiscovery)
+        discovery.find_calibre.return_value = fake_calibre
+
+        pipeline = ConversionPipeline(discovery=discovery)
+        state = {"ram_gib": 16.0}
+        events: list[tuple[str, object]] = []
+
+        def _fake_avail_ram() -> float:
+            val = state["ram_gib"]
+            events.append(("sample_ram", val))
+            return val
+
+        def _fake_resolve_registry(_cfg: DetectorConfig) -> BackendRegistry:
+            events.append(("resolve_registry", state["ram_gib"]))
+            # Simulate Magi v3 + CUDA model load consuming commit charge after resolution
+            state["ram_gib"] = 4.0
+            return BackendRegistry(DetectorConfig(kind=DetectorKind.CONTOUR))
+
+        orig_resolve_bw = ConversionPipeline._resolve_batch_workers
+
+        def _spy_resolve_bw(*args: object, **kwargs: object) -> tuple[int, int]:
+            res = orig_resolve_bw(*args, **kwargs)
+            events.append(("resolve_bw", kwargs.get("available_ram_gib"), res))
+            return res
+
+        monkeypatch.setattr(pipeline, "_available_ram_gib", _fake_avail_ram)
+        monkeypatch.setattr(pipeline, "_resolve_registry", _fake_resolve_registry)
+        monkeypatch.setattr(pipeline, "_resolve_batch_workers", _spy_resolve_bw)
+        monkeypatch.setattr(
+            pipeline,
+            "_convert_single",
+            lambda cfg, *, output_kfx, **_kw: output_kfx,
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "preview_panels",
+            lambda *_args, output_dir, **_kw: [output_dir],
+        )
+
+        out_dir = tmp_path / "out_kfx"
+        cfg = ConversionConfig(
+            input_path=input_dir,
+            output_path=out_dir,
+            profile=DeviceProfile.from_name("KPW5"),
+            workers=16,
+            no_kcc=False,
+        )
+        results = pipeline.run_batch(cfg)
+        assert len(results) == 6
+        assert events == [
+            ("sample_ram", 16.0),
+            ("resolve_registry", 16.0),
+            ("resolve_bw", 16.0, (6, 2)),
+        ]
+
+        # Reset simulated RAM and verify preview_batch uses the same pre-load ordering
+        state["ram_gib"] = 16.0
+        events.clear()
+        preview_cfg = cfg.model_copy(update={"output_path": tmp_path / "out_previews"})
+        previews = pipeline.preview_batch(preview_cfg)
+        assert len(previews) == 6
+        assert events == [
+            ("sample_ram", 16.0),
+            ("resolve_registry", 16.0),
+            ("resolve_bw", 16.0, (6, 2)),
+        ]
 
     def test_build_contour_backend_and_registry_forward_merge_config(self) -> None:
         from manga2kindle.cv.backends import ContourBackend, _build_contour_backend

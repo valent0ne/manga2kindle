@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 _BATCH_ARCHIVE_EXTENSIONS = frozenset({".cbz", ".cbr"})
 _BatchOutcome = tuple[int, Path, str, Path | None, Exception | None]
+_AUTO_BATCH_WORKERS_ULTRA_MEM_GIB: float = 12.0
+_AUTO_BATCH_WORKERS_ULTRA_MIN_WORKERS: int = 8
+_AUTO_BATCH_WORKERS_ULTRA_CAP: int = 6
 _AUTO_BATCH_WORKERS_HIGH_MEM_GIB: float = 8.0
 _AUTO_BATCH_WORKERS_MID_MEM_GIB: float = 4.0
 _AUTO_BATCH_WORKERS_HIGH_CAP: int = 4
@@ -210,7 +213,11 @@ class ConversionPipeline:
             return bw, max(1, workers // bw)
         if not no_kcc:
             avail = available_ram_gib if available_ram_gib is not None else cls._available_ram_gib()
-            if avail is None or avail >= _AUTO_BATCH_WORKERS_HIGH_MEM_GIB:
+            if (
+                avail is None or avail >= _AUTO_BATCH_WORKERS_ULTRA_MEM_GIB
+            ) and workers >= _AUTO_BATCH_WORKERS_ULTRA_MIN_WORKERS:
+                bw = min(_AUTO_BATCH_WORKERS_ULTRA_CAP, max(1, workers), item_count)
+            elif avail is None or avail >= _AUTO_BATCH_WORKERS_HIGH_MEM_GIB:
                 bw = min(_AUTO_BATCH_WORKERS_HIGH_CAP, max(1, workers), item_count)
             elif avail >= _AUTO_BATCH_WORKERS_MID_MEM_GIB:
                 bw = min(_AUTO_BATCH_WORKERS_MID_CAP, max(1, workers), item_count)
@@ -287,6 +294,7 @@ class ConversionPipeline:
                 page_widths=widths,
                 is_spreads=spreads,
                 on_progress=on_page_progress,
+                workers=workers,
             )
             annotated = [
                 page.model_copy(update={"panels": panels})
@@ -366,7 +374,9 @@ class ConversionPipeline:
             reporter.on_book_stage(
                 ProgressEvent(item_id, input_name, ConversionStage.EXTRACTING)
             )
-            pages = self.extractor.extract(config.input_path, work_dir)
+            pages = self.extractor.extract(
+                config.input_path, work_dir, workers=config.workers
+            )
             reporter.on_book_stage(
                 ProgressEvent(
                     item_id,
@@ -564,6 +574,7 @@ class ConversionPipeline:
                     "or pass --calibre-path."
                 )
 
+            pre_load_ram_gib = self._available_ram_gib()
             batch_registry = self._resolve_registry(config.detector)
 
             if config.beautify_source:
@@ -589,6 +600,7 @@ class ConversionPipeline:
                 no_kcc=config.no_kcc,
                 detector_kind=config.detector.kind,
                 batch_workers_override=config.batch_workers,
+                available_ram_gib=pre_load_ram_gib,
             )
 
             def _convert_one(
@@ -858,7 +870,7 @@ class ConversionPipeline:
             reporter.on_book_stage(
                 ProgressEvent(item_id, display_name, ConversionStage.EXTRACTING)
             )
-            pages = self.extractor.extract(input_path, work_dir)
+            pages = self.extractor.extract(input_path, work_dir, workers=workers)
             reporter.on_book_stage(
                 ProgressEvent(
                     item_id,
@@ -990,6 +1002,7 @@ class ConversionPipeline:
         self.last_batch_errors = []
         reporter.on_batch_start(len(preview_targets), label="Rendering previews")
         try:
+            pre_load_ram_gib = self._available_ram_gib()
             batch_registry = self._resolve_registry(config.detector)
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -999,6 +1012,7 @@ class ConversionPipeline:
                 no_kcc=config.no_kcc,
                 detector_kind=config.detector.kind,
                 batch_workers_override=config.batch_workers,
+                available_ram_gib=pre_load_ram_gib,
             )
 
             def _preview_one(

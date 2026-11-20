@@ -523,3 +523,104 @@ def test_kcc_backend_resolve_max_concurrent_and_semaphore_limits_parallel_runs(
     assert all(len(res) == 1 and res[0].processed_path is not None for res in results)
     assert peak_active <= 2
     assert peak_active >= 1
+
+
+def test_pillow_fallback_parallel_workers_match_sequential(tmp_path: Path) -> None:
+    pages: list[PageAsset] = []
+    # Mix portrait grayscale, dark-border spread, and transparent RGBA pages
+    img0 = Image.new("L", (800, 1200), color=255)
+    ImageDraw.Draw(img0).rectangle([100, 120, 699, 1079], fill=60)
+    pages.append(PageAsset(index=0, source_path=_save_image(img0, tmp_path / "src/00.png"), width=800, height=1200, is_cover=True))
+
+    img1 = Image.new("L", (2000, 1000), color=30)
+    ImageDraw.Draw(img1).rectangle([1000, 0, 1999, 999], fill=200)
+    pages.append(PageAsset(index=1, source_path=_save_image(img1, tmp_path / "src/01.png"), width=2000, height=1000, is_spread=True))
+
+    img2 = Image.new("RGBA", (600, 900), color=(255, 255, 255, 0))
+    ImageDraw.Draw(img2).rectangle([60, 80, 539, 819], fill=(110, 110, 110, 255))
+    pages.append(PageAsset(index=2, source_path=_save_image(img2, tmp_path / "src/02.png"), width=600, height=900))
+
+    img3 = Image.new("L", (700, 1050), color=240)
+    ImageDraw.Draw(img3).rectangle([50, 50, 649, 999], fill=15)
+    pages.append(PageAsset(index=3, source_path=_save_image(img3, tmp_path / "src/03.png"), width=700, height=1050))
+
+    seq_cfg = _make_config(tmp_path, no_kcc=True).model_copy(update={"workers": 1})
+    par_cfg = _make_config(tmp_path, no_kcc=True).model_copy(update={"workers": 4})
+
+    seq_out = PillowFallbackBackend().process(pages, tmp_path / "work_seq", seq_cfg)
+    par_out = PillowFallbackBackend().process(pages, tmp_path / "work_par", par_cfg)
+
+    assert len(seq_out) == len(par_out) == 5
+    for sp, pp in zip(seq_out, par_out):
+        assert sp.index == pp.index
+        assert sp.is_cover == pp.is_cover
+        assert sp.is_spread == pp.is_spread
+        assert (sp.width, sp.height) == (pp.width, pp.height)
+        assert sp.source_path == pp.source_path
+        assert sp.processed_path is not None and pp.processed_path is not None
+        assert sp.processed_path.name == pp.processed_path.name
+        with Image.open(sp.processed_path) as si, Image.open(pp.processed_path) as pi:
+            assert si.size == pi.size
+            assert si.mode == pi.mode
+            assert si.tobytes() == pi.tobytes()
+
+
+def _is_pid_running(pid: int) -> bool:
+    import os
+    import sys
+
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("win"):
+        import ctypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return False
+        try:
+            return int(kernel32.WaitForSingleObject(handle, 0)) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def test_run_managed_subprocess_kills_child_and_grandchild_on_timeout(tmp_path: Path) -> None:
+    import json
+    import subprocess
+    import sys
+    from manga2kindle.platform import run_managed_subprocess
+
+    pids_file = tmp_path / "pids.json"
+    child_code = (
+        "import json, os, pathlib, subprocess, sys, time; "
+        f"pf = pathlib.Path({str(pids_file)!r}); "
+        "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "pf.write_text(json.dumps({'child': os.getpid(), 'grandchild': gc.pid}), encoding='utf-8'); "
+        "time.sleep(60)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_managed_subprocess([sys.executable, "-c", child_code], timeout=1.5)
+
+    assert pids_file.is_file(), "Child did not spawn grandchild before timeout"
+    pids = json.loads(pids_file.read_text(encoding="utf-8"))
+    child_pid = int(pids["child"])
+    grandchild_pid = int(pids["grandchild"])
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and (
+        _is_pid_running(child_pid) or _is_pid_running(grandchild_pid)
+    ):
+        time.sleep(0.05)
+
+    assert not _is_pid_running(child_pid)
+    assert not _is_pid_running(grandchild_pid)

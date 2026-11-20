@@ -8,6 +8,7 @@ import stat
 import subprocess
 import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -19,7 +20,13 @@ from manga2kindle.models import (
     ReadingDirection,
     SpreadMode,
 )
-from manga2kindle.platform import PlatformDiscovery, available_memory_gib
+from manga2kindle.platform import (
+    PlatformDiscovery,
+    available_memory_gib,
+    run_managed_subprocess,
+)
+
+_DEFAULT_SUBPROCESS_RUN = subprocess.run
 
 _SPREAD_CLI_ARGS: dict[SpreadMode, list[str]] = {
     SpreadMode.SPLIT: ["-r", "0"],
@@ -159,15 +166,18 @@ class KccBackend:
 
         try:
             with self._semaphore:
-                proc = subprocess.run(
-                    cmd,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
+                if subprocess.run is not _DEFAULT_SUBPROCESS_RUN:
+                    proc = subprocess.run(
+                        cmd,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                else:
+                    proc = run_managed_subprocess(cmd, env=env)
         except (OSError, subprocess.SubprocessError) as exc:
             raise ImagePreprocessingError(f"Failed to execute kcc-c2e: {exc}") from exc
 
@@ -180,9 +190,16 @@ class KccBackend:
         extracted_paths = self._unpack_cbz_outputs(out_dir, processed_dir)
         preserve_sources = len(extracted_paths) == len(pages)
 
+        if config.workers > 1 and len(extracted_paths) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(config.workers, len(extracted_paths))
+            ) as pool:
+                dimensions = list(pool.map(_measure_image, extracted_paths))
+        else:
+            dimensions = [_measure_image(out_path) for out_path in extracted_paths]
+
         result: list[PageAsset] = []
-        for idx, out_path in enumerate(extracted_paths):
-            width, height = _measure_image(out_path)
+        for idx, (out_path, (width, height)) in enumerate(zip(extracted_paths, dimensions)):
             result.append(
                 PageAsset(
                     index=idx,
@@ -292,11 +309,53 @@ class PillowFallbackBackend:
         self._gamma_lut = [
             round(255 * ((value / 255.0) ** self._GAMMA)) for value in range(256)
         ]
+        self._thread_local = threading.local()
+
+    @staticmethod
+    def _make_eink_palette() -> Image.Image:
         palette_img = Image.new("P", (1, 1))
         palette_img.putpalette(
             [channel for level in range(16) for channel in (level * 17,) * 3]
         )
-        self._eink_palette = palette_img
+        return palette_img
+
+    def _get_eink_palette(self) -> Image.Image:
+        palette = getattr(self._thread_local, "eink_palette", None)
+        if palette is None:
+            palette = self._make_eink_palette()
+            self._thread_local.eink_palette = palette
+        return palette
+
+    def _process_single_page(
+        self,
+        page_idx: int,
+        page: PageAsset,
+        processed_dir: Path,
+        target_size: tuple[int, int],
+        config: ConversionConfig,
+    ) -> list[tuple[Path, int, int, bool, Path]]:
+        if not page.source_path.is_file():
+            raise ImagePreprocessingError(
+                f"Source page does not exist: {page.source_path}"
+            )
+        rendered: list[tuple[Path, int, int, bool, Path]] = []
+        with Image.open(page.source_path) as raw:
+            gray = self._to_grayscale(raw)
+            pre_crop_spread = page.is_spread or (gray.width > gray.height)
+            cropped = self._autocrop_white(gray)
+            variants, keep_spread = self._handle_spread(
+                cropped, pre_crop_spread, config
+            )
+            for var_idx, variant in enumerate(variants):
+                final_img = self._render_eink_page(
+                    variant, target_size, keep_spread=keep_spread
+                )
+                tmp_path = processed_dir / f"__tmp_{page_idx:06d}_{var_idx}.png"
+                final_img.save(tmp_path, format="PNG", optimize=True)
+                width, height = final_img.size
+                final_img.close()
+                rendered.append((tmp_path, width, height, keep_spread, page.source_path))
+        return rendered
 
     def process(
         self,
@@ -306,43 +365,47 @@ class PillowFallbackBackend:
     ) -> list[PageAsset]:
         """Auto-crop, handle spreads, apply gamma 1.6, quantize to 16-level grayscale, and pad."""
         processed_dir = _reset_dir(work_dir / "processed")
+        if not pages:
+            return []
         target_size = (config.profile.width, config.profile.height)
         pad = max(4, len(str(len(pages) * 2)))
+
+        if config.workers > 1 and len(pages) > 1:
+            with ThreadPoolExecutor(max_workers=min(config.workers, len(pages))) as pool:
+                per_page_results = list(
+                    pool.map(
+                        lambda item: self._process_single_page(
+                            item[0], item[1], processed_dir, target_size, config
+                        ),
+                        enumerate(pages),
+                    )
+                )
+        else:
+            per_page_results = [
+                self._process_single_page(
+                    page_idx, page, processed_dir, target_size, config
+                )
+                for page_idx, page in enumerate(pages)
+            ]
+
         output_pages: list[PageAsset] = []
         out_idx = 0
-
-        for page in pages:
-            if not page.source_path.is_file():
-                raise ImagePreprocessingError(
-                    f"Source page does not exist: {page.source_path}"
-                )
-            with Image.open(page.source_path) as raw:
-                gray = self._to_grayscale(raw)
-                pre_crop_spread = page.is_spread or (gray.width > gray.height)
-                cropped = self._autocrop_white(gray)
-                variants, keep_spread = self._handle_spread(
-                    cropped, pre_crop_spread, config
-                )
-                for variant in variants:
-                    final_img = self._render_eink_page(
-                        variant, target_size, keep_spread=keep_spread
+        for page_variants in per_page_results:
+            for tmp_path, width, height, keep_spread, source_path in page_variants:
+                out_path = processed_dir / f"{out_idx:0{pad}d}.png"
+                os.replace(tmp_path, out_path)
+                output_pages.append(
+                    PageAsset(
+                        index=out_idx,
+                        source_path=source_path,
+                        processed_path=out_path,
+                        width=width,
+                        height=height,
+                        is_cover=(out_idx == 0),
+                        is_spread=keep_spread,
                     )
-                    out_path = processed_dir / f"{out_idx:0{pad}d}.png"
-                    final_img.save(out_path, format="PNG", optimize=True)
-                    final_img.close()
-                    width, height = _measure_image(out_path)
-                    output_pages.append(
-                        PageAsset(
-                            index=out_idx,
-                            source_path=page.source_path,
-                            processed_path=out_path,
-                            width=width,
-                            height=height,
-                            is_cover=(out_idx == 0),
-                            is_spread=keep_spread,
-                        )
-                    )
-                    out_idx += 1
+                )
+                out_idx += 1
         return output_pages
 
     @staticmethod
@@ -408,7 +471,7 @@ class PillowFallbackBackend:
 
         gamma_adjusted = canvas.point(self._gamma_lut)
         quantized = gamma_adjusted.convert("RGB").quantize(
-            palette=self._eink_palette,
+            palette=self._get_eink_palette(),
             dither=Image.Dither.NONE,
         )
         # Convert back from palette ("P") to grayscale ("L") so PNG/JPEG saving never fails.

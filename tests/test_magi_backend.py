@@ -700,26 +700,440 @@ class TestMagiModelsHub:
     def test_resolve_magi_batch_size_by_vram_and_override(self) -> None:
         from manga2kindle.cv.backends.magi import resolve_magi_batch_size
 
-        fake_cuda_5070ti = SimpleNamespace(
-            get_device_properties=lambda idx: SimpleNamespace(total_memory=int(15.89 * (1024**3)))
-        )
-        fake_cuda_16g = SimpleNamespace(
-            get_device_properties=lambda idx: SimpleNamespace(total_memory=16 * (1024**3))
-        )
-        fake_cuda_12g = SimpleNamespace(
-            get_device_properties=lambda idx: SimpleNamespace(total_memory=12 * (1024**3))
-        )
-        fake_cuda_8g = SimpleNamespace(
-            get_device_properties=lambda idx: SimpleNamespace(total_memory=8 * (1024**3))
-        )
-        fake_cuda_6g = SimpleNamespace(
-            get_device_properties=lambda idx: SimpleNamespace(total_memory=6 * (1024**3))
-        )
+        def _make_cuda(total_gib: float, free_gib: float | None = None, *, fail_mem_info: bool = False):
+            def _mem_get_info(_idx: int) -> tuple[int, int]:
+                if fail_mem_info:
+                    raise RuntimeError("cuda driver query failed")
+                free = total_gib if free_gib is None else free_gib
+                return int(free * (1024**3)), int(total_gib * (1024**3))
+
+            return SimpleNamespace(
+                get_device_properties=lambda idx: SimpleNamespace(
+                    total_memory=int(total_gib * (1024**3))
+                ),
+                mem_get_info=_mem_get_info,
+            )
+
+        fake_cuda_24g = _make_cuda(24.0, 22.0)
+        fake_cuda_24g_busy = _make_cuda(24.0, 14.0)
+        fake_cuda_5070ti = _make_cuda(15.89, 14.5)
+        fake_cuda_16g = _make_cuda(16.0, 15.0)
+        fake_cuda_16g_busy = _make_cuda(16.0, 7.0)
+        fake_cuda_16g_err = _make_cuda(16.0, fail_mem_info=True)
+        fake_cuda_12g = _make_cuda(12.0, 11.0)
+        fake_cuda_8g = _make_cuda(8.0, 7.0)
+        fake_cuda_6g = _make_cuda(6.0, 5.0)
+
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_24g), None) == 32
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_24g_busy), None) == 16
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_5070ti), None) == 16
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), None) == 16
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g_busy), None) == 4
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g_err), None) == 16
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_12g), None) == 8
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_8g), None) == 4
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_6g), None) == 2
         assert resolve_magi_batch_size("mps", SimpleNamespace(), None) == 2
         assert resolve_magi_batch_size("cpu", SimpleNamespace(), None) == 1
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), 12) == 12
+
+
+class TestFastFlorence2Primitives:
+    def test_magi_backend_falls_back_from_sdpa_to_eager(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        fake_torch, fake_transformers, mock_lm, _, _ = _build_mock_torch_and_transformers(
+            cuda_available=False,
+        )
+        seen_attn_impls: list[object] = []
+        mock_model = mock_lm.from_pretrained.return_value
+
+        def _from_pretrained(*args: object, **kwargs: object) -> object:
+            attn = kwargs.get("attn_implementation")
+            seen_attn_impls.append(attn)
+            if attn == "sdpa":
+                raise ValueError("Custom model does not support sdpa")
+            return mock_model
+
+        mock_lm.from_pretrained.side_effect = _from_pretrained
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                allow_remote_code=True,
+            )
+        )
+        assert seen_attn_impls == ["sdpa", "eager"]
+
+    def test_fast_no_repeat_ngram_matches_naive_reference_and_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch = pytest.importorskip("torch")
+        from manga2kindle.cv.backends._florence2_fast import FastNoRepeatNGramLogitsProcessor
+
+        def _naive_ban(input_ids_list: list[list[int]], scores_t: object, n: int) -> object:
+            out = scores_t.clone()
+            for row_idx, seq in enumerate(input_ids_list):
+                if len(seq) < n:
+                    continue
+                if n == 1:
+                    for tok in seq:
+                        out[row_idx, tok] = float("-inf")
+                else:
+                    prefix = tuple(seq[-(n - 1) :])
+                    for pos in range(len(seq) - n + 1):
+                        if tuple(seq[pos : pos + n - 1]) == prefix:
+                            out[row_idx, seq[pos + n - 1]] = float("-inf")
+            return out
+
+        vocab = 16
+        # Verify cur_len < ngram_size is a no-op
+        short_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+        base_scores = torch.arange(2 * vocab, dtype=torch.float32).view(2, vocab)
+        proc3 = FastNoRepeatNGramLogitsProcessor(3)
+        assert torch.equal(proc3(short_ids, base_scores.clone()), base_scores)
+
+        sequences = [
+            [5, 6, 7, 5, 6, 8, 5, 6],  # bans 7 and 8 for n=3; 6, 7, 8 for n=2
+            [0, 1, 2, 3, 4, 9, 10, 11],  # no repeated (n-1)-grams for n=2, 3
+            [2, 2, 2, 2, 2, 2, 2, 2],  # heavy overlap
+        ]
+        input_ids = torch.tensor(sequences, dtype=torch.long)
+        scores = torch.linspace(-2.0, 2.0, steps=len(sequences) * vocab).view(len(sequences), vocab)
+
+        for n in (1, 2, 3):
+            proc = FastNoRepeatNGramLogitsProcessor(n)
+            expected = _naive_ban(sequences, scores, n)
+            actual = proc(input_ids, scores.clone())
+            assert torch.equal(actual, expected)
+
+        # Verify nonzero fallback branch (MPS / unsupported scatter_reduce_)
+        orig_scatter_reduce = torch.Tensor.scatter_reduce_
+
+        def _raise_not_impl(self, *args: object, **kwargs: object) -> object:
+            raise NotImplementedError("scatter_reduce_ unsupported")
+
+        monkeypatch.setattr(torch.Tensor, "scatter_reduce_", _raise_not_impl)
+        try:
+            for n in (2, 3):
+                proc_fb = FastNoRepeatNGramLogitsProcessor(n)
+                expected = _naive_ban(sequences, scores, n)
+                actual_fb = proc_fb(input_ids, scores.clone())
+                assert torch.equal(actual_fb, expected)
+        finally:
+            monkeypatch.setattr(torch.Tensor, "scatter_reduce_", orig_scatter_reduce)
+
+    @pytest.mark.parametrize("use_past_key_values", [True, False])
+    def test_compact_beam_search_equivalence_and_shrinking_batches(
+        self,
+        use_past_key_values: bool,
+    ) -> None:
+        torch = pytest.importorskip("torch")
+        modeling_outputs = pytest.importorskip("transformers.modeling_outputs")
+        from manga2kindle.cv.backends._florence2_fast import (
+            FastNoRepeatNGramLogitsProcessor,
+            compact_beam_search,
+        )
+
+        vocab = 20
+        eos_id = 3
+        start_id = 2
+        pad_id = 1
+        # Page 0 finishes early ([10, eos]), Page 1 runs longer ([11, 12, 13, 14, eos])
+        page_plans = {
+            0: [10, eos_id, 15, 16, 17, 18],
+            1: [11, 12, 13, 14, eos_id, 15],
+        }
+
+        class _StubLM:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(
+                    decoder_start_token_id=start_id,
+                    pad_token_id=pad_id,
+                    eos_token_id=eos_id,
+                    length_penalty=1.0,
+                    early_stopping=True,
+                )
+                self.observed_batch_sizes: list[int] = []
+
+            def __call__(
+                self,
+                *,
+                input_ids: object = None,
+                encoder_outputs: object,
+                attention_mask: object,
+                decoder_input_ids: object,
+                past_key_values: object = None,
+                use_cache: bool = True,
+                return_dict: bool = True,
+            ) -> object:
+                enc = encoder_outputs.last_hidden_state
+                bs = int(enc.shape[0])
+                self.observed_batch_sizes.append(bs)
+                if past_key_values is not None:
+                    step_idx = int(past_key_values[0][0].shape[2])
+                    seq_len = step_idx + 1
+                else:
+                    seq_len = int(decoder_input_ids.shape[1])
+                    step_idx = seq_len - 1
+
+                logits = torch.full((bs, 1, vocab), -20.0, dtype=torch.float32)
+                for row in range(bs):
+                    page_id = int(round(float(enc[row, 0, 0].item())))
+                    plan = page_plans[page_id]
+                    target_tok = plan[min(step_idx, len(plan) - 1)]
+                    logits[row, 0, target_tok] = 5.0
+                    logits[row, 0, (target_tok + 1) % vocab] = 2.0
+                    # Penalize pad/start to keep beams clean
+                    logits[row, 0, start_id] = -50.0
+                    logits[row, 0, pad_id] = -50.0
+
+                next_kv = None
+                if use_past_key_values:
+                    # 4-tensor per layer matching Florence-2 self/cross KV format
+                    self_kv = torch.zeros((bs, 1, seq_len, 2), dtype=torch.float32)
+                    cross_kv = torch.zeros((bs, 1, 2, 2), dtype=torch.float32)
+                    next_kv = ((self_kv, self_kv.clone(), cross_kv, cross_kv.clone()),)
+
+                return SimpleNamespace(logits=logits, past_key_values=next_kv)
+
+        enc_states = torch.zeros((2, 2, 4), dtype=torch.float32)
+        enc_states[0, :, 0] = 0.0
+        enc_states[1, :, 0] = 1.0
+        enc_out = modeling_outputs.BaseModelOutput(last_hidden_state=enc_states)
+        attn_mask = torch.ones((2, 2), dtype=torch.long)
+
+        lm_compact = _StubLM()
+        lm_uncompact = _StubLM()
+        out_compact = compact_beam_search(
+            lm_compact,
+            enc_out,
+            attn_mask,
+            num_beams=3,
+            max_new_tokens=10,
+            ngram_processor=FastNoRepeatNGramLogitsProcessor(3),
+            enable_compaction=True,
+        )
+        out_uncompact = compact_beam_search(
+            lm_uncompact,
+            enc_out,
+            attn_mask,
+            num_beams=3,
+            max_new_tokens=10,
+            ngram_processor=FastNoRepeatNGramLogitsProcessor(3),
+            enable_compaction=False,
+        )
+
+        assert torch.equal(out_compact, out_uncompact)
+        assert lm_compact.observed_batch_sizes[0] == 6
+        assert 3 in lm_compact.observed_batch_sizes
+        assert all(b == 6 for b in lm_uncompact.observed_batch_sizes)
+
+    def test_detect_batch_fast_runner_preserves_order_progress_workers_and_oom_halving(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch = pytest.importorskip("torch")
+        modeling_outputs = pytest.importorskip("transformers.modeling_outputs")
+
+        model_dir = _make_fake_magi_dir(tmp_path)
+        pages: list[Path] = []
+        for idx in range(5):
+            img = np.zeros((1000, 800, 3), dtype=np.uint8)
+            img[:, :] = (10, 20, idx + 1)  # BGR -> RGB red channel == idx + 1
+            page_path = tmp_path / f"fast_p{idx}.png"
+            ok, buf = cv2.imencode(".png", img)
+            assert ok
+            page_path.write_bytes(buf.tobytes())
+            pages.append(page_path)
+
+        vocab = 32
+        bos_id = 0
+        pad_id = 1
+        start_id = 2
+        eos_id = 3
+        raise_oom_when_gt2 = {"enabled": False}
+        seen_batch_sizes: list[int] = []
+        empty_cache_calls = 0
+
+        class _FastStubLM:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(
+                    decoder_start_token_id=start_id,
+                    pad_token_id=pad_id,
+                    eos_token_id=eos_id,
+                    length_penalty=1.0,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                )
+
+            def get_encoder(self) -> object:
+                def _encode(*, inputs_embeds: object, attention_mask: object, return_dict: bool = True) -> object:
+                    return modeling_outputs.BaseModelOutput(last_hidden_state=inputs_embeds)
+
+                return _encode
+
+            def __call__(
+                self,
+                *,
+                input_ids: object = None,
+                encoder_outputs: object,
+                attention_mask: object,
+                decoder_input_ids: object,
+                past_key_values: object = None,
+                use_cache: bool = True,
+                output_hidden_states: bool = False,
+                return_dict: bool = True,
+            ) -> object:
+                enc = encoder_outputs.last_hidden_state
+                bs = int(enc.shape[0])
+                if not output_hidden_states and past_key_values is None:
+                    if raise_oom_when_gt2["enabled"] and bs > 6:
+                        raise RuntimeError("CUDA out of memory. Tried to allocate ...")
+                    seen_batch_sizes.append(bs // 3)
+                if output_hidden_states:
+                    hidden = torch.zeros((bs, int(decoder_input_ids.shape[1]), 4), dtype=torch.float32)
+                    return SimpleNamespace(decoder_hidden_states=(hidden,))
+
+                step_idx = int(past_key_values[0][0].shape[2]) if past_key_values is not None else 0
+                logits = torch.full((bs, 1, vocab), -20.0, dtype=torch.float32)
+                for row in range(bs):
+                    page_code = int(round(float(enc[row, 0, 0].item())))
+                    tok = (10 + page_code) if step_idx == 0 else eos_id
+                    logits[row, 0, tok] = 5.0
+                seq_len = step_idx + 1
+                self_kv = torch.zeros((bs, 1, seq_len, 2), dtype=torch.float32)
+                cross_kv = torch.zeros((bs, 1, 2, 2), dtype=torch.float32)
+                return SimpleNamespace(
+                    logits=logits,
+                    past_key_values=((self_kv, self_kv.clone(), cross_kv, cross_kv.clone()),),
+                )
+
+        class _FastStubModel:
+            def __init__(self) -> None:
+                self.dtype = torch.float32
+                self.device = torch.device("cpu")
+                self.language_model = _FastStubLM()
+
+            def to(self, _device: object) -> "_FastStubModel":
+                return self
+
+            def eval(self) -> "_FastStubModel":
+                return self
+
+            def get_input_embeddings(self) -> object:
+                return lambda ids: torch.zeros((int(ids.shape[0]), int(ids.shape[1]), 4), dtype=torch.float32)
+
+            def _encode_image(self, pixel_values: object) -> object:
+                return pixel_values.unsqueeze(1).repeat(1, 2, 4)
+
+            def _merge_input_ids_with_image_features(self, img_feat: object, embeds: object) -> tuple[object, object]:
+                return img_feat, torch.ones((int(img_feat.shape[0]), int(img_feat.shape[1])), dtype=torch.long)
+
+            def get_essential_text_logits(
+                self,
+                _hidden: object,
+                cleaned_ids: object,
+                _tokenizer: object,
+                apply_sigmoid: bool = True,
+            ) -> object:
+                return torch.zeros((int(cleaned_ids.shape[0]), 0), dtype=torch.float32)
+
+        class _FastStubProcessor:
+            def __init__(self) -> None:
+                self.tokenizer = SimpleNamespace(bos_token_id=bos_id, pad_token_id=pad_id)
+
+            def __call__(self, *, batch_images: list[np.ndarray], **_kwargs: object) -> dict[str, object]:
+                bs = len(batch_images)
+                input_ids = torch.full((bs, 2), pad_id, dtype=torch.long)
+                pixel_values = torch.tensor(
+                    [float(img[0, 0, 0]) for img in batch_images],
+                    dtype=torch.float32,
+                ).unsqueeze(-1)
+                return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+            def postprocess_output(
+                self,
+                generated_ids: object,
+                rgb_images: list[np.ndarray],
+            ) -> tuple[list[str], list[list[list[list[float]]]], list[list[tuple[int, int]]]]:
+                # Match Magi processor behavior: in-place mutation on Tensor
+                generated_ids.masked_fill_(generated_ids < 0, pad_id)
+                texts: list[str] = []
+                bboxes_batch: list[list[list[list[float]]]] = []
+                indices_batch: list[list[tuple[int, int]]] = []
+                for row in generated_ids:
+                    code = int(row[1].item()) - 10
+                    texts.append("<pa")
+                    bboxes_batch.append([[[20.0, 20.0, 400.0, 200.0 + float(code) * 50.0]]])
+                    indices_batch.append([(0, 0)])
+                return texts, bboxes_batch, indices_batch
+
+        auto_lm = MagicMock()
+        auto_lm.from_pretrained.return_value = _FastStubModel()
+        auto_proc = MagicMock()
+        auto_proc.from_pretrained.return_value = _FastStubProcessor()
+        fake_transformers = SimpleNamespace(
+            AutoModelForCausalLM=auto_lm,
+            AutoModel=auto_lm,
+            AutoProcessor=auto_proc,
+        )
+
+        orig_empty_cache = torch.cuda.empty_cache
+
+        def _counting_empty_cache() -> None:
+            nonlocal empty_cache_calls
+            empty_cache_calls += 1
+
+        monkeypatch.setattr(torch.cuda, "empty_cache", _counting_empty_cache)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+        try:
+            backend = MagiBackend(
+                DetectorConfig(
+                    kind=DetectorKind.MAGI,
+                    model_path=model_dir,
+                    device=DevicePreference.CPU,
+                    padding=0.0,
+                    batch_size=2,
+                    allow_remote_code=True,
+                )
+            )
+            assert backend._fast_runner is not None
+            progress_seen: list[tuple[int, int]] = []
+            ordered = backend.detect_batch(
+                pages,
+                on_progress=lambda done, total: progress_seen.append((done, total)),
+                workers=3,
+            )
+            assert [res.panels[0].h for res in ordered] == [230, 280, 330, 380, 430]
+            assert progress_seen == [(2, 5), (4, 5), (5, 5)]
+            assert seen_batch_sizes == [2, 2, 1]
+
+            # Test OOM chunk halving (4 -> 2 + 2) via slice_prepared + _pad_and_concat_ids
+            raise_oom_when_gt2["enabled"] = True
+            auto_lm.from_pretrained.return_value = _FastStubModel()
+            oom_backend = MagiBackend(
+                DetectorConfig(
+                    kind=DetectorKind.MAGI,
+                    model_path=model_dir,
+                    device=DevicePreference.CPU,
+                    padding=0.0,
+                    batch_size=4,
+                    allow_remote_code=True,
+                )
+            )
+            oom_out = oom_backend.detect_batch(pages[:4], workers=2)
+            assert [res.panels[0].h for res in oom_out] == [230, 280, 330, 380]
+            assert empty_cache_calls == 1
+            assert oom_backend._batch_size == 2
+        finally:
+            monkeypatch.setattr(torch.cuda, "empty_cache", orig_empty_cache)
