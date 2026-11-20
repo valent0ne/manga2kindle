@@ -159,10 +159,10 @@ def test_merge_bridged_panel_clusters_ignores_degenerate_boxes() -> None:
 
 
 def test_merge_bridged_panel_clusters_three_panels_strongest_first_and_area_cap() -> None:
-    # Page 1000x1000 -> max_merged_area_ratio=0.65 -> max 650_000 px
+    # Page 1000x1000 -> max_merged_area_ratio=0.55 -> max 550_000 px
     p0 = (50, 50, 450, 400)    # 180_000
-    p1 = (520, 50, 430, 400)   # 172_000; union(p0, p1) = 900x400 = 360_000 (<= 0.65)
-    p2 = (50, 470, 900, 480)   # union(p0,p1,p2) = 900x900 = 810_000 (> 0.65)
+    p1 = (520, 50, 430, 400)   # 172_000; union(p0, p1) = 900x400 = 360_000 (<= 0.55)
+    p2 = (50, 470, 900, 480)   # union(p0,p1,p2) = 900x900 = 810_000 (> 0.55)
     # Text box bridges p0, p1, p2:
     # x=300..700 (w=400), y=400..520 (h=120) -> area=48_000
     # In p0 (y=400..450, x=300..500): 200x50 = 10_000 (20.8%)

@@ -501,7 +501,7 @@ def merge_bridged_panel_clusters(
             continue
 
         roots_to_merge = {root_a, root_b}
-        union_rect = _union_rect(cluster_rects[root_a], cluster_rects[root_b])
+        merged_rect = _union_rect(cluster_rects[root_a], cluster_rects[root_b])
 
         # Absorb any external cluster engulfed by the merged bounding box so we
         # preserve bridged layouts without creating nested duplicate panels.
@@ -510,15 +510,15 @@ def merge_bridged_panel_clusters(
                 _find(k)
                 for k in valid_indices
                 if _find(k) not in roots_to_merge
-                and compute_containment(union_rect, boxes[k]) >= containment_threshold
+                and compute_containment(merged_rect, boxes[k]) >= containment_threshold
             }
             if not engulfed_roots:
                 break
             roots_to_merge.update(engulfed_roots)
             for eroot in engulfed_roots:
-                union_rect = _union_rect(union_rect, cluster_rects[eroot])
+                merged_rect = _union_rect(merged_rect, cluster_rects[eroot])
 
-        union_area = _box_area(union_rect)
+        union_area = _box_area(merged_rect)
         if (union_area / page_area) > max_merged_area_ratio:
             continue
 
@@ -529,7 +529,7 @@ def merge_bridged_panel_clusters(
         # Reject L-shaped merges that slice partially through unrelated panels.
         if any(
             _find(k) not in roots_to_merge
-            and compute_containment(union_rect, boxes[k]) >= _MAX_EXTERNAL_SLICE_OVERLAP
+            and compute_containment(merged_rect, boxes[k]) >= _MAX_EXTERNAL_SLICE_OVERLAP
             for k in valid_indices
         ):
             continue
@@ -542,7 +542,7 @@ def merge_bridged_panel_clusters(
             cluster_rects.pop(other_root)
             cluster_member_areas.pop(other_root)
 
-        cluster_rects[root_a] = union_rect
+        cluster_rects[root_a] = merged_rect
         cluster_member_areas[root_a] = combined_area
 
     # 3. Expand clusters to enclose attached gutter/margin text boxes that protrude
