@@ -533,6 +533,122 @@ class TestMagiBackendInference:
         assert result.panels[1] == PanelBox(x=520, y=350, w=400, h=450, ordinal=2)
         assert result.panels[2] == PanelBox(x=80, y=350, w=400, h=450, ordinal=3)
 
+    def test_detect_batch_parallel_chunks_preserve_order_and_halve_on_oom(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        pages = [
+            _write_bgr_page(tmp_path / f"p{i}.png", 800, 1000)
+            for i in range(5)
+        ]
+
+        @contextmanager
+        def _inference_mode():
+            yield
+
+        seen_batch_sizes: list[int] = []
+        empty_cache_calls = 0
+
+        def _predict(images: list[np.ndarray], _proc: object = None) -> list[dict[str, object]]:
+            seen_batch_sizes.append(len(images))
+            # Assign distinct panel height per page using first pixel red channel (0..40) or call order
+            return [
+                {
+                    "panels": [[20.0, 20.0, 400.0, 300.0 + float(img[0, 0, 0]) * 5.0]],
+                    "texts": [],
+                }
+                for img in images
+            ]
+
+        for idx, page in enumerate(pages):
+            img = np.zeros((1000, 800, 3), dtype=np.uint8)
+            img[:, :] = (10, 20, idx * 10)  # BGR -> RGB red channel == idx * 10
+            ok, buf = cv2.imencode(".png", img)
+            assert ok
+            page.write_bytes(buf.tobytes())
+
+        fake_model = MagicMock()
+        fake_model.to.return_value = fake_model
+        fake_model.eval.return_value = fake_model
+        fake_model.predict_detections_and_associations.side_effect = _predict
+        auto_lm = MagicMock()
+        auto_lm.from_pretrained.return_value = fake_model
+        auto_proc = MagicMock()
+        auto_proc.from_pretrained.return_value = MagicMock()
+
+        def _empty_cache() -> None:
+            nonlocal empty_cache_calls
+            empty_cache_calls += 1
+
+        fake_torch = SimpleNamespace(
+            float16="float16",
+            float32="float32",
+            cuda=SimpleNamespace(is_available=lambda: False, empty_cache=_empty_cache),
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
+            inference_mode=_inference_mode,
+        )
+        fake_transformers = SimpleNamespace(
+            AutoModelForCausalLM=auto_lm,
+            AutoModel=auto_lm,
+            AutoProcessor=auto_proc,
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                batch_size=2,
+                allow_remote_code=True,
+            )
+        )
+        progress_seen: list[tuple[int, int]] = []
+        ordered = backend.detect_batch(
+            pages, on_progress=lambda done, total: progress_seen.append((done, total))
+        )
+        assert len(ordered) == 5
+        assert [res.panels[0].h for res in ordered] == [280, 330, 380, 430, 480]
+        assert progress_seen == [(2, 5), (4, 5), (5, 5)]
+        assert seen_batch_sizes == [2, 2, 1]
+
+        # Now verify CUDA OOM on 4-page chunk halves to 2-page chunks (not straight to 1)
+        oom_sizes: list[int] = []
+
+        def _oom_predict(images: list[np.ndarray], _proc: object = None) -> list[dict[str, object]]:
+            oom_sizes.append(len(images))
+            if len(images) > 2:
+                raise RuntimeError("CUDA out of memory. Tried to allocate ...")
+            return [
+                {
+                    "panels": [[20.0, 20.0, 400.0, 300.0 + float(img[0, 0, 0]) * 5.0]],
+                    "texts": [],
+                }
+                for img in images
+            ]
+
+        fake_model.predict_detections_and_associations.side_effect = _oom_predict
+        oom_backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                batch_size=4,
+                allow_remote_code=True,
+            )
+        )
+        oom_out = oom_backend.detect_batch(pages[:4])
+        assert len(oom_out) == 4
+        assert [res.panels[0].h for res in oom_out] == [280, 330, 380, 430]
+        assert oom_sizes == [4, 2, 2]
+        assert empty_cache_calls == 1
+        assert oom_backend._batch_size == 2
+
 
 class TestMagiModelsHub:
     def test_registered_magi_models_have_pinned_revisions_and_license(self) -> None:
@@ -584,14 +700,26 @@ class TestMagiModelsHub:
     def test_resolve_magi_batch_size_by_vram_and_override(self) -> None:
         from manga2kindle.cv.backends.magi import resolve_magi_batch_size
 
+        fake_cuda_5070ti = SimpleNamespace(
+            get_device_properties=lambda idx: SimpleNamespace(total_memory=int(15.89 * (1024**3)))
+        )
         fake_cuda_16g = SimpleNamespace(
             get_device_properties=lambda idx: SimpleNamespace(total_memory=16 * (1024**3))
+        )
+        fake_cuda_12g = SimpleNamespace(
+            get_device_properties=lambda idx: SimpleNamespace(total_memory=12 * (1024**3))
         )
         fake_cuda_8g = SimpleNamespace(
             get_device_properties=lambda idx: SimpleNamespace(total_memory=8 * (1024**3))
         )
-        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), None) == 8
+        fake_cuda_6g = SimpleNamespace(
+            get_device_properties=lambda idx: SimpleNamespace(total_memory=6 * (1024**3))
+        )
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_5070ti), None) == 16
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), None) == 16
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_12g), None) == 8
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_8g), None) == 4
+        assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_6g), None) == 2
         assert resolve_magi_batch_size("mps", SimpleNamespace(), None) == 2
         assert resolve_magi_batch_size("cpu", SimpleNamespace(), None) == 1
         assert resolve_magi_batch_size("cuda", SimpleNamespace(cuda=fake_cuda_16g), 12) == 12

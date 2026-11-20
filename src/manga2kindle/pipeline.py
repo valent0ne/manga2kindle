@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 _BATCH_ARCHIVE_EXTENSIONS = frozenset({".cbz", ".cbr"})
 _BatchOutcome = tuple[int, Path, str, Path | None, Exception | None]
+_AUTO_BATCH_WORKERS_HIGH_MEM_GIB: float = 8.0
+_AUTO_BATCH_WORKERS_MID_MEM_GIB: float = 4.0
+_AUTO_BATCH_WORKERS_HIGH_CAP: int = 4
+_AUTO_BATCH_WORKERS_MID_CAP: int = 2
 
 
 class ConversionPipeline:
@@ -206,10 +210,13 @@ class ConversionPipeline:
             return bw, max(1, workers // bw)
         if not no_kcc:
             avail = available_ram_gib if available_ram_gib is not None else cls._available_ram_gib()
-            if workers >= 2 and (avail is None or avail >= 8.0):
-                bw = min(2, item_count)
-                return bw, max(1, workers // bw)
-            return 1, max(1, workers)
+            if avail is None or avail >= _AUTO_BATCH_WORKERS_HIGH_MEM_GIB:
+                bw = min(_AUTO_BATCH_WORKERS_HIGH_CAP, max(1, workers), item_count)
+            elif avail >= _AUTO_BATCH_WORKERS_MID_MEM_GIB:
+                bw = min(_AUTO_BATCH_WORKERS_MID_CAP, max(1, workers), item_count)
+            else:
+                bw = 1
+            return bw, max(1, workers // bw)
         batch_workers = min(max(1, workers), item_count)
         per_book_workers = max(1, workers // batch_workers)
         return batch_workers, per_book_workers
@@ -409,11 +416,7 @@ class ConversionPipeline:
             )
             compiler = KfxCompiler(calibre_path)
             staged_kfx = work_dir / f"{input_name}.kfx"
-            compiled = compiler.compile(kpf_path, staged_kfx)
-            if not compiler.verify_pdoc(compiled):
-                raise KfxCompilationError(
-                    f"Compiled KFX failed PDOC verification: {compiled}"
-                )
+            compiled = compiler.compile_and_verify(kpf_path, staged_kfx)
 
             output_kfx.parent.mkdir(parents=True, exist_ok=True)
             tmp_dest = output_kfx.with_name(f".{output_kfx.stem}.tmp_{os.getpid()}.kfx")

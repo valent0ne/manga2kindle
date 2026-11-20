@@ -133,7 +133,7 @@ class TestRichProgressReporter:
     def test_tty_live_mode_updates_tasks_and_cleans_workers(self, tmp_path: Path) -> None:
         console = Console(force_terminal=True, record=True, width=140)
         with RichProgressReporter(console, is_batch=True, show_live=True) as reporter:
-            reporter.on_batch_start(2, label="Converting")
+            reporter.on_batch_start(3, label="Converting")
             assert reporter._overall_task_id is not None
             assert reporter._overall_progress is not None
             assert reporter._worker_progress is not None
@@ -153,17 +153,20 @@ class TestRichProgressReporter:
             assert "b1" not in reporter._active_tasks
             assert len(reporter._worker_progress.tasks) == 0
 
+            reporter.on_book_skip("b3", "Book 03", tmp_path / "Book 03.kfx")
+
             reporter.on_book_start("b2", "Book 02")
             reporter.on_book_error("b2", "Book 02.cbz", RuntimeError("broken"))
             assert "b2" not in reporter._active_tasks
 
             overall_task = reporter._overall_progress.tasks[0]
-            assert overall_task.completed == 2
-            assert "2/2 books (1 ok, 0 skip, 1 fail)" in overall_task.fields["counts"]
+            assert overall_task.completed == 3
+            assert "3/3 books (1 ok, 1 skip, 1 fail)" in overall_task.fields["counts"]
             reporter.on_batch_finish()
 
         text = console.export_text()
-        assert f"Converted: {tmp_path / 'Book 01.kfx'}" in text
+        assert "Converted:" not in text
+        assert "Skipped (already exists):" not in text
         assert "Failed: Book 02.cbz - broken" in text
 
     def test_tty_live_mode_sets_transient_on_exception(self) -> None:
@@ -213,7 +216,11 @@ class TestRichProgressReporter:
                 reporter.on_batch_finish()
 
             exported = console.export_text()
-            assert str(tricky_out) in exported
+            if show_live:
+                assert "Converted:" not in exported
+                assert "Skipped (already exists):" not in exported
+            else:
+                assert str(tricky_out) in exported
             assert "[scans] Manga [b] [/tag] [/].cbz" in exported
             assert "bad xml [/tag] and [/] [red]" in exported
 
