@@ -1540,3 +1540,43 @@ def test_cli_panel_merge_profile_calibration_and_e2e_post_sort_merge(
         registry=_FakeRegistry(),  # type: ignore[arg-type]
     )
     assert len(rendered_panels_seen[-1]) == 5
+
+
+def test_convert_batch_streams_each_outcome_once_and_escapes_brackets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch_dir = tmp_path / "batch_stream"
+    batch_dir.mkdir()
+    _make_cbz(batch_dir / "[scans] Vol 01 [b].cbz", num_pages=1)
+    _make_cbz(batch_dir / "[scans] Vol 02 [bold].cbz", num_pages=1)
+    (batch_dir / "[scans] Vol 03 [red].cbz").write_bytes(b"corrupt")
+    out_dir = tmp_path / "kfx"
+    out_dir.mkdir()
+    (out_dir / "[scans] Vol 01 [b].kfx").write_bytes(b"EXISTING")
+
+    TestConvertCliMocked._mock_calibre(tmp_path, monkeypatch, pdoc_valid=True)
+
+    result = runner.invoke(
+        app,
+        [
+            "convert",
+            "-i",
+            str(batch_dir),
+            "-o",
+            str(out_dir),
+            "--no-kcc",
+            "--skip-existing",
+            "-w",
+            "2",
+        ],
+        env={"COLUMNS": "240"},
+    )
+
+    assert result.exit_code == 1
+    assert result.output.count("Skipped (already exists):") == 1
+    assert result.output.count("Converted:") == 1
+    assert result.output.count("Failed:") == 1
+    assert "[scans] Vol 01 [b].kfx" in result.output
+    assert "[scans] Vol 02 [bold].kfx" in result.output
+    assert "[scans] Vol 03 [red].cbz" in result.output
+    assert "1/3 succeeded, 1 skipped, 1 failed." in result.output

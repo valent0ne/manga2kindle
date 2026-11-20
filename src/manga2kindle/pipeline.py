@@ -7,7 +7,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from manga2kindle.beautify import beautify_name, beautify_source_file
@@ -38,6 +38,12 @@ from manga2kindle.models import (
 from manga2kindle.packaging.kpf import KpfBuilder
 from manga2kindle.platform import PlatformDiscovery
 from manga2kindle.preprocessor import ImagePreprocessor
+from manga2kindle.progress import (
+    ConversionStage,
+    NullProgressReporter,
+    ProgressEvent,
+    ProgressReporter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +61,7 @@ class ConversionPipeline:
         builder: KpfBuilder | None = None,
         backend_registry: BackendRegistry | None = None,
         on_detector_resolved: Callable[[DetectorKind, list[DetectorKind]], None] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> None:
         self.discovery = discovery or PlatformDiscovery()
         self.extractor = extractor or ArchiveExtractor(discovery=self.discovery)
@@ -62,6 +69,9 @@ class ConversionPipeline:
         self.builder = builder or KpfBuilder()
         self._backend_registry = backend_registry
         self._on_detector_resolved = on_detector_resolved
+        self._progress: ProgressReporter = (
+            progress if progress is not None else NullProgressReporter()
+        )
         self.last_batch_errors: list[tuple[Path, Exception]] = []
         self.last_batch_skipped: list[Path] = []
         self.last_single_skipped: bool = False
@@ -212,10 +222,15 @@ class ConversionPipeline:
         workers: int,
         panel_merge: PanelMergeConfig | None = None,
         padding: float = DEFAULT_PADDING,
+        on_page_progress: Callable[[int, int], None] | None = None,
     ) -> list[PageAsset]:
         sorter = PanelSorter(direction=direction)
+        total_pages = len(pages)
+        if on_page_progress is not None and total_pages > 0:
+            on_page_progress(0, total_pages)
+
         active = registry.active_backend
-        if active is not None and active.kind == DetectorKind.MAGI and len(pages) > 1:
+        if active is not None and active.kind == DetectorKind.MAGI and total_pages > 1:
             paths = [page.processed_path or page.source_path for page in pages]
             widths = [page.width for page in pages]
             spreads = [page.is_spread for page in pages]
@@ -224,6 +239,7 @@ class ConversionPipeline:
                 sorter,
                 page_widths=widths,
                 is_spreads=spreads,
+                on_progress=on_page_progress,
             )
             annotated = [
                 page.model_copy(update={"panels": panels})
@@ -240,11 +256,27 @@ class ConversionPipeline:
                 )
                 return page.model_copy(update={"panels": panels})
 
-            if workers > 1 and len(pages) > 1:
-                with ThreadPoolExecutor(max_workers=min(workers, len(pages))) as executor:
-                    annotated = list(executor.map(_process_page, pages))
+            if workers > 1 and total_pages > 1:
+                annotated_slots: list[PageAsset | None] = [None] * total_pages
+                completed = 0
+                with ThreadPoolExecutor(max_workers=min(workers, total_pages)) as executor:
+                    future_to_idx = {
+                        executor.submit(_process_page, page): idx
+                        for idx, page in enumerate(pages)
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        annotated_slots[idx] = future.result()
+                        completed += 1
+                        if on_page_progress is not None:
+                            on_page_progress(completed, total_pages)
+                annotated = [slot for slot in annotated_slots if slot is not None]
             else:
-                annotated = [_process_page(page) for page in pages]
+                annotated = []
+                for idx, page in enumerate(pages, start=1):
+                    annotated.append(_process_page(page))
+                    if on_page_progress is not None:
+                        on_page_progress(idx, total_pages)
 
         if panel_merge is not None and panel_merge.enabled:
             merger = PanelMerger(panel_merge)
@@ -274,13 +306,28 @@ class ConversionPipeline:
         registry: BackendRegistry,
         title: str | None = None,
         author: str | None = None,
+        progress: ProgressReporter | None = None,
+        book_id: str | None = None,
     ) -> Path:
         """Execute extraction, preprocessing, detection, KPF packaging, and KFX compilation."""
         book_title = (title or "").strip() or input_name
+        reporter = progress or self._progress
+        item_id = book_id or str(config.input_path)
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_"))
 
         try:
+            reporter.on_book_stage(
+                ProgressEvent(item_id, input_name, ConversionStage.EXTRACTING)
+            )
             pages = self.extractor.extract(config.input_path, work_dir)
+            reporter.on_book_stage(
+                ProgressEvent(
+                    item_id,
+                    input_name,
+                    ConversionStage.PREPROCESSING,
+                    total=len(pages),
+                )
+            )
             processed = self.preprocessor.process(pages, work_dir, config)
             annotated = self._detect_and_sort_pages(
                 processed,
@@ -289,8 +336,25 @@ class ConversionPipeline:
                 workers=config.workers,
                 panel_merge=config.panel_merge,
                 padding=config.detector.padding,
+                on_page_progress=lambda done, total: reporter.on_book_stage(
+                    ProgressEvent(
+                        item_id,
+                        input_name,
+                        ConversionStage.DETECTING,
+                        completed=done,
+                        total=total,
+                    )
+                ),
             )
 
+            reporter.on_book_stage(
+                ProgressEvent(
+                    item_id,
+                    input_name,
+                    ConversionStage.PACKAGING,
+                    total=len(annotated),
+                )
+            )
             kpf_path = work_dir / f"{input_name}.kpf"
             self.builder.build(
                 pages=annotated,
@@ -300,6 +364,9 @@ class ConversionPipeline:
                 author=author,
             )
 
+            reporter.on_book_stage(
+                ProgressEvent(item_id, input_name, ConversionStage.COMPILING)
+            )
             compiler = KfxCompiler(calibre_path)
             staged_kfx = work_dir / f"{input_name}.kfx"
             compiled = compiler.compile(kpf_path, staged_kfx)
@@ -327,6 +394,7 @@ class ConversionPipeline:
         title: str | None = None,
         author: str | None = None,
         registry: BackendRegistry | None = None,
+        progress: ProgressReporter | None = None,
     ) -> Path:
         """Convert a single CBZ/CBR archive or image folder into a verified PDOC KFX."""
         self.last_single_skipped = False
@@ -340,6 +408,8 @@ class ConversionPipeline:
                 f"Unsupported input format '{config.input_path.suffix}' for {config.input_path}"
             )
 
+        reporter = progress or self._progress
+        book_id = str(config.input_path)
         effective_beautify = config.effective_beautify
         input_name = self.resolve_input_name(config.input_path, beautify=effective_beautify)
         output_kfx = self.resolve_single_output(
@@ -350,6 +420,7 @@ class ConversionPipeline:
         if config.skip_existing and output_kfx.is_file():
             logger.info("Skipping existing output: %s", output_kfx)
             self.last_single_skipped = True
+            reporter.on_book_skip(book_id, input_name, output_kfx)
             return output_kfx
 
         calibre_path = self.discovery.find_calibre(override=config.calibre_path)
@@ -364,15 +435,24 @@ class ConversionPipeline:
             renamed_input = beautify_source_file(config.input_path)
             config = config.model_copy(update={"input_path": renamed_input})
 
-        return self._convert_single(
-            config,
-            input_name=input_name,
-            output_kfx=output_kfx,
-            calibre_path=calibre_path,
-            registry=active_registry,
-            title=title,
-            author=author,
-        )
+        reporter.on_book_start(book_id, input_name)
+        try:
+            out_path = self._convert_single(
+                config,
+                input_name=input_name,
+                output_kfx=output_kfx,
+                calibre_path=calibre_path,
+                registry=active_registry,
+                title=title,
+                author=author,
+                progress=reporter,
+                book_id=book_id,
+            )
+        except Exception as exc:
+            reporter.on_book_error(book_id, config.input_path.name, exc)
+            raise
+        reporter.on_book_complete(book_id, input_name, out_path)
+        return out_path
 
     def run_batch(
         self,
@@ -382,6 +462,7 @@ class ConversionPipeline:
         on_success: Callable[[Path, Path], None] | None = None,
         on_error: Callable[[Path, Exception], None] | None = None,
         on_skip: Callable[[Path, Path], None] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> list[Path]:
         """Convert all CBZ/CBR archives in config.input_path concurrently."""
         archives = self._find_archives(config.input_path)
@@ -414,104 +495,127 @@ class ConversionPipeline:
                 seen_source_names[src_key] = archive_path
             planned.append((archive_path, target_stem, out_kfx))
 
+        reporter = progress or self._progress
         self.last_batch_errors = []
         self.last_batch_skipped = []
-        pending_planned: list[tuple[Path, str, Path]] = []
-        for archive_path, target_stem, out_kfx in planned:
-            if config.skip_existing and out_kfx.is_file():
-                logger.info("Skipping existing output: %s", out_kfx)
-                self.last_batch_skipped.append(out_kfx)
-                if on_skip is not None:
-                    on_skip(archive_path, out_kfx)
+        reporter.on_batch_start(len(planned), label="Converting")
+        try:
+            pending_planned: list[tuple[Path, str, Path]] = []
+            for archive_path, target_stem, out_kfx in planned:
+                if config.skip_existing and out_kfx.is_file():
+                    logger.info("Skipping existing output: %s", out_kfx)
+                    self.last_batch_skipped.append(out_kfx)
+                    reporter.on_book_skip(str(archive_path), target_stem, out_kfx)
+                    if on_skip is not None:
+                        on_skip(archive_path, out_kfx)
+                else:
+                    pending_planned.append((archive_path, target_stem, out_kfx))
+
+            if not pending_planned:
+                return []
+
+            calibre_path = self.discovery.find_calibre(override=config.calibre_path)
+            if calibre_path is None:
+                raise KfxCompilationError(
+                    "calibre-debug not found. Install Calibre with the KFX Output plugin "
+                    "or pass --calibre-path."
+                )
+
+            batch_registry = self._resolve_registry(config.detector)
+
+            if config.beautify_source:
+                for archive_path, target_stem, _ in pending_planned:
+                    if target_stem != archive_path.stem:
+                        target_src = archive_path.with_name(f"{target_stem}{archive_path.suffix}")
+                        if target_src.exists() and target_src.resolve() != archive_path.resolve():
+                            raise FileExistsError(
+                                f"Cannot beautify '{archive_path.name}': target '{target_src.name}' already exists."
+                            )
+                pending_targets = [
+                    (beautify_source_file(archive_path), target_stem, out_kfx)
+                    for archive_path, target_stem, out_kfx in pending_planned
+                ]
             else:
-                pending_planned.append((archive_path, target_stem, out_kfx))
+                pending_targets = pending_planned
 
-        if not pending_planned:
-            return []
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        calibre_path = self.discovery.find_calibre(override=config.calibre_path)
-        if calibre_path is None:
-            raise KfxCompilationError(
-                "calibre-debug not found. Install Calibre with the KFX Output plugin "
-                "or pass --calibre-path."
+            batch_workers, per_book_workers = self._resolve_batch_workers(
+                config.workers,
+                len(pending_targets),
+                no_kcc=config.no_kcc,
+                detector_kind=config.detector.kind,
+                batch_workers_override=config.batch_workers,
             )
 
-        batch_registry = self._resolve_registry(config.detector)
-
-        if config.beautify_source:
-            for archive_path, target_stem, _ in pending_planned:
-                if target_stem != archive_path.stem:
-                    target_src = archive_path.with_name(f"{target_stem}{archive_path.suffix}")
-                    if target_src.exists() and target_src.resolve() != archive_path.resolve():
-                        raise FileExistsError(
-                            f"Cannot beautify '{archive_path.name}': target '{target_src.name}' already exists."
-                        )
-            pending_targets = [
-                (beautify_source_file(archive_path), target_stem, out_kfx)
-                for archive_path, target_stem, out_kfx in pending_planned
-            ]
-        else:
-            pending_targets = pending_planned
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        batch_workers, per_book_workers = self._resolve_batch_workers(
-            config.workers,
-            len(pending_targets),
-            no_kcc=config.no_kcc,
-            detector_kind=config.detector.kind,
-            batch_workers_override=config.batch_workers,
-        )
-
-        def _convert_one(
-            archive_path: Path, target_stem: str, target_kfx: Path
-        ) -> tuple[Path, Path | None, Exception | None]:
-            book_config = config.model_copy(
-                update={
-                    "input_path": archive_path,
-                    "output_path": target_kfx,
-                    "calibre_path": calibre_path,
-                    "workers": per_book_workers,
-                }
-            )
-            try:
-                out_kfx = self._convert_single(
-                    book_config,
-                    input_name=target_stem,
-                    output_kfx=target_kfx,
-                    calibre_path=calibre_path,
-                    registry=batch_registry,
-                    title=target_stem,
-                    author=author,
+            def _convert_one(
+                idx: int, archive_path: Path, target_stem: str, target_kfx: Path
+            ) -> tuple[int, Path, str, Path | None, Exception | None]:
+                book_id = str(archive_path)
+                reporter.on_book_start(book_id, target_stem)
+                book_config = config.model_copy(
+                    update={
+                        "input_path": archive_path,
+                        "output_path": target_kfx,
+                        "calibre_path": calibre_path,
+                        "workers": per_book_workers,
+                    }
                 )
-                return archive_path, out_kfx, None
-            except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
-                logger.error("Failed to convert %s: %s", archive_path, exc)
-                return archive_path, None, exc
+                try:
+                    out_kfx = self._convert_single(
+                        book_config,
+                        input_name=target_stem,
+                        output_kfx=target_kfx,
+                        calibre_path=calibre_path,
+                        registry=batch_registry,
+                        title=target_stem,
+                        author=author,
+                        progress=reporter,
+                        book_id=book_id,
+                    )
+                    return idx, archive_path, target_stem, out_kfx, None
+                except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
+                    logger.error("Failed to convert %s: %s", archive_path, exc)
+                    return idx, archive_path, target_stem, None, exc
 
-        if batch_workers > 1:
-            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                outcomes = list(
-                    executor.map(lambda item: _convert_one(item[0], item[1], item[2]), pending_targets)
-                )
-        else:
-            outcomes = [_convert_one(arch, stem, tgt) for arch, stem, tgt in pending_targets]
+            indexed_succeeded: list[tuple[int, Path]] = []
+            indexed_errors: list[tuple[int, Path, Exception]] = []
 
-        succeeded: list[Path] = []
-        errors: list[tuple[Path, Exception]] = []
-        for archive_path, out_kfx, exc in outcomes:
-            if exc is not None or out_kfx is None:
-                err = exc if exc is not None else RuntimeError("Unknown conversion failure")
-                errors.append((archive_path, err))
-                if on_error is not None:
-                    on_error(archive_path, err)
+            def _handle_outcome(
+                outcome: tuple[int, Path, str, Path | None, Exception | None],
+            ) -> None:
+                idx, archive_path, target_stem, out_kfx, exc = outcome
+                book_id = str(archive_path)
+                if exc is not None or out_kfx is None:
+                    err = exc if exc is not None else RuntimeError("Unknown conversion failure")
+                    indexed_errors.append((idx, archive_path, err))
+                    reporter.on_book_error(book_id, archive_path.name, err)
+                    if on_error is not None:
+                        on_error(archive_path, err)
+                else:
+                    indexed_succeeded.append((idx, out_kfx))
+                    reporter.on_book_complete(book_id, target_stem, out_kfx)
+                    if on_success is not None:
+                        on_success(archive_path, out_kfx)
+
+            if batch_workers > 1:
+                with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                    futures = [
+                        executor.submit(_convert_one, idx, arch, stem, tgt)
+                        for idx, (arch, stem, tgt) in enumerate(pending_targets)
+                    ]
+                    for future in as_completed(futures):
+                        _handle_outcome(future.result())
             else:
-                succeeded.append(out_kfx)
-                if on_success is not None:
-                    on_success(archive_path, out_kfx)
+                for idx, (arch, stem, tgt) in enumerate(pending_targets):
+                    _handle_outcome(_convert_one(idx, arch, stem, tgt))
 
-        self.last_batch_errors = errors
-        return succeeded
+            indexed_succeeded.sort(key=lambda item: item[0])
+            indexed_errors.sort(key=lambda item: item[0])
+            self.last_batch_errors = [(arch, err) for _, arch, err in indexed_errors]
+            return [out_kfx for _, out_kfx in indexed_succeeded]
+        finally:
+            reporter.on_batch_finish()
 
     def run(
         self,
@@ -522,6 +626,7 @@ class ConversionPipeline:
         on_success: Callable[[Path, Path], None] | None = None,
         on_error: Callable[[Path, Exception], None] | None = None,
         on_skip: Callable[[Path, Path], None] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> list[Path]:
         """Auto-disambiguate single vs batch input and execute conversion."""
         if self.is_batch_input(config.input_path):
@@ -531,8 +636,9 @@ class ConversionPipeline:
                 on_success=on_success,
                 on_error=on_error,
                 on_skip=on_skip,
+                progress=progress,
             )
-        out_kfx = self.run_single(config, title=title, author=author)
+        out_kfx = self.run_single(config, title=title, author=author, progress=progress)
         if self.last_single_skipped:
             if on_skip is not None:
                 on_skip(config.input_path, out_kfx)
@@ -564,6 +670,63 @@ class ConversionPipeline:
             )
         return unique_kinds
 
+    @staticmethod
+    def _render_preview_pages(
+        total_pages: int,
+        render_fn: Callable[[int], Path],
+        *,
+        workers: int,
+        reporter: ProgressReporter,
+        book_id: str,
+        book_name: str,
+    ) -> list[Path]:
+        if total_pages > 0:
+            reporter.on_book_stage(
+                ProgressEvent(
+                    book_id,
+                    book_name,
+                    ConversionStage.RENDERING,
+                    completed=0,
+                    total=total_pages,
+                )
+            )
+        if workers > 1 and total_pages > 1:
+            slots: list[Path | None] = [None] * total_pages
+            completed = 0
+            with ThreadPoolExecutor(max_workers=min(workers, total_pages)) as executor:
+                future_to_idx = {
+                    executor.submit(render_fn, idx): idx
+                    for idx in range(total_pages)
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    slots[idx] = future.result()
+                    completed += 1
+                    reporter.on_book_stage(
+                        ProgressEvent(
+                            book_id,
+                            book_name,
+                            ConversionStage.RENDERING,
+                            completed=completed,
+                            total=total_pages,
+                        )
+                    )
+            return [path for path in slots if path is not None]
+
+        rendered: list[Path] = []
+        for idx in range(total_pages):
+            rendered.append(render_fn(idx))
+            reporter.on_book_stage(
+                ProgressEvent(
+                    book_id,
+                    book_name,
+                    ConversionStage.RENDERING,
+                    completed=idx + 1,
+                    total=total_pages,
+                )
+            )
+        return rendered
+
     def preview_panels(
         self,
         input_path: Path,
@@ -584,6 +747,10 @@ class ConversionPipeline:
         kcc_path: Path | None = None,
         cover_size: tuple[int, int] = DEFAULT_COVER_SIZE,
         registry: BackendRegistry | None = None,
+        progress: ProgressReporter | None = None,
+        book_id: str | None = None,
+        book_name: str | None = None,
+        _managed_lifecycle: bool = False,
     ) -> list[Path]:
         """Extract, preprocess, detect/sort panels, and render numbered PNG debug overlays."""
         resolved_profile = profile or DeviceProfile.from_name(DEFAULT_PROFILE_NAME)
@@ -641,25 +808,52 @@ class ConversionPipeline:
         else:
             active_registry = self._resolve_registry(config.detector, registry)
 
+        reporter = progress or self._progress
+        item_id = book_id or str(input_path)
+        display_name = book_name or self.resolve_input_name(input_path)
+        if not _managed_lifecycle:
+            reporter.on_book_start(item_id, display_name)
+
         work_dir = Path(tempfile.mkdtemp(prefix="manga2kindle_preview_"))
         try:
+            reporter.on_book_stage(
+                ProgressEvent(item_id, display_name, ConversionStage.EXTRACTING)
+            )
             pages = self.extractor.extract(input_path, work_dir)
+            reporter.on_book_stage(
+                ProgressEvent(
+                    item_id,
+                    display_name,
+                    ConversionStage.PREPROCESSING,
+                    total=len(pages),
+                )
+            )
             processed = self.preprocessor.process(pages, work_dir, config)
             renderer = PanelPreviewRenderer()
             pad = max(4, len(str(len(processed))))
 
             if compare_registries is not None and compare_kinds is not None:
-                annotated_by_kind: dict[DetectorKind, list[PageAsset]] = {
-                    kind: self._detect_and_sort_pages(
+                total_compare_pages = len(compare_kinds) * len(processed)
+                annotated_by_kind: dict[DetectorKind, list[PageAsset]] = {}
+                for kind_idx, (kind, reg) in enumerate(compare_registries.items()):
+                    offset = kind_idx * len(processed)
+                    annotated_by_kind[kind] = self._detect_and_sort_pages(
                         processed,
                         registry=reg,
                         direction=direction,
                         workers=workers,
                         panel_merge=config.panel_merge,
                         padding=config.detector.padding,
+                        on_page_progress=lambda done, _t, base=offset: reporter.on_book_stage(
+                            ProgressEvent(
+                                item_id,
+                                display_name,
+                                ConversionStage.DETECTING,
+                                completed=base + done,
+                                total=total_compare_pages,
+                            )
+                        ),
                     )
-                    for kind, reg in compare_registries.items()
-                }
 
                 def _render_compare_page(page_idx: int) -> Path:
                     base_page = processed[page_idx]
@@ -671,34 +865,59 @@ class ConversionPipeline:
                     }
                     return renderer.render_comparison(img_path, results, out_file)
 
-                indices = list(range(len(processed)))
-                if workers > 1 and len(indices) > 1:
-                    with ThreadPoolExecutor(max_workers=min(workers, len(indices))) as executor:
-                        return list(executor.map(_render_compare_page, indices))
-                return [_render_compare_page(idx) for idx in indices]
+                rendered = self._render_preview_pages(
+                    len(processed),
+                    _render_compare_page,
+                    workers=workers,
+                    reporter=reporter,
+                    book_id=item_id,
+                    book_name=display_name,
+                )
+            else:
+                assert active_registry is not None
+                annotated = self._detect_and_sort_pages(
+                    processed,
+                    registry=active_registry,
+                    direction=direction,
+                    workers=workers,
+                    panel_merge=config.panel_merge,
+                    padding=config.detector.padding,
+                    on_page_progress=lambda done, total: reporter.on_book_stage(
+                        ProgressEvent(
+                            item_id,
+                            display_name,
+                            ConversionStage.DETECTING,
+                            completed=done,
+                            total=total,
+                        )
+                    ),
+                )
 
-            assert active_registry is not None
-            annotated = self._detect_and_sort_pages(
-                processed,
-                registry=active_registry,
-                direction=direction,
-                workers=workers,
-                panel_merge=config.panel_merge,
-                padding=config.detector.padding,
-            )
+                def _render_page(page_idx: int) -> Path:
+                    page = annotated[page_idx]
+                    img_path = page.processed_path or page.source_path
+                    out_file = output_dir / f"page_{page.index + 1:0{pad}d}.png"
+                    return renderer.render(img_path, page.panels, out_file)
 
-            def _render_page(page: PageAsset) -> Path:
-                img_path = page.processed_path or page.source_path
-                out_file = output_dir / f"page_{page.index + 1:0{pad}d}.png"
-                return renderer.render(img_path, page.panels, out_file)
-
-            if workers > 1 and len(annotated) > 1:
-                with ThreadPoolExecutor(max_workers=min(workers, len(annotated))) as executor:
-                    return list(executor.map(_render_page, annotated))
-            return [_render_page(page) for page in annotated]
+                rendered = self._render_preview_pages(
+                    len(annotated),
+                    _render_page,
+                    workers=workers,
+                    reporter=reporter,
+                    book_id=item_id,
+                    book_name=display_name,
+                )
+        except Exception as exc:
+            if not _managed_lifecycle:
+                reporter.on_book_error(item_id, input_path.name, exc)
+            raise
         finally:
             if not keep_temp:
                 shutil.rmtree(work_dir, ignore_errors=True)
+
+        if not _managed_lifecycle:
+            reporter.on_book_complete(item_id, display_name, output_dir)
+        return rendered
 
     def preview_batch(
         self,
@@ -706,6 +925,7 @@ class ConversionPipeline:
         *,
         on_success: Callable[[Path, Path], None] | None = None,
         on_error: Callable[[Path, Exception], None] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> list[Path]:
         """Render panel preview overlays for all CBZ/CBR archives in config.input_path."""
         archives = self._find_archives(config.input_path)
@@ -714,7 +934,7 @@ class ConversionPipeline:
 
         out_dir = self.resolve_batch_output_dir(config.input_path, config.output_path)
         seen_preview_dirs: dict[str, Path] = {}
-        preview_targets: list[tuple[Path, Path]] = []
+        preview_targets: list[tuple[Path, str, Path]] = []
         for archive_path in archives:
             stem = beautify_name(archive_path.stem) if config.effective_beautify else archive_path.stem
             preview_dir = out_dir / f"{stem}_preview"
@@ -725,64 +945,90 @@ class ConversionPipeline:
                     f"'{seen_preview_dirs[key].name}' and '{archive_path.name}'"
                 )
             seen_preview_dirs[key] = archive_path
-            preview_targets.append((archive_path, preview_dir))
+            preview_targets.append((archive_path, stem, preview_dir))
 
-        batch_registry = self._resolve_registry(config.detector)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        reporter = progress or self._progress
         self.last_batch_errors = []
+        reporter.on_batch_start(len(preview_targets), label="Rendering previews")
+        try:
+            batch_registry = self._resolve_registry(config.detector)
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        batch_workers, per_book_workers = self._resolve_batch_workers(
-            config.workers,
-            len(preview_targets),
-            no_kcc=config.no_kcc,
-            detector_kind=config.detector.kind,
-            batch_workers_override=config.batch_workers,
-        )
+            batch_workers, per_book_workers = self._resolve_batch_workers(
+                config.workers,
+                len(preview_targets),
+                no_kcc=config.no_kcc,
+                detector_kind=config.detector.kind,
+                batch_workers_override=config.batch_workers,
+            )
 
-        def _preview_one(archive_path: Path, preview_dir: Path) -> tuple[Path, Path | None, Exception | None]:
-            try:
-                self.preview_panels(
-                    input_path=archive_path,
-                    output_dir=preview_dir,
-                    profile=config.profile,
-                    direction=config.direction,
-                    spread_mode=config.spread_mode,
-                    padding=config.padding,
-                    min_panel_area=config.min_panel_area,
-                    detector_config=config.detector,
-                    panel_merge=config.panel_merge,
-                    no_kcc=config.no_kcc,
-                    keep_temp=config.keep_temp,
-                    workers=per_book_workers,
-                    kcc_path=config.kcc_path,
-                    cover_size=config.cover_size,
-                    registry=batch_registry,
-                )
-                return archive_path, preview_dir, None
-            except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
-                logger.error("Failed to preview %s: %s", archive_path, exc)
-                return archive_path, None, exc
+            def _preview_one(
+                idx: int, archive_path: Path, stem: str, preview_dir: Path
+            ) -> tuple[int, Path, str, Path | None, Exception | None]:
+                book_id = str(archive_path)
+                reporter.on_book_start(book_id, stem)
+                try:
+                    self.preview_panels(
+                        input_path=archive_path,
+                        output_dir=preview_dir,
+                        profile=config.profile,
+                        direction=config.direction,
+                        spread_mode=config.spread_mode,
+                        padding=config.padding,
+                        min_panel_area=config.min_panel_area,
+                        detector_config=config.detector,
+                        panel_merge=config.panel_merge,
+                        no_kcc=config.no_kcc,
+                        keep_temp=config.keep_temp,
+                        workers=per_book_workers,
+                        kcc_path=config.kcc_path,
+                        cover_size=config.cover_size,
+                        registry=batch_registry,
+                        progress=reporter,
+                        book_id=book_id,
+                        book_name=stem,
+                        _managed_lifecycle=True,
+                    )
+                    return idx, archive_path, stem, preview_dir, None
+                except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
+                    logger.error("Failed to preview %s: %s", archive_path, exc)
+                    return idx, archive_path, stem, None, exc
 
-        if batch_workers > 1:
-            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                outcomes = list(
-                    executor.map(lambda item: _preview_one(item[0], item[1]), preview_targets)
-                )
-        else:
-            outcomes = [_preview_one(arch, pdir) for arch, pdir in preview_targets]
+            indexed_succeeded: list[tuple[int, Path]] = []
+            indexed_errors: list[tuple[int, Path, Exception]] = []
 
-        succeeded_dirs: list[Path] = []
-        errors: list[tuple[Path, Exception]] = []
-        for archive_path, preview_dir, exc in outcomes:
-            if exc is not None or preview_dir is None:
-                err = exc if exc is not None else RuntimeError("Unknown preview failure")
-                errors.append((archive_path, err))
-                if on_error is not None:
-                    on_error(archive_path, err)
+            def _handle_outcome(
+                outcome: tuple[int, Path, str, Path | None, Exception | None],
+            ) -> None:
+                idx, archive_path, stem, preview_dir, exc = outcome
+                book_id = str(archive_path)
+                if exc is not None or preview_dir is None:
+                    err = exc if exc is not None else RuntimeError("Unknown preview failure")
+                    indexed_errors.append((idx, archive_path, err))
+                    reporter.on_book_error(book_id, archive_path.name, err)
+                    if on_error is not None:
+                        on_error(archive_path, err)
+                else:
+                    indexed_succeeded.append((idx, preview_dir))
+                    reporter.on_book_complete(book_id, stem, preview_dir)
+                    if on_success is not None:
+                        on_success(archive_path, preview_dir)
+
+            if batch_workers > 1:
+                with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                    futures = [
+                        executor.submit(_preview_one, idx, arch, stem, pdir)
+                        for idx, (arch, stem, pdir) in enumerate(preview_targets)
+                    ]
+                    for future in as_completed(futures):
+                        _handle_outcome(future.result())
             else:
-                succeeded_dirs.append(preview_dir)
-                if on_success is not None:
-                    on_success(archive_path, preview_dir)
+                for idx, (arch, stem, pdir) in enumerate(preview_targets):
+                    _handle_outcome(_preview_one(idx, arch, stem, pdir))
 
-        self.last_batch_errors = errors
-        return succeeded_dirs
+            indexed_succeeded.sort(key=lambda item: item[0])
+            indexed_errors.sort(key=lambda item: item[0])
+            self.last_batch_errors = [(arch, err) for _, arch, err in indexed_errors]
+            return [preview_dir for _, preview_dir in indexed_succeeded]
+        finally:
+            reporter.on_batch_finish()
