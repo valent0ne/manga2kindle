@@ -189,7 +189,6 @@ uv run manga2kindle convert \
   --merge-panels \
   --skip-existing \
   -w "$CORES" \
-  --batch-workers "$CORES" \
   --gpu-batch-size 8
 ```
 
@@ -208,12 +207,11 @@ uv run manga2kindle convert `
   --merge-panels `
   --skip-existing `
   -w $cores `
-  --batch-workers $cores `
   --gpu-batch-size 8
 ```
 
 - `--beautify-source` automatically beautifies both the source `.cbz`/`.cbr` files (in place) and the output `.kfx` filenames + embedded KFX titles.
-- Lower `--batch-workers` (e.g., `4`–`6`) if RAM-constrained since each concurrent `kcc-c2e` process uses memory, and omit `--gpu-batch-size` for automatic VRAM/MPS tuning.
+- Omit `--batch-workers` for automatic memory-safe concurrency (or tune to e.g. `2`–`4` to overlap KCC preprocessing, GPU Magi detection, and Calibre KFX compilation); `kcc-c2e` already parallelizes internally across all CPU cores and is concurrency-capped automatically to prevent OOM. Omit `--gpu-batch-size` for automatic VRAM/MPS tuning.
 - Live progress bars and per-worker stage updates render automatically in interactive terminals and stream per-file completion lines when piped.
 
 ### 5. Benchmark Panel Detectors (`benchmark`)

@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -17,7 +18,7 @@ from manga2kindle.models import (
     ReadingDirection,
     SpreadMode,
 )
-from manga2kindle.platform import PlatformDiscovery, ToolStatus
+from manga2kindle.platform import PlatformDiscovery, ToolStatus, available_memory_gib
 
 
 def test_device_profile_presets():
@@ -295,4 +296,32 @@ def test_device_profile_size_tier_and_panel_merge_calibration(tmp_path: Path) ->
         detector=DetectorConfig(max_merged_area_ratio=0.62),
     )
     assert cfg_bridged_explicit.detector.max_merged_area_ratio == 0.62
+
+
+def test_available_memory_gib_uses_min_of_ram_and_windows_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import manga2kindle.platform as platform_mod
+
+    live = available_memory_gib()
+    assert live is not None and live > 0.0
+
+    monkeypatch.setattr(platform_mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        "psutil.virtual_memory",
+        lambda: SimpleNamespace(available=int(20.0 * (1024.0**3))),
+    )
+    monkeypatch.setattr(platform_mod, "_windows_avail_commit_gib", lambda: 6.5)
+    assert available_memory_gib() == pytest.approx(6.5)
+
+    monkeypatch.setattr(
+        "psutil.virtual_memory",
+        lambda: SimpleNamespace(available=int(4.0 * (1024.0**3))),
+    )
+    monkeypatch.setattr(platform_mod, "_windows_avail_commit_gib", lambda: 12.0)
+    assert available_memory_gib() == pytest.approx(4.0)
+
+    monkeypatch.setattr(platform_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(platform_mod, "_windows_avail_commit_gib", lambda: 1.0)
+    assert available_memory_gib() == pytest.approx(4.0)
 

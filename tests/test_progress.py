@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import sys
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -211,7 +213,7 @@ class TestRichProgressReporter:
                 reporter.on_batch_finish()
 
             exported = console.export_text()
-            assert "[scans] Manga [b] [/tag] [/].kfx" in exported
+            assert str(tricky_out) in exported
             assert "[scans] Manga [b] [/tag] [/].cbz" in exported
             assert "bad xml [/tag] and [/] [red]" in exported
 
@@ -591,3 +593,83 @@ class TestPipelineProgressAndStreaming:
         assert batch_reporter.events[0] == ("batch_start", (2, "Rendering previews"))
         assert batch_reporter.events[-1] == ("batch_finish", None)
         assert len([1 for kind, _ in batch_reporter.events if kind == "book_complete"]) == 2
+
+    def test_run_batch_avoids_duplicate_error_logging_when_ui_reporter_active(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _mock_kfx_compiler(tmp_path, monkeypatch)
+        batch_dir = tmp_path / "batch_log_dedup"
+        batch_dir.mkdir()
+        (batch_dir / "bad.cbz").write_bytes(b"corrupt")
+        out_dir = tmp_path / "out_log_dedup"
+
+        cfg = ConversionConfig(
+            input_path=batch_dir,
+            output_path=out_dir,
+            profile=DeviceProfile.from_name("KPW5"),
+            no_kcc=True,
+            workers=1,
+            batch_workers=1,
+        )
+
+        console = Console(force_terminal=False, record=True, width=160)
+        with caplog.at_level(logging.ERROR, logger="manga2kindle.pipeline"):
+            with RichProgressReporter(console, is_batch=True, show_live=False) as reporter:
+                ConversionPipeline(progress=reporter).run_batch(cfg)
+
+        rich_errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert rich_errors == []
+        assert "Failed: bad.cbz" in console.export_text()
+
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="manga2kindle.pipeline"):
+            ConversionPipeline(progress=NullProgressReporter()).run_batch(cfg)
+
+        null_errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(null_errors) == 1
+        assert "Failed to convert" in null_errors[0].getMessage()
+
+    def test_execute_batch_workers_cancels_queued_tasks_on_interrupt(
+        self, tmp_path: Path
+    ) -> None:
+        targets = [
+            (tmp_path / f"b{i}.cbz", f"b{i}", tmp_path / f"b{i}.kfx")
+            for i in range(6)
+        ]
+        lock = threading.Lock()
+        started: list[int] = []
+        captured_events: list[threading.Event] = []
+        gate = threading.Event()
+        blocked_done = threading.Event()
+
+        def _worker(
+            idx: int,
+            arch: Path,
+            stem: str,
+            tgt: Path,
+            cancel_event: threading.Event,
+        ):
+            with lock:
+                started.append(idx)
+                captured_events.append(cancel_event)
+            if idx >= 1:
+                gate.wait(timeout=2.0)
+                blocked_done.set()
+            return idx, arch, stem, tgt, None
+
+        def _handle(_outcome) -> None:
+            raise KeyboardInterrupt
+
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                ConversionPipeline._execute_batch_workers(2, targets, _worker, _handle)
+        finally:
+            gate.set()
+
+        if any(idx >= 1 for idx in started):
+            blocked_done.wait(timeout=1.0)
+        assert captured_events and captured_events[0].is_set()
+        assert len(started) < len(targets)
