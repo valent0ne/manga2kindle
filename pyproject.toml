@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manga2kindle"
-version = "0.9.1"
+version = "0.10.0"
 description = "Cross-platform headless CLI to convert CBZ/CBR manga into PDOC-tagged KFX with Guided View panels"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
