@@ -29,7 +29,7 @@ from manga2kindle.cv.models_hub import (
     list_registered_magi_models,
     resolve_magi_model_spec,
 )
-from manga2kindle.models import DetectorConfig, DetectorKind, DevicePreference
+from manga2kindle.models import DetectorConfig, DetectorKind, DevicePreference, PanelBox
 
 
 def _write_bgr_page(path: Path, width: int, height: int, bgr: tuple[int, int, int] = (10, 20, 30)) -> Path:
@@ -487,6 +487,51 @@ class TestMagiBackendInference:
         out = backend.detect_batch([p1, p2])
         assert len(out[0].panels) == 2
         assert len(out[1].panels) == 2
+
+    def test_detect_encloses_floating_non_essential_gutter_text_without_merging(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = _make_fake_magi_dir(tmp_path)
+        page_path = _write_bgr_page(tmp_path / "gutter_caption.png", 1000, 1000)
+
+        # Top wide panel + bottom-right/left split row + wide ess=False caption sitting cleanly in gutter (0% overlap)
+        # Plus a bridging ess=False SFX between bottom panels (must still be ignored, NOT merge)
+        mock_result = {
+            "panels": [
+                [80.0, 20.0, 920.0, 280.0],
+                [520.0, 350.0, 920.0, 800.0],
+                [80.0, 350.0, 480.0, 800.0],
+            ],
+            "texts": [
+                [200.0, 310.0, 800.0, 336.0],   # floating gutter caption (ess=False, 0% overlap)
+                [400.0, 500.0, 600.0, 600.0],   # bridging SFX across bottom panels (ess=False)
+            ],
+            "is_essential_text": [False, False],
+        }
+        fake_torch, fake_transformers, _, _, _ = _build_mock_torch_and_transformers(
+            cuda_available=False,
+            results_per_call=[mock_result],
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        backend = MagiBackend(
+            DetectorConfig(
+                kind=DetectorKind.MAGI,
+                model_path=model_dir,
+                device=DevicePreference.CPU,
+                padding=0.0,
+                allow_remote_code=True,
+                merge_bridged_panels=True,
+            )
+        )
+        result = backend.detect(page_path)
+        assert len(result.panels) == 3  # SFX did NOT merge bottom panels
+        assert result.panels[0] == PanelBox(x=80, y=20, w=840, h=316, ordinal=1)
+        assert result.panels[1] == PanelBox(x=520, y=350, w=400, h=450, ordinal=2)
+        assert result.panels[2] == PanelBox(x=80, y=350, w=400, h=450, ordinal=3)
 
 
 class TestMagiModelsHub:

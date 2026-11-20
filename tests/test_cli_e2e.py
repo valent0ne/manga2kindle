@@ -20,6 +20,7 @@ from manga2kindle.models import (
     DetectorKind,
     DeviceProfile,
     PanelBox,
+    PanelMergeConfig,
     ReadingDirection,
     SpreadMode,
 )
@@ -1388,3 +1389,154 @@ class TestCliReviewRegressionFixes:
         assert batch_ok.exit_code == 0, batch_ok.output
         with Image.open(batch_out / "ch_01_preview" / "page_0001.png") as batch_cover:
             assert batch_cover.size == (800, 1200)
+
+
+def test_cli_panel_merge_profile_calibration_and_e2e_post_sort_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cbz_path = _make_cbz(tmp_path / "mini_row.cbz", num_pages=1)
+    captured_configs: list[ConversionConfig] = []
+    captured_preview_merges: list[PanelMergeConfig] = []
+
+    def fake_run_single(self, config: ConversionConfig, **_kwargs) -> Path:
+        captured_configs.append(config)
+        return config.output_path
+
+    def fake_preview(self, **kwargs):
+        captured_preview_merges.append(kwargs["panel_merge"])
+        return []
+
+    with monkeypatch.context() as m:
+        m.setattr(ConversionPipeline, "run_single", fake_run_single)
+        m.setattr(ConversionPipeline, "preview_panels", fake_preview)
+
+        res_kpw6 = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "-o", str(tmp_path / "kpw6.kfx"), "-p", "KPW6", "--no-kcc"],
+        )
+        assert res_kpw6.exit_code == 0, res_kpw6.output
+        assert captured_configs[-1].panel_merge == PanelMergeConfig.for_profile(
+            DeviceProfile.from_name("KPW6")
+        )
+
+        res_ks = runner.invoke(
+            app,
+            ["convert", "-i", str(cbz_path), "-o", str(tmp_path / "ks.kfx"), "-p", "KS", "--no-kcc"],
+        )
+        assert res_ks.exit_code == 0, res_ks.output
+        assert captured_configs[-1].panel_merge == PanelMergeConfig.for_profile(
+            DeviceProfile.from_name("KS")
+        )
+
+        res_disabled = runner.invoke(
+            app,
+            [
+                "convert",
+                "-i",
+                str(cbz_path),
+                "-o",
+                str(tmp_path / "off.kfx"),
+                "--no-kcc",
+                "--no-merge-panels",
+            ],
+        )
+        assert res_disabled.exit_code == 0, res_disabled.output
+        assert captured_configs[-1].detector.merge_bridged_panels is False
+        assert captured_configs[-1].panel_merge.enabled is False
+
+        res_prev_ks = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(tmp_path / "prev_ks"),
+                "-p",
+                "KS",
+                "--no-kcc",
+            ],
+        )
+        assert res_prev_ks.exit_code == 0, res_prev_ks.output
+        assert captured_preview_merges[-1] == PanelMergeConfig.for_profile(
+            DeviceProfile.from_name("KS"), enabled=True
+        )
+
+        res_prev_off = runner.invoke(
+            app,
+            [
+                "preview-panels",
+                "-i",
+                str(cbz_path),
+                "--output-dir",
+                str(tmp_path / "prev_off"),
+                "--no-kcc",
+                "--no-merge-panels",
+            ],
+        )
+        assert res_prev_off.exit_code == 0, res_prev_off.output
+        assert captured_preview_merges[-1].enabled is False
+
+    # End-to-end pipeline verification: PanelMerger runs post-sort in preview_panels
+    rendered_panels_seen: list[list[PanelBox]] = []
+
+    class _MiniRowStubBackend:
+        kind = DetectorKind.ONNX_YOLO
+
+        def detect(self, image_path: Path) -> DetectionResult:
+            with Image.open(image_path) as img:
+                w, h = img.size
+            # Top hero + compact 4-panel bottom row (24% height)
+            hero = PanelBox(x=30, y=40, w=w - 60, h=int(h * 0.65), ordinal=0)
+            row_y = int(h * 0.72)
+            row_h = int(h * 0.24)
+            col_w = (w - 150) // 4
+            row = [
+                PanelBox(x=30 + i * (col_w + 30), y=row_y, w=col_w, h=row_h, ordinal=0)
+                for i in range(4)
+            ]
+            return DetectionResult(
+                panels=[hero, *row],
+                ordered=False,
+                backend=self.kind,
+                page_width=w,
+                page_height=h,
+            )
+
+        def detect_batch(self, image_paths):
+            return [self.detect(p) for p in image_paths]
+
+    class _FakeRegistry:
+        active_backend = _MiniRowStubBackend()
+
+        def resolve(self):
+            return [self.active_backend]
+
+        def detect_and_sort(self, image_path, sorter, *, page_width=None, is_spread=False):
+            res = self.active_backend.detect(image_path)
+            return sorter.sort(res.panels, page_width=page_width, is_spread=is_spread)
+
+    monkeypatch.setattr(
+        "manga2kindle.pipeline.PanelPreviewRenderer.render",
+        lambda self, image_path, panels, out_path: rendered_panels_seen.append(panels) or out_path,
+    )
+
+    pipeline = ConversionPipeline()
+    pipeline.preview_panels(
+        input_path=cbz_path,
+        output_dir=tmp_path / "e2e_merged",
+        no_kcc=True,
+        detector_config=DetectorConfig(kind=DetectorKind.ONNX_YOLO, merge_bridged_panels=True, padding=0.0),
+        registry=_FakeRegistry(),  # type: ignore[arg-type]
+    )
+    assert len(rendered_panels_seen[-1]) == 2
+
+    pipeline.preview_panels(
+        input_path=cbz_path,
+        output_dir=tmp_path / "e2e_unmerged",
+        no_kcc=True,
+        detector_config=DetectorConfig(kind=DetectorKind.ONNX_YOLO, merge_bridged_panels=False, padding=0.0),
+        registry=_FakeRegistry(),  # type: ignore[arg-type]
+    )
+    assert len(rendered_panels_seen[-1]) == 5
