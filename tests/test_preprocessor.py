@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -22,6 +25,7 @@ from manga2kindle.platform import PlatformDiscovery
 from manga2kindle.preprocessor import (
     ImagePreprocessingError,
     ImagePreprocessor,
+    KccBackend,
     PillowFallbackBackend,
 )
 
@@ -310,6 +314,14 @@ def test_kcc_backend_stages_pages_builds_command_and_unpacks_cbz(
     assert captured_envs[0]["TMP"] == expected_tmp
     assert captured_envs[0]["PYTHONIOENCODING"] == "utf-8"
     assert captured_envs[0]["PYTHONUTF8"] == "1"
+    for thread_var in (
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert captured_envs[0][thread_var] == "1"
     cmd = captured_cmds[0]
     assert cmd == [
         str(fake_kcc),
@@ -459,3 +471,55 @@ def test_image_preprocessor_stretches_cover_to_1600x2560(tmp_path: Path) -> None
         assert out_cover.getpixel((10, 10)) == (20, 90, 180)
         assert out_cover.getpixel((1590, 2550)) == (20, 90, 180)
         assert out_cover.getpixel((800, 1280)) == (20, 90, 180)
+
+
+def test_kcc_backend_resolve_max_concurrent_and_semaphore_limits_parallel_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert KccBackend.resolve_max_concurrent(available_mem_gib=16.0, cpu_count=16) == 2
+    assert KccBackend.resolve_max_concurrent(available_mem_gib=6.0, cpu_count=16) == 1
+    assert KccBackend.resolve_max_concurrent(available_mem_gib=16.0, cpu_count=2) == 1
+    assert KccBackend.resolve_max_concurrent(override=3, available_mem_gib=2.0, cpu_count=2) == 3
+
+    p1 = _save_image(Image.new("L", (800, 1200), 100), tmp_path / "src" / "01.png")
+    pages = [PageAsset(index=0, source_path=p1, width=800, height=1200, is_cover=True)]
+
+    fake_kcc = tmp_path / "kcc-c2e"
+    fake_kcc.write_text("#!/bin/sh\n")
+    discovery = MagicMock(spec=PlatformDiscovery)
+    discovery.find_kcc.return_value = fake_kcc
+
+    lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            time.sleep(0.05)
+            out_dir = Path(cmd[cmd.index("-o") + 1])
+            with zipfile.ZipFile(out_dir / "out.cbz", "w") as zf:
+                zf.writestr("0001.jpg", _make_jpg_bytes(1264, 1680))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr("manga2kindle.preprocessor.subprocess.run", fake_run)
+
+    backend = KccBackend(discovery=discovery, max_concurrent=2)
+    config = _make_config(tmp_path, no_kcc=False, kcc_path=fake_kcc)
+
+    def _run_one(idx: int) -> list[PageAsset]:
+        return backend.process(pages, tmp_path / f"work_{idx}", config)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(_run_one, range(6)))
+
+    assert len(results) == 6
+    assert all(len(res) == 1 and res[0].processed_path is not None for res in results)
+    assert peak_active <= 2
+    assert peak_active >= 1

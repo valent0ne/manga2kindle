@@ -6,7 +6,8 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from manga2kindle.models import (
     SpreadMode,
 )
 from manga2kindle.packaging.kpf import KpfBuilder
-from manga2kindle.platform import PlatformDiscovery
+from manga2kindle.platform import PlatformDiscovery, available_memory_gib
 from manga2kindle.preprocessor import ImagePreprocessor
 from manga2kindle.progress import (
     ConversionStage,
@@ -48,6 +49,7 @@ from manga2kindle.progress import (
 logger = logging.getLogger(__name__)
 
 _BATCH_ARCHIVE_EXTENSIONS = frozenset({".cbz", ".cbr"})
+_BatchOutcome = tuple[int, Path, str, Path | None, Exception | None]
 
 
 class ConversionPipeline:
@@ -141,11 +143,49 @@ class ConversionPipeline:
 
     @staticmethod
     def _available_ram_gib() -> float | None:
+        return available_memory_gib()
+
+    @staticmethod
+    def _log_batch_failure(
+        reporter: ProgressReporter,
+        action: str,
+        archive_path: Path,
+        exc: Exception,
+    ) -> None:
+        """Log batch failures at ERROR only when no UI reporter handles stderr output."""
+        if isinstance(reporter, NullProgressReporter):
+            logger.error("Failed to %s %s: %s", action, archive_path, exc)
+        else:
+            logger.debug("Failed to %s %s: %s", action, archive_path, exc)
+
+    @staticmethod
+    def _execute_batch_workers(
+        batch_workers: int,
+        targets: Sequence[tuple[Path, str, Path]],
+        worker_fn: Callable[[int, Path, str, Path, threading.Event], _BatchOutcome],
+        handle_outcome: Callable[[_BatchOutcome], None],
+    ) -> None:
+        """Run batch worker tasks with cancellation and queued-future cleanup on interrupt."""
+        cancel_event = threading.Event()
+        if batch_workers <= 1:
+            for idx, (arch, stem, tgt) in enumerate(targets):
+                handle_outcome(worker_fn(idx, arch, stem, tgt, cancel_event))
+            return
+
+        executor = ThreadPoolExecutor(max_workers=batch_workers)
         try:
-            import psutil
-        except ImportError:
-            return None
-        return psutil.virtual_memory().available / (1024.0**3)
+            futures = [
+                executor.submit(worker_fn, idx, arch, stem, tgt, cancel_event)
+                for idx, (arch, stem, tgt) in enumerate(targets)
+            ]
+            for future in as_completed(futures):
+                handle_outcome(future.result())
+        except BaseException:
+            cancel_event.set()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     @classmethod
     def _resolve_batch_workers(
@@ -549,8 +589,14 @@ class ConversionPipeline:
             )
 
             def _convert_one(
-                idx: int, archive_path: Path, target_stem: str, target_kfx: Path
-            ) -> tuple[int, Path, str, Path | None, Exception | None]:
+                idx: int,
+                archive_path: Path,
+                target_stem: str,
+                target_kfx: Path,
+                cancel_event: threading.Event,
+            ) -> _BatchOutcome:
+                if cancel_event.is_set():
+                    return idx, archive_path, target_stem, None, RuntimeError("Batch cancelled")
                 book_id = str(archive_path)
                 reporter.on_book_start(book_id, target_stem)
                 book_config = config.model_copy(
@@ -575,15 +621,13 @@ class ConversionPipeline:
                     )
                     return idx, archive_path, target_stem, out_kfx, None
                 except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
-                    logger.error("Failed to convert %s: %s", archive_path, exc)
+                    self._log_batch_failure(reporter, "convert", archive_path, exc)
                     return idx, archive_path, target_stem, None, exc
 
             indexed_succeeded: list[tuple[int, Path]] = []
             indexed_errors: list[tuple[int, Path, Exception]] = []
 
-            def _handle_outcome(
-                outcome: tuple[int, Path, str, Path | None, Exception | None],
-            ) -> None:
+            def _handle_outcome(outcome: _BatchOutcome) -> None:
                 idx, archive_path, target_stem, out_kfx, exc = outcome
                 book_id = str(archive_path)
                 if exc is not None or out_kfx is None:
@@ -598,17 +642,9 @@ class ConversionPipeline:
                     if on_success is not None:
                         on_success(archive_path, out_kfx)
 
-            if batch_workers > 1:
-                with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                    futures = [
-                        executor.submit(_convert_one, idx, arch, stem, tgt)
-                        for idx, (arch, stem, tgt) in enumerate(pending_targets)
-                    ]
-                    for future in as_completed(futures):
-                        _handle_outcome(future.result())
-            else:
-                for idx, (arch, stem, tgt) in enumerate(pending_targets):
-                    _handle_outcome(_convert_one(idx, arch, stem, tgt))
+            self._execute_batch_workers(
+                batch_workers, pending_targets, _convert_one, _handle_outcome
+            )
 
             indexed_succeeded.sort(key=lambda item: item[0])
             indexed_errors.sort(key=lambda item: item[0])
@@ -963,8 +999,14 @@ class ConversionPipeline:
             )
 
             def _preview_one(
-                idx: int, archive_path: Path, stem: str, preview_dir: Path
-            ) -> tuple[int, Path, str, Path | None, Exception | None]:
+                idx: int,
+                archive_path: Path,
+                stem: str,
+                preview_dir: Path,
+                cancel_event: threading.Event,
+            ) -> _BatchOutcome:
+                if cancel_event.is_set():
+                    return idx, archive_path, stem, None, RuntimeError("Batch cancelled")
                 book_id = str(archive_path)
                 reporter.on_book_start(book_id, stem)
                 try:
@@ -991,15 +1033,13 @@ class ConversionPipeline:
                     )
                     return idx, archive_path, stem, preview_dir, None
                 except Exception as exc:  # noqa: BLE001 - isolate per-book failures in batch mode
-                    logger.error("Failed to preview %s: %s", archive_path, exc)
+                    self._log_batch_failure(reporter, "preview", archive_path, exc)
                     return idx, archive_path, stem, None, exc
 
             indexed_succeeded: list[tuple[int, Path]] = []
             indexed_errors: list[tuple[int, Path, Exception]] = []
 
-            def _handle_outcome(
-                outcome: tuple[int, Path, str, Path | None, Exception | None],
-            ) -> None:
+            def _handle_outcome(outcome: _BatchOutcome) -> None:
                 idx, archive_path, stem, preview_dir, exc = outcome
                 book_id = str(archive_path)
                 if exc is not None or preview_dir is None:
@@ -1014,17 +1054,9 @@ class ConversionPipeline:
                     if on_success is not None:
                         on_success(archive_path, preview_dir)
 
-            if batch_workers > 1:
-                with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                    futures = [
-                        executor.submit(_preview_one, idx, arch, stem, pdir)
-                        for idx, (arch, stem, pdir) in enumerate(preview_targets)
-                    ]
-                    for future in as_completed(futures):
-                        _handle_outcome(future.result())
-            else:
-                for idx, (arch, stem, pdir) in enumerate(preview_targets):
-                    _handle_outcome(_preview_one(idx, arch, stem, pdir))
+            self._execute_batch_workers(
+                batch_workers, preview_targets, _preview_one, _handle_outcome
+            )
 
             indexed_succeeded.sort(key=lambda item: item[0])
             indexed_errors.sort(key=lambda item: item[0])

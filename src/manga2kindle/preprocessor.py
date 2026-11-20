@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 import zipfile
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from manga2kindle.models import (
     ReadingDirection,
     SpreadMode,
 )
-from manga2kindle.platform import PlatformDiscovery
+from manga2kindle.platform import PlatformDiscovery, available_memory_gib
 
 _SPREAD_CLI_ARGS: dict[SpreadMode, list[str]] = {
     SpreadMode.SPLIT: ["-r", "0"],
@@ -26,6 +27,16 @@ _SPREAD_CLI_ARGS: dict[SpreadMode, list[str]] = {
     # KCC -r 2 means "Both (Split + Rotate)"; -r 1 --norotate keeps spreads unsplit and unrotated.
     SpreadMode.KEEP: ["-r", "1", "--norotate"],
 }
+_KCC_SINGLE_THREAD_ENV: dict[str, str] = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+_KCC_MAX_CONCURRENT_CAP: int = 2
+_KCC_CONCURRENT_MEMORY_THRESHOLD_GIB: float = 8.0
+_KCC_CONCURRENT_MIN_CPUS: int = 4
 
 
 class ImagePreprocessingError(RuntimeError):
@@ -86,8 +97,33 @@ def _is_valid_archive_image(raw_name: str) -> bool:
 class KccBackend:
     """Preprocesses verified page images by staging them cleanly for ``kcc-c2e``."""
 
-    def __init__(self, discovery: PlatformDiscovery | None = None) -> None:
+    def __init__(
+        self,
+        discovery: PlatformDiscovery | None = None,
+        *,
+        max_concurrent: int | None = None,
+    ) -> None:
         self.discovery = discovery or PlatformDiscovery()
+        self._max_concurrent = self.resolve_max_concurrent(max_concurrent)
+        self._semaphore = threading.BoundedSemaphore(self._max_concurrent)
+
+    @staticmethod
+    def resolve_max_concurrent(
+        override: int | None = None,
+        *,
+        available_mem_gib: float | None = None,
+        cpu_count: int | None = None,
+    ) -> int:
+        """Resolve safe simultaneous ``kcc-c2e`` subprocess count for this host."""
+        if override is not None:
+            return max(1, override)
+        cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+        avail = available_mem_gib if available_mem_gib is not None else available_memory_gib()
+        if cpus >= _KCC_CONCURRENT_MIN_CPUS and (
+            avail is None or avail >= _KCC_CONCURRENT_MEMORY_THRESHOLD_GIB
+        ):
+            return _KCC_MAX_CONCURRENT_CAP
+        return 1
 
     def process(
         self,
@@ -109,10 +145,11 @@ class KccBackend:
 
         self._stage_pages(pages, staging_dir)
         cmd = self._build_command(kcc_bin, staging_dir, out_dir, config)
-        # Isolate KCC's global checkPre('KCC-') cleanup per subprocess across batch workers.
+        # Isolate KCC's global checkPre('KCC-') cleanup and cap BLAS threads per child process.
         kcc_tmp_str = str(kcc_tmp_dir)
         env = {
             **os.environ,
+            **_KCC_SINGLE_THREAD_ENV,
             "TMPDIR": kcc_tmp_str,
             "TEMP": kcc_tmp_str,
             "TMP": kcc_tmp_str,
@@ -121,15 +158,16 @@ class KccBackend:
         }
 
         try:
-            proc = subprocess.run(
-                cmd,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            with self._semaphore:
+                proc = subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ImagePreprocessingError(f"Failed to execute kcc-c2e: {exc}") from exc
 
@@ -380,9 +418,17 @@ class PillowFallbackBackend:
 class ImagePreprocessor:
     """Facade selecting KCC or Pillow preprocessing according to ConversionConfig."""
 
-    def __init__(self, discovery: PlatformDiscovery | None = None) -> None:
+    def __init__(
+        self,
+        discovery: PlatformDiscovery | None = None,
+        *,
+        kcc_max_concurrent: int | None = None,
+    ) -> None:
         self.discovery = discovery or PlatformDiscovery()
-        self._kcc_backend = KccBackend(discovery=self.discovery)
+        self._kcc_backend = KccBackend(
+            discovery=self.discovery,
+            max_concurrent=kcc_max_concurrent,
+        )
         self._pillow_backend = PillowFallbackBackend()
 
     def process(
